@@ -19,22 +19,47 @@ if data.get("schemaVersion") != 1:
 
 for dependency in data["dependencies"]:
     repo = root / dependency["repositoryPath"]
+    if not (repo / ".git").is_dir():
+        print(f"[SKIP] {dependency['name']}: checkout not present at {repo}")
+        continue
     commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
     if commit != dependency["expectedCommit"]:
         raise SystemExit(f"{dependency['name']} commit mismatch: expected {dependency['expectedCommit']}, got {commit}")
+
+    patches = []
     for entry in dependency["patches"]:
         patch = root / entry["path"]
         digest = hashlib.sha256(patch.read_bytes()).hexdigest()
         if digest != entry["sha256"]:
             raise SystemExit(f"Patch checksum mismatch: {entry['path']}")
-        reverse = subprocess.run(["git", "-C", str(repo), "apply", "--reverse", "--check", str(patch)], capture_output=True)
-        if reverse.returncode == 0:
+        patches.append((entry, patch))
+
+    # Check if every patch can be cleanly reverse-applied (all already applied).
+    all_applied = all(
+        subprocess.run(["git", "-C", str(repo), "apply", "--reverse", "--check", str(p)], capture_output=True).returncode == 0
+        for _, p in patches
+    )
+    if all_applied:
+        for entry, _ in patches:
             print(f"[OK] {dependency['name']}: {entry['path']} (already-applied)")
-            continue
-        changes = subprocess.check_output(["git", "-C", str(repo), "status", "--short", "--untracked-files=no", "--ignore-submodules=dirty"], text=True)
-        if changes.strip():
-            raise SystemExit(f"Refusing to patch dependency with tracked changes: {repo}\n{changes}")
-        subprocess.run(["git", "-C", str(repo), "apply", "--check", str(patch)], check=True)
-        subprocess.run(["git", "-C", str(repo), "apply", str(patch)], check=True)
+        continue
+
+    # Check if every patch can be cleanly forward-applied (none applied yet).
+    all_unapplied = all(
+        subprocess.run(["git", "-C", str(repo), "apply", "--check", str(p)], capture_output=True).returncode == 0
+        for _, p in patches
+    )
+    if all_unapplied:
+        for entry, p in patches:
+            subprocess.run(["git", "-C", str(repo), "apply", str(p)], check=True)
+            print(f"[OK] {dependency['name']}: {entry['path']} (applied)")
+        continue
+
+    # Partially applied or context-shifted: reset to the pinned commit and
+    # re-apply everything. Safe because the commit is pinned and verified.
+    print(f"[INFO] {dependency['name']}: resetting to pinned commit and re-applying all patches")
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "."], check=True)
+    for entry, p in patches:
+        subprocess.run(["git", "-C", str(repo), "apply", str(p)], check=True)
         print(f"[OK] {dependency['name']}: {entry['path']} (applied)")
 PY

@@ -58,3 +58,4 @@ extern/n64-modern-runtime/
 extern/rt64/
 runtime-recomp/RecompiledFuncs/
 build/runtime-tools/
+runtime-recomp/build/
