@@ -1,6 +1,7 @@
-# DKR-R — Diddy Kong Racing Recompiled
 
-<img width="860" height="860" alt="DKR-R8" src="https://github.com/user-attachments/assets/a02fbcce-12b5-4f0f-bd03-d3414da53d5a" />
+# DKR-R — Diddy Kong Racing Recompiled
+<img width="1672" height="941" alt="bb1a4a71-c0c0-4803-a31e-377e8f4bbf35" src="https://github.com/user-attachments/assets/c913bee2-029c-4e29-9921-0f6abe7a3bf1" />
+
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20our%20server-informational?style=flat&logo=discord)](https://discord.gg/JnbKRBtHqC)
 
