@@ -2,6 +2,8 @@
 
 <img width="860" height="860" alt="DKR-R8" src="https://github.com/user-attachments/assets/a02fbcce-12b5-4f0f-bd03-d3414da53d5a" />
 
+[![Discord](https://shields.io)](https://discord.gg/JnbKRBtHqC)
+
 DKR-R 1.0.0 is a cross-platform static recompilation of Diddy Kong Racing for
 Windows and Linux. It runs the original game from a locally selected, legally
 obtained US 1.0 Game Pak image; no ROM or extracted Nintendo/Rare assets are
