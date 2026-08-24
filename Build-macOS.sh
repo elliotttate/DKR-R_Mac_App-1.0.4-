@@ -15,7 +15,7 @@ for tool in cmake ninja ditto codesign; do
 done
 
 [[ -d "${project_root}/runtime-recomp/RecompiledFuncs" ]] || {
-  echo 'Generated DKR functions are missing. Prepare them through the Patch Pipeline first.' >&2
+  echo 'Generated DKR functions are missing. Prepare them on macOS with Prepare-DKR-Runtime-macOS.sh first' >&2
   exit 1
 }
 [[ -d "${project_root}/extern/n64-modern-runtime" ]] || {

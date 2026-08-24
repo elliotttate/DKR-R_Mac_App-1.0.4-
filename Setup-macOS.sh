@@ -8,6 +8,10 @@ for tool in cmake ninja c++; do
     exit 1
   fi
 done
+if ! xcrun --find metal >/dev/null 2>&1; then
+  echo "Install MetalToolchain with: xcodebuild -downloadComponent MetalToolchain"
+  exit 1
+fi
 cmake --version | head -n1
 c++ --version | head -n1
 echo "macOS setup checks passed. Run ./Build-macOS.sh."

@@ -9,8 +9,12 @@
 #include "runtime_ui.hpp"
 #include "imgui/imgui.h"
 #include <SDL.h>
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
 #include <SDL_syswm.h>
+#endif
+#if defined(__APPLE__)
+extern "C" void* dkr_create_metal_layer(void* ns_window_ptr);
+extern "C" void dkr_destroy_metal_layer(void* layer_ptr);
 #endif
 #endif
 
@@ -48,6 +52,9 @@ SDL_AudioDeviceID g_audio_device = 0;
 std::array<SDL_GameController*, kControllerCount> g_controllers{};
 SDL_GameController* g_gyro_controller = nullptr;
 SDL_Window* g_window = nullptr;
+#if defined(__APPLE__)
+void* g_metal_layer = nullptr;
+#endif
 std::uint32_t g_audio_frequency = 0;
 std::vector<std::int16_t> g_audio_swap_buffer;
 dkr::runtime::audio::StereoEqualizer g_audio_equalizer;
@@ -196,6 +203,10 @@ void dkr::runtime::platform::shutdown() {
         }
     }
     g_gyro_controller = nullptr;
+#if defined(__APPLE__)
+    dkr_destroy_metal_layer(g_metal_layer);
+    g_metal_layer = nullptr;
+#endif
     if (g_window != nullptr) {
         SDL_DestroyWindow(g_window);
         g_window = nullptr;
@@ -232,6 +243,17 @@ ultramodern::renderer::WindowHandle dkr::runtime::platform::create_window() {
         return {};
     }
     return {.window = info.info.win.window, .thread_id = GetCurrentThreadId()};
+#elif defined(__APPLE__)
+    SDL_SysWMinfo info{};
+    SDL_VERSION(&info.version);
+    if (g_window == nullptr || SDL_GetWindowWMInfo(g_window, &info) != SDL_TRUE) {
+        std::fprintf(stderr, "[boot][window] native handle failed: %s\n", SDL_GetError());
+        return {};
+    }
+    if (g_metal_layer == nullptr) {
+        g_metal_layer = dkr_create_metal_layer(info.info.cocoa.window);
+    }
+    return {.window = info.info.cocoa.window, .view = g_metal_layer};
 #else
     return g_window;
 #endif

@@ -352,7 +352,7 @@ int DkrMain(int argc, char** argv) {
     dkr::runtime::ui::configure(config_directory);
     dkr::runtime::ui::reset_lifecycle_request();
     auto window_handle = dkr::runtime::platform::create_window();
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     if (window_handle.window == nullptr) {
 #else
     if (window_handle == nullptr) {
@@ -374,7 +374,7 @@ int DkrMain(int argc, char** argv) {
         }
         rom_path = startup.rom_path;
         window_handle = dkr::runtime::platform::prepare_window_for_game();
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
         if (window_handle.window == nullptr) {
 #else
         if (window_handle == nullptr) {
