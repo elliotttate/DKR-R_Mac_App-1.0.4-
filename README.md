@@ -19,8 +19,8 @@ included.
 - Controller-first launcher and transparent in-game settings overlay.
 - Keyboard/controller remapping, quick race restart and two-axis gyro steering.
 - Independent live master, music, effects, vehicle and ambience levels, plus EQ.
-- Save import/export/backups, checksum-safe Save Builder and launch-time Magic Codes.
-- Optional performance overlay, CRT masks and hot-swappable RT64/Rice texture packs.
+- Save import/export/backups, Save Builder and Magic Code switches.
+- Optional performance overlay, CRT masks and hot-swappable RT64/Rice texture packs. (An official community-made texture pack can be found on our discord (*WIP*))
 - Native virtual EEPROM and four Controller Paks.
 
 Game simulation, race timers, AI, input polling and audio remain on the original
