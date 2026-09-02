@@ -101,7 +101,7 @@ the runtime. See [docs/CONTROLLERS.md](docs/CONTROLLERS.md).
 
 Online multiplayer is player-hosted: Player 1 is always the host. Remote
 friends can use a five-character Quick Join code with no account or port
-forwarding; the public rendezvous exchanges signaling metadata only and never
+forwarding; the public rendezvous exchanges signalling metadata only and never
 carries gameplay. Quick Join is the sole connection workflow, so players never
 select an adapter, exchange an address, import an invitation file or configure
 a UDP port. There is no DKR-R account, gameplay backend or relay. See
@@ -146,11 +146,6 @@ For those of you looking for the DKR-R Community Texture pack. It can be found i
   </a>
 </p>
 
-Before distribution, run:
-
-```bash
-python scripts/scan_for_game_assets.py
-```
 
 See [docs/ASSET_POLICY.md](docs/ASSET_POLICY.md),
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
