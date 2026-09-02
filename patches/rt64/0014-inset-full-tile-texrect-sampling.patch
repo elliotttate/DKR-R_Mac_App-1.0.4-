@@ -1,0 +1,34 @@
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -1262,8 +1262,28 @@ namespace RT64 {
+         const float vFractionOffset = (uly & 0x3) ? (dtdy >> 5) / 32.0f : 0.0f;
+         float u1 = uls / 32.0f;
+         float v1 = ult / 32.0f + vFractionOffset;
+-        float u2 = lrs / 32.0f;
+-        float v2 = lrt / 32.0f + vFractionOffset;
++        float u2 = lrs / 32.0f;
++        float v2 = lrt / 32.0f + vFractionOffset;
++
++        // Full-tile, one-to-one sprites finish exactly on the following texel
++        // boundary. At high internal resolutions the final bilinear footprint
++        // can therefore wrap into the next tile, exposing a repeated column
++        // and row between sliced UI textures. Keep the correction limited to
++        // ordinary, unflipped one-to-one texture rectangles; copy rectangles,
++        // scaled UI, framebuffer effects and triangle geometry are untouched.
++        if (!usesCopyMode && !flip && (uls == 0) && (ult == 0) &&
++            (dsdx == 1024) && (dtdy == 1024) &&
++            (drawCall.tileCount == 1)) {
++            const DrawCallTile &callTile =
++                workload.drawData.callTiles[drawCall.tileIndex];
++            if (callTile.valid && (callTile.sampleWidth > 1) &&
++                (callTile.sampleHeight > 1) &&
++                (callTile.sampleWidth == rectWidth) &&
++                (callTile.sampleHeight == rectHeight)) {
++                u2 -= 0.5f;
++                v2 -= 0.5f;
++            }
++        }
+         triTcFloats.emplace_back(u1);
+         triTcFloats.emplace_back(v1);
+         triTcFloats.emplace_back(flip ? u1 : u2);

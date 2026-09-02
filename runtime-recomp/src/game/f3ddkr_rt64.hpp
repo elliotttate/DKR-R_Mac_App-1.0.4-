@@ -2,6 +2,7 @@
 
 #include "ultramodern/ultra64.h"
 
+#include <array>
 #include <cstdint>
 
 namespace RT64 {
@@ -26,12 +27,27 @@ public:
     void process(RT64::Application& application, const OSTask& task);
 
 private:
+    using Handler = void (*)(RT64::State*, RT64::DisplayList**);
     struct StateData;
     RT64::GBI* gbi_;
     StateData* data_;
+    std::array<Handler, 256> original_handlers_{};
 
     static F3DDKRRT64Bridge* active_;
 
+    static void Dispatch(RT64::State* state,
+                         RT64::DisplayList** display_list);
+    static void ApplyPresentationMarkers(RT64::State* state,
+                                         RT64::DisplayList* display_list);
+    static void ApplyPresentationGroup(RT64::State* state,
+                                       std::uint32_t mode,
+                                       std::uint16_t token,
+                                       std::uint8_t variant);
+    static void FinishShadowScope(RT64::State* state);
+    static void AdjustSplitViewportCommand(RT64::State* state,
+                                           RT64::DisplayList* command,
+                                           std::uint8_t opcode);
+    static void RejectTask(RT64::DisplayList** display_list);
     static void PresentationGroup(RT64::State* state,
                                   RT64::DisplayList** display_list);
     static void MoveMem(RT64::State* state, RT64::DisplayList** display_list);

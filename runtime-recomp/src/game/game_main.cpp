@@ -1,12 +1,17 @@
 #include "game_registration.hpp"
+#include "revision_addresses.hpp"
 #include "null_renderer.hpp"
+#include "rev_a_asset_mutex.hpp"
 #include "runtime_platform.hpp"
+#include "runtime_netplay.hpp"
+#include "runtime_support.hpp"
 #include "save_manager.hpp"
 #include "virtual_pak.hpp"
 #if DKR_RUNTIME_HAS_RT64
 #include "rt64_renderer.hpp"
 #include "runtime_texture_packs.hpp"
 #include "runtime_ui.hpp"
+#include <SDL.h>
 #endif
 
 #include "librecomp/game.hpp"
@@ -21,12 +26,20 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #ifndef _WIN32
+#include <csignal>
 #include <cerrno>
+#if defined(__linux__)
+#include <execinfo.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -42,7 +55,46 @@ namespace {
 
 #ifdef _WIN32
 std::atomic_flag g_crash_filter_active = ATOMIC_FLAG_INIT;
+std::filesystem::path g_crash_directory;
 #endif
+
+bool ConfigurePersistentRuntimeLog(
+    const std::filesystem::path& config_directory) {
+    if (!dkr::runtime::support::diagnostic_logging_enabled()) {
+        return true;
+    }
+    std::error_code error;
+    const std::filesystem::path& log_directory =
+        dkr::runtime::support::log_directory();
+    std::filesystem::create_directories(log_directory, error);
+    if (error) {
+        return false;
+    }
+    const std::filesystem::path current = log_directory / "runtime.log";
+    const std::filesystem::path previous =
+        log_directory / "runtime-previous.log";
+    std::filesystem::remove(previous, error);
+    error.clear();
+    if (std::filesystem::exists(current, error)) {
+        error.clear();
+        std::filesystem::rename(current, previous, error);
+    }
+#ifdef _WIN32
+    FILE* stream = nullptr;
+    if (_wfreopen_s(&stream, current.c_str(), L"w", stderr) != 0 ||
+        stream == nullptr) {
+        return false;
+    }
+#else
+    if (std::freopen(current.c_str(), "w", stderr) == nullptr) {
+        return false;
+    }
+#endif
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "[boot] DKR-R %s persistent runtime log\n",
+                 DKR_RELEASE_VERSION);
+    return true;
+}
 
 std::filesystem::path DefaultConfigDirectory(const char* executable_argument) {
     std::error_code error;
@@ -75,7 +127,8 @@ RspExitReason EmptyAudioTask(std::uint8_t*, std::uint32_t) {
 }
 
 RspUcodeFunc* GetRspMicrocode(const OSTask* task) {
-    if (task->t.type == M_AUDTASK && task->t.ucode == 0x800D7600U) {
+    if (task->t.type == M_AUDTASK &&
+        task->t.ucode == dkr::runtime::revision_addresses::AspMainTextStart) {
         // DKR can submit a zero-command audio frame when the host-reported AI
         // queue already satisfies the synthesizer's requested frame size. The
         // original scheduler treats that as completed work; entering the ABI
@@ -104,6 +157,37 @@ std::string GetThreadName(const OSThread* thread) {
 }
 
 #ifdef _WIN32
+void WriteWindowsMinidump(EXCEPTION_POINTERS* exception) {
+    if (!dkr::runtime::support::crash_dumps_enabled() ||
+        g_crash_directory.empty()) {
+        return;
+    }
+    SYSTEMTIME time{};
+    GetSystemTime(&time);
+    wchar_t name[96]{};
+    swprintf_s(name, L"DKR-R-crash-%04u%02u%02u-%02u%02u%02u.dmp",
+               time.wYear, time.wMonth, time.wDay,
+               time.wHour, time.wMinute, time.wSecond);
+    const std::filesystem::path path = g_crash_directory / name;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION information{};
+    information.ThreadId = GetCurrentThreadId();
+    information.ExceptionPointers = exception;
+    information.ClientPointers = FALSE;
+    const BOOL written = MiniDumpWriteDump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        MiniDumpWithIndirectlyReferencedMemory,
+        exception != nullptr ? &information : nullptr, nullptr, nullptr);
+    CloseHandle(file);
+    std::fprintf(stderr, "[boot][crash] minidump=%ls status=%s\n",
+                 path.c_str(), written ? "written" : "failed");
+}
+
 LONG WINAPI RuntimeCrashFilter(EXCEPTION_POINTERS* exception) {
     if (g_crash_filter_active.test_and_set()) {
         Sleep(5000);
@@ -118,6 +202,7 @@ LONG WINAPI RuntimeCrashFilter(EXCEPTION_POINTERS* exception) {
     std::fprintf(stderr, "[boot][crash] exception=0x%08lX address=0x%016llX\n",
                  exception->ExceptionRecord->ExceptionCode,
                  static_cast<unsigned long long>(fault_address));
+    WriteWindowsMinidump(exception);
     if (exception->ExceptionRecord->NumberParameters >= 2U) {
         const ULONG_PTR operation = exception->ExceptionRecord->ExceptionInformation[0];
         const char* operation_name = operation == 0U ? "read" :
@@ -201,7 +286,136 @@ LONG WINAPI RuntimeCrashFilter(EXCEPTION_POINTERS* exception) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+#else
+
+void RuntimeSignalHandler(int signal_number) {
+    std::fprintf(stderr, "[boot][crash] signal=%d\n", signal_number);
+#if defined(__linux__)
+    void* frames[48]{};
+    const int count = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
 #endif
+    std::fflush(stderr);
+    _exit(128 + signal_number);
+}
+
+void InstallRuntimeSignalHandlers() {
+    struct sigaction action {};
+    action.sa_handler = RuntimeSignalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESETHAND;
+    for (const int signal_number : {SIGSEGV, SIGABRT, SIGFPE, SIGILL}) {
+        sigaction(signal_number, &action, nullptr);
+    }
+}
+
+#endif
+
+struct LaunchOptions {
+    std::filesystem::path rom_path;
+    std::filesystem::path config_directory;
+    unsigned timeout_seconds = 0;
+};
+
+bool ParseLaunchOptions(int argc, char** argv, LaunchOptions& options,
+                        std::string& error) {
+    unsigned positional_index = 0;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        auto require_value = [&](const char* option) -> const char* {
+            if (index + 1 >= argc) {
+                error = std::string(option) + " requires a value.";
+                return nullptr;
+            }
+            return argv[++index];
+        };
+
+        if (argument == "--rom") {
+            const char* value = require_value("--rom");
+            if (value == nullptr) {
+                return false;
+            }
+            options.rom_path = std::filesystem::u8path(value);
+        } else if (argument == "--config") {
+            const char* value = require_value("--config");
+            if (value == nullptr) {
+                return false;
+            }
+            options.config_directory = std::filesystem::u8path(value);
+        } else if (argument == "--timeout") {
+            const char* value = require_value("--timeout");
+            if (value == nullptr) {
+                return false;
+            }
+            try {
+                const unsigned long parsed = std::stoul(value);
+                if (parsed > std::numeric_limits<unsigned>::max()) {
+                    throw std::out_of_range("timeout");
+                }
+                options.timeout_seconds = static_cast<unsigned>(parsed);
+            } catch (...) {
+                error = "--timeout requires a non-negative whole number.";
+                return false;
+            }
+        } else if (argument.starts_with("--")) {
+            error = "Unknown DKR-R option: " + std::string(argument);
+            return false;
+        } else {
+            // Preserve the original positional invocation for developer and
+            // diagnostic scripts: ROM, config directory, optional timeout.
+            if (positional_index == 0U) {
+                options.rom_path = std::filesystem::u8path(argv[index]);
+            } else if (positional_index == 1U) {
+                options.config_directory = std::filesystem::u8path(argv[index]);
+            } else if (positional_index == 2U) {
+                try {
+                    const unsigned long parsed = std::stoul(argv[index]);
+                    if (parsed > std::numeric_limits<unsigned>::max()) {
+                        throw std::out_of_range("timeout");
+                    }
+                    options.timeout_seconds = static_cast<unsigned>(parsed);
+                } catch (...) {
+                    error = "The timeout must be a non-negative whole number.";
+                    return false;
+                }
+            } else {
+                error = "Too many positional arguments.";
+                return false;
+            }
+            ++positional_index;
+        }
+    }
+    if (options.config_directory.empty()) {
+        options.config_directory = DefaultConfigDirectory(argv[0]);
+    }
+    return true;
+}
+
+bool PrepareCanonicalRomPath(std::filesystem::path& rom_path,
+                             dkr::runtime::rom::Identity& identity,
+                             const std::filesystem::path& config_directory,
+                             std::string& error) {
+    if (identity.byte_order == dkr::runtime::rom::ByteOrder::BigEndian) {
+        return true;
+    }
+    std::filesystem::path canonical_path;
+    if (!dkr::runtime::rom::materialize_canonical(
+            rom_path, identity, config_directory / "rom-cache",
+            canonical_path, error)) {
+        return false;
+    }
+    rom_path = canonical_path;
+    identity = dkr::runtime::rom::inspect(rom_path);
+    if (!identity.supported() ||
+        identity.byte_order != dkr::runtime::rom::ByteOrder::BigEndian) {
+        error = "The prepared ROM cache did not retain the selected revision.";
+        return false;
+    }
+    std::fprintf(stderr,
+                 "[boot][rom] normalised selected ROM into the local big-endian cache\n");
+    error.clear();
+    return true;
+}
 
 } // namespace
 
@@ -242,7 +456,7 @@ bool RelaunchApplication(int argc, char** argv) {
 int DkrMain(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
-#ifdef _WIN32
+#if defined(_WIN32)
     SetUnhandledExceptionFilter(RuntimeCrashFilter);
 #endif
 
@@ -258,6 +472,73 @@ int DkrMain(int argc, char** argv) {
         std::fprintf(stderr, "[test][pak] PASS: round-trip and backup recovery\n");
         return 0;
     }
+
+#if DKR_RUNTIME_HAS_RT64
+    if (argc >= 2 &&
+        std::string_view(argv[1]) == "--self-test-input-switch") {
+        const std::filesystem::path test_directory = argc >= 3
+            ? std::filesystem::u8path(argv[2])
+            : DefaultConfigDirectory(argv[0]) / "input-switch-self-test";
+        std::filesystem::create_directories(test_directory);
+        dkr::runtime::platform::configure_input(test_directory);
+        dkr::runtime::platform::set_requested_input_backend(
+            dkr::runtime::platform::InputBackend::SDL2Compatibility);
+        if (!dkr::runtime::platform::initialise()) {
+            std::fprintf(stderr,
+                         "[test][input-switch] FAILED: platform initialization\n");
+            return 1;
+        }
+        constexpr Uint32 kInvariantSubsystems = SDL_INIT_VIDEO | SDL_INIT_AUDIO;
+        constexpr Uint32 kControllerSubsystems =
+            SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC | SDL_INIT_SENSOR;
+        const auto fail = [](const char* reason) {
+            std::fprintf(stderr, "[test][input-switch] FAILED: %s (%s)\n",
+                         reason,
+                         dkr::runtime::platform::input_backend_detail().c_str());
+            dkr::runtime::platform::shutdown();
+            return 1;
+        };
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            dkr::runtime::platform::set_requested_input_backend(
+                dkr::runtime::platform::InputBackend::SDL3Native);
+            dkr::runtime::platform::pump_input_backend_events();
+            if (dkr::runtime::platform::active_input_backend() !=
+                    dkr::runtime::platform::InputBackend::SDL3Native ||
+                dkr::runtime::platform::input_backend_switch_pending()) {
+                return fail("SDL2 to SDL3 handover");
+            }
+            if ((SDL_WasInit(kInvariantSubsystems) & kInvariantSubsystems) !=
+                kInvariantSubsystems) {
+                return fail("video or audio subsystem changed during SDL3 handover");
+            }
+            if ((SDL_WasInit(kControllerSubsystems) &
+                 kControllerSubsystems) != 0U) {
+                return fail("SDL2 retained controller subsystem ownership");
+            }
+
+            dkr::runtime::platform::set_requested_input_backend(
+                dkr::runtime::platform::InputBackend::SDL2Compatibility);
+            dkr::runtime::platform::pump_input_backend_events();
+            if (dkr::runtime::platform::active_input_backend() !=
+                    dkr::runtime::platform::InputBackend::SDL2Compatibility ||
+                dkr::runtime::platform::input_backend_switch_pending()) {
+                return fail("SDL3 to SDL2 handover");
+            }
+            if ((SDL_WasInit(kInvariantSubsystems) & kInvariantSubsystems) !=
+                kInvariantSubsystems) {
+                return fail("video or audio subsystem changed during SDL2 handover");
+            }
+            if ((SDL_WasInit(kControllerSubsystems) &
+                 kControllerSubsystems) != kControllerSubsystems) {
+                return fail("SDL2 controller subsystems were not restored");
+            }
+        }
+        dkr::runtime::platform::shutdown();
+        std::fprintf(stderr,
+                     "[test][input-switch] PASS: two live round trips\n");
+        return 0;
+    }
+#endif
 
 #if DKR_RUNTIME_HAS_RT64
     if (argc == 4 && std::string_view(argv[1]) == "--self-test-rice-pack") {
@@ -307,28 +588,66 @@ int DkrMain(int argc, char** argv) {
     }
 #endif
 
-    if (argc > 4) {
+    LaunchOptions launch{};
+    std::string rom_error;
+    if (!ParseLaunchOptions(argc, argv, launch, rom_error)) {
         std::fprintf(stderr,
-                     "Usage: DKR-R [rom.z64] [config-directory] [timeout-seconds]\n");
+                     "Usage: DKR-R [rom.z64] [config-directory] [timeout-seconds]\n"
+                     "       DKR-R --rom <path> [--config <path>] [--timeout <seconds>]\n"
+                     "[boot][arguments] %s\n", rom_error.c_str());
         return 2;
     }
-
-    std::filesystem::path rom_path;
-    if (argc >= 2) {
-        rom_path = std::filesystem::u8path(argv[1]);
-    }
-    const std::filesystem::path config_directory = argc >= 3
-        ? std::filesystem::u8path(argv[2])
-        : DefaultConfigDirectory(argv[0]);
-    const unsigned timeout_seconds = argc >= 4 ? static_cast<unsigned>(std::stoul(argv[3])) : 0U;
+    std::filesystem::path& rom_path = launch.rom_path;
+    const std::filesystem::path& config_directory = launch.config_directory;
+    const unsigned timeout_seconds = launch.timeout_seconds;
     std::filesystem::create_directories(config_directory);
+    dkr::runtime::support::configure(config_directory);
+#if defined(_WIN32)
+    g_crash_directory = dkr::runtime::support::crash_dump_directory();
+    if (dkr::runtime::support::crash_dumps_enabled()) {
+        std::error_code crash_directory_error;
+        std::filesystem::create_directories(g_crash_directory,
+                                            crash_directory_error);
+        if (crash_directory_error) {
+            g_crash_directory.clear();
+        }
+    }
+#endif
+#ifndef _WIN32
+    InstallRuntimeSignalHandlers();
+#endif
+
+    dkr::runtime::rom::Identity rom_identity{};
+    bool rom_identified = false;
+    if (!rom_path.empty()) {
+        if (!dkr::runtime::ValidateRomForLauncher(
+                rom_path, rom_identity, rom_error)) {
+            std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+            return 3;
+        }
+        if (!PrepareCanonicalRomPath(rom_path, rom_identity,
+                                     config_directory, rom_error)) {
+            std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+            return 3;
+        }
+        rom_identified = true;
+    }
+
+    bool log_configured = false;
+    if (rom_identified) {
+        log_configured = ConfigurePersistentRuntimeLog(config_directory);
+        if (!log_configured) {
+            std::fprintf(stderr,
+                         "[boot][log] could not create the persistent runtime log\n");
+        }
+    }
     dkr::runtime::pak::configure(config_directory);
     dkr::runtime::saves::configure(config_directory);
+    dkr::runtime::platform::configure_input(config_directory);
 
     if (!dkr::runtime::platform::initialise()) {
         return 4;
     }
-
     // N64ModernRuntime intentionally leaves its process-wide graphics options
     // value-initialized for applications with a settings frontend. Supply
     // parity-first defaults here so RT64 does not silently remain at 320x240.
@@ -347,7 +666,6 @@ int DkrMain(int argc, char** argv) {
     graphics_config.ds_option = 1;
     ultramodern::renderer::set_graphics_config(graphics_config);
 
-    dkr::runtime::RegisterGame(config_directory);
 #if DKR_RUNTIME_HAS_RT64
     dkr::runtime::ui::configure(config_directory);
     dkr::runtime::ui::reset_lifecycle_request();
@@ -373,6 +691,35 @@ int DkrMain(int argc, char** argv) {
             return 0;
         }
         rom_path = startup.rom_path;
+        rom_identified = false;
+    }
+#else
+    const ultramodern::renderer::WindowHandle window_handle{};
+    if (rom_path.empty()) {
+        std::fprintf(stderr, "The diagnostic runtime requires a ROM path.\n");
+        dkr::runtime::platform::shutdown();
+        return 2;
+    }
+#endif
+
+    if (!rom_identified && !dkr::runtime::ValidateRomForLauncher(
+            rom_path, rom_identity, rom_error)) {
+        std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+        dkr::runtime::platform::shutdown();
+        return 3;
+    }
+    if (!rom_identified && !PrepareCanonicalRomPath(
+            rom_path, rom_identity, config_directory, rom_error)) {
+        std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+        dkr::runtime::platform::shutdown();
+        return 3;
+    }
+    if (!log_configured && !ConfigurePersistentRuntimeLog(config_directory)) {
+        std::fprintf(stderr,
+                     "[boot][log] could not create the persistent runtime log\n");
+    }
+#if DKR_RUNTIME_HAS_RT64
+    if (!rom_identified) {
         window_handle = dkr::runtime::platform::prepare_window_for_game();
 #if defined(_WIN32)
         if (window_handle.window == nullptr) {
@@ -385,20 +732,15 @@ int DkrMain(int argc, char** argv) {
             return 4;
         }
     }
-#else
-    const ultramodern::renderer::WindowHandle window_handle{};
-    if (rom_path.empty()) {
-        std::fprintf(stderr, "The diagnostic runtime requires a ROM path.\n");
-        dkr::runtime::platform::shutdown();
-        return 2;
-    }
 #endif
 
-    std::string rom_error;
-    if (!dkr::runtime::SelectRom(rom_path, rom_error)) {
+    if (!dkr::runtime::RegisterGame(config_directory, rom_identity.revision,
+                                    rom_error)) {
         std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+        dkr::runtime::platform::shutdown();
         return 3;
     }
+    const dkr::runtime::rom::Revision registered_revision = rom_identity.revision;
     std::fprintf(stderr, "[boot][rom] validated and registered\n");
 
     const recomp::rsp::callbacks_t rsp_callbacks{.get_rsp_microcode = GetRspMicrocode};
@@ -412,9 +754,16 @@ int DkrMain(int argc, char** argv) {
         .queue_samples = dkr::runtime::platform::queue_audio,
         .get_frames_remaining = dkr::runtime::platform::audio_frames_remaining,
         .set_frequency = dkr::runtime::platform::set_audio_frequency,
+        .external_work_allowed = []() {
+            return dkr::runtime::netplay::external_side_effects_allowed();
+        },
     };
     const ultramodern::input::callbacks_t input_callbacks{
         .poll_input = dkr::runtime::platform::poll_input,
+        .frame_boundary = dkr::runtime::netplay::on_frame_boundary,
+        .physical_poll_allowed = []() {
+            return dkr::runtime::netplay::physical_input_poll_allowed();
+        },
         .get_input = dkr::runtime::platform::get_input,
         .set_rumble = dkr::runtime::platform::set_rumble,
         .get_connected_device_info = dkr::runtime::platform::get_connected_device_info,
@@ -426,7 +775,14 @@ int DkrMain(int argc, char** argv) {
     // not consistently serviced by every pinned runtime configuration and can
     // leave Escape, window close and Exit to Desktop unresponsive.
     const ultramodern::gfx_callbacks_t gfx_callbacks{};
-    const ultramodern::events::callbacks_t events_callbacks{};
+    const ultramodern::events::callbacks_t events_callbacks{
+        .authored_simulation_pacing_scale_milli_callback = []() {
+            return dkr::runtime::netplay::
+                authored_simulation_pacing_scale_milli();
+        },
+        .presentation_allowed_callback = []() {
+            return dkr::runtime::netplay::external_side_effects_allowed();
+        }};
     const ultramodern::error_handling::callbacks_t error_callbacks{.message_box = MessageBox};
     const ultramodern::threads::callbacks_t thread_callbacks{.get_game_thread_name = GetThreadName};
 
@@ -440,6 +796,9 @@ int DkrMain(int argc, char** argv) {
         .input_callbacks = input_callbacks,
         .gfx_callbacks = gfx_callbacks,
         .events_callbacks = events_callbacks,
+        .save_write_allowed_callback = []() {
+            return dkr::runtime::netplay::external_side_effects_allowed();
+        },
         .error_handling_callbacks = error_callbacks,
         .threads_callbacks = thread_callbacks,
         // DKR's scheduler interrupt queue can briefly be full while the VI and
@@ -451,68 +810,145 @@ int DkrMain(int argc, char** argv) {
         .message_queue_control = {.requeue_sp = true, .requeue_dp = true},
     };
 
-    std::fprintf(stderr, "[boot] runtime initialized; waiting for first safe VI state\n");
-    std::atomic<bool> runtime_finished{false};
-    std::exception_ptr runtime_failure;
-    std::thread runtime_thread([&] {
-        try {
-            recomp::start(configuration);
-        } catch (...) {
-            runtime_failure = std::current_exception();
+    for (;;) {
+#if DKR_RUNTIME_HAS_RT64
+        dkr::runtime::ui::reset_lifecycle_request();
+#endif
+        if (!dkr::runtime::SelectRom(rom_path, rom_error)) {
+            std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+            dkr::runtime::platform::shutdown();
+            return 3;
         }
-        runtime_finished.store(true, std::memory_order_release);
-    });
 
-    const auto runtime_started_at = std::chrono::steady_clock::now();
-    bool timeout_requested = false;
-    while (!runtime_finished.load(std::memory_order_acquire)) {
+        dkr::runtime::netplay::reset_runtime_state();
+        dkr::runtime::rev_a_asset_mutex::reset_statistics();
+        std::fprintf(stderr,
+                     "[boot] runtime initialized; waiting for first safe VI state\n");
+        std::atomic<bool> runtime_finished{false};
+        std::exception_ptr runtime_failure;
+        std::thread runtime_thread([&] {
+            try {
+                recomp::start(configuration);
+            } catch (...) {
+                runtime_failure = std::current_exception();
+            }
+            runtime_finished.store(true, std::memory_order_release);
+        });
+
+        const auto runtime_started_at = std::chrono::steady_clock::now();
+        bool timeout_requested = false;
+        while (!runtime_finished.load(std::memory_order_acquire)) {
 #if DKR_RUNTIME_HAS_RT64
-        // The SDL video subsystem and native window were created on this
-        // thread. Keep all window/input event pumping here for Windows, X11
-        // and Wayland compatibility while the recompiler owns its worker.
-        dkr::runtime::platform::pump_window_events(nullptr);
+            // The SDL video subsystem and native window were created on this
+            // thread. Keep all window/input event pumping here for Windows,
+            // X11 and Wayland compatibility while the recompiler owns its
+            // worker.
+            dkr::runtime::platform::pump_window_events(nullptr);
+            dkr::runtime::service_online_wait_presentation();
 #endif
-        if (!timeout_requested && timeout_seconds != 0 &&
-            std::chrono::steady_clock::now() - runtime_started_at >=
-                std::chrono::seconds(timeout_seconds)) {
+            if (!timeout_requested && timeout_seconds != 0 &&
+                std::chrono::steady_clock::now() - runtime_started_at >=
+                    std::chrono::seconds(timeout_seconds)) {
 #if DKR_RUNTIME_HAS_RT64
-            std::fprintf(stderr, "[boot][watchdog] completed-f3ddkr-tasks=%llu\n",
-                         static_cast<unsigned long long>(
-                             dkr::runtime::completed_f3ddkr_task_count()));
+                std::fprintf(
+                    stderr,
+                    "[boot][watchdog] completed-f3ddkr-tasks=%llu\n",
+                    static_cast<unsigned long long>(
+                        dkr::runtime::completed_f3ddkr_task_count()));
 #endif
-            std::fprintf(stderr, "[boot][watchdog] stopping after %u seconds\n",
-                         timeout_seconds);
-            timeout_requested = true;
-            ultramodern::quit();
+                std::fprintf(stderr,
+                             "[boot][watchdog] stopping after %u seconds\n",
+                             timeout_seconds);
+                timeout_requested = true;
+                ultramodern::quit();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    runtime_thread.join();
-#if DKR_RUNTIME_HAS_RT64
-    const auto lifecycle_request = dkr::runtime::ui::lifecycle_request();
-#endif
-    dkr::runtime::platform::shutdown();
-    if (runtime_failure != nullptr) {
-        try {
-            std::rethrow_exception(runtime_failure);
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "[boot] runtime failed: %s\n", error.what());
-        } catch (...) {
-            std::fprintf(stderr, "[boot] runtime failed with an unknown exception\n");
+        runtime_thread.join();
+        if (registered_revision == dkr::runtime::rom::Revision::UsV80) {
+            const auto mutex_stats =
+                dkr::runtime::rev_a_asset_mutex::statistics();
+            std::fprintf(
+                stderr,
+                "[perf][v1.1-asset-mutex] fast=%" PRIu64 "/%" PRIu64
+                " scheduler=%" PRIu64 "/%" PRIu64 "\n",
+                mutex_stats.fast_acquires, mutex_stats.fast_releases,
+                mutex_stats.scheduler_acquires,
+                mutex_stats.scheduler_releases);
         }
-        return 5;
-    }
 #if DKR_RUNTIME_HAS_RT64
-    if (lifecycle_request == dkr::runtime::ui::LifecycleRequest::Restart) {
-        std::fprintf(stderr, "[boot][restart] relaunching DKR-R\n");
-        return RelaunchApplication(argc, argv) ? 0 : 6;
-    }
+        const auto lifecycle_request = dkr::runtime::ui::lifecycle_request();
 #endif
-    std::fprintf(stderr, "[boot] runtime stopped cleanly\n");
-    return 0;
+        if (runtime_failure != nullptr) {
+            dkr::runtime::platform::shutdown();
+            try {
+                std::rethrow_exception(runtime_failure);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[boot] runtime failed: %s\n",
+                             error.what());
+            } catch (...) {
+                std::fprintf(
+                    stderr,
+                    "[boot] runtime failed with an unknown exception\n");
+            }
+            return 5;
+        }
+#if DKR_RUNTIME_HAS_RT64
+        if (lifecycle_request == dkr::runtime::ui::LifecycleRequest::StopGame) {
+            std::fprintf(stderr,
+                         "[boot][stop] game stopped; returning to launcher\n");
+            dkr::runtime::ui::reset_lifecycle_request();
+            const auto startup = dkr::runtime::ui::run_startup_screen(
+                static_cast<SDL_Window*>(
+                    dkr::runtime::platform::sdl_window()),
+                rom_path);
+            if (!startup.start_game) {
+                dkr::runtime::platform::shutdown();
+                if (startup.lifecycle_request ==
+                    dkr::runtime::ui::LifecycleRequest::Restart) {
+                    return RelaunchApplication(argc, argv) ? 0 : 6;
+                }
+                std::fprintf(stderr, "[boot] launcher closed cleanly\n");
+                return 0;
+            }
+
+            dkr::runtime::rom::Identity next_identity{};
+            std::filesystem::path next_rom_path = startup.rom_path;
+            if (!dkr::runtime::ValidateRomForLauncher(
+                    next_rom_path, next_identity, rom_error) ||
+                !PrepareCanonicalRomPath(next_rom_path, next_identity,
+                                         config_directory, rom_error)) {
+                std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+                dkr::runtime::platform::shutdown();
+                return 3;
+            }
+            if (next_identity.revision != registered_revision) {
+                std::fprintf(
+                    stderr,
+                    "[boot][rom] changing ROM revisions requires a clean "
+                    "runtime relaunch\n");
+                dkr::runtime::platform::shutdown();
+                return RelaunchApplication(argc, argv) ? 0 : 6;
+            }
+            rom_path = std::move(next_rom_path);
+            rom_identity = next_identity;
+            std::fprintf(stderr,
+                         "[boot][start] launching a new game session\n");
+            continue;
+        }
+        if (lifecycle_request == dkr::runtime::ui::LifecycleRequest::Restart) {
+            dkr::runtime::platform::shutdown();
+            std::fprintf(stderr, "[boot][restart] relaunching DKR-R\n");
+            return RelaunchApplication(argc, argv) ? 0 : 6;
+        }
+#endif
+        dkr::runtime::platform::shutdown();
+        std::fprintf(stderr, "[boot] runtime stopped cleanly\n");
+        return 0;
+    }
 }
 
-#ifdef _WIN32
+#if defined(_WIN32)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     return DkrMain(__argc, __argv);
 }

@@ -6,6 +6,9 @@
 using namespace dkr::runtime::rice_texture;
 
 int main() {
+    static_assert(kLegacyCoordinateShift == "none");
+    static_assert(kLegacyCoordinatePolicy == "legacy-rice-no-shift");
+
     const auto rgb = parse_filename(
         "Diddy Kong Racing/Backgrounds/Diddy Kong Racing#37B491A3#0#2_rgb.png");
     assert(rgb.has_value());

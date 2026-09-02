@@ -3,6 +3,8 @@
 #include "librecomp/helpers.hpp"
 #include "recomp.h"
 #include "ultramodern/ultra64.h"
+#include "runtime_platform.hpp"
+#include "virtual_pak_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -57,6 +59,31 @@ struct VirtualPak {
 std::filesystem::path g_config_directory;
 std::array<VirtualPak, 4> g_paks;
 std::atomic<bool> g_enabled{true};
+std::atomic<bool> g_self_test_allow_all{false};
+
+bool PortEnabled(int channel) {
+    if (!g_enabled.load(std::memory_order_acquire) || channel < 0 || channel >= 4) {
+        return false;
+    }
+    if (g_self_test_allow_all.load(std::memory_order_acquire) || channel == 0) {
+        return true;
+    }
+    const auto status = dkr::runtime::platform::player_controller_status(
+        static_cast<std::size_t>(channel));
+    return status.assigned && status.connected;
+}
+
+std::uint8_t ConnectedPortMask() {
+    std::array<bool, 4> assigned{};
+    std::array<bool, 4> connected{};
+    for (std::size_t channel = 1; channel < 4; ++channel) {
+        const auto status = dkr::runtime::platform::player_controller_status(channel);
+        assigned[channel] = status.assigned;
+        connected[channel] = status.connected;
+    }
+    return dkr::runtime::pak::policy::connected_port_mask(
+        g_enabled.load(std::memory_order_acquire), assigned, connected);
+}
 
 std::uint32_t AlignToPage(std::uint32_t value) {
     return (value + kPageSize - 1U) & ~(kPageSize - 1U);
@@ -228,7 +255,7 @@ bool SavePakLocked(int channel, VirtualPak& pak) {
 }
 
 std::int32_t EnsureLoaded(int channel, VirtualPak*& result) {
-    if (!g_enabled.load(std::memory_order_acquire) || channel < 0 || channel >= 4) {
+    if (!PortEnabled(channel)) {
         return kPfsNoPak;
     }
     VirtualPak& pak = g_paks[static_cast<std::size_t>(channel)];
@@ -326,49 +353,67 @@ bool dkr::runtime::pak::self_test(const std::filesystem::path& directory,
                                   std::string& error) {
     configure(directory);
     set_enabled(true);
+    struct TestPortGuard {
+        TestPortGuard() { g_self_test_allow_all.store(true, std::memory_order_release); }
+        ~TestPortGuard() { g_self_test_allow_all.store(false, std::memory_order_release); }
+    } test_port_guard;
+    for (int channel = 0; channel < 4; ++channel) {
+        VirtualPak& pak = g_paks[static_cast<std::size_t>(channel)];
+        {
+            std::scoped_lock lock(pak.mutex);
+            pak.files = {};
+            pak.loaded = true;
+            pak.corrupt = false;
+            pak.generation = 0;
+            if (!SavePakLocked(channel, pak)) {
+                error = "could not create Player " +
+                    std::to_string(channel + 1) + "'s empty virtual Pak";
+                return false;
+            }
+            PakFile& file = pak.files[0];
+            file.used = true;
+            file.company_code = 0x3459;
+            file.game_code = 0x4E445945;
+            file.extension = {0, 0, 0, static_cast<std::uint8_t>(channel + 1)};
+            file.name[0] = 'D';
+            file.name[1] = 'K';
+            file.name[2] = 'R';
+            file.name[3] = static_cast<std::uint8_t>('1' + channel);
+            file.data.resize(1024U);
+            for (std::size_t index = 0; index < file.data.size(); ++index) {
+                file.data[index] = static_cast<std::uint8_t>(
+                    (index * 37U + static_cast<std::size_t>(channel)) & 0xFFU);
+            }
+            if (!SavePakLocked(channel, pak)) {
+                error = "could not persist Player " +
+                    std::to_string(channel + 1) + "'s test data";
+                return false;
+            }
+        }
+        VirtualPak decoded;
+        std::error_code size_error;
+        if (std::filesystem::file_size(PakPath(channel), size_error) != kPakSize ||
+            size_error || !DecodePak(PakPath(channel), decoded) ||
+            !decoded.files[0].used || decoded.files[0].data.size() != 1024U ||
+            decoded.files[0].data[0] != static_cast<std::uint8_t>(channel)) {
+            error = "Player " + std::to_string(channel + 1) +
+                "'s 32 KiB round-trip validation failed";
+            return false;
+        }
+    }
+
+    // Create a third generation on Player 4, damage only the live file, and
+    // prove that the previous complete generation is recovered atomically.
     constexpr int channel = 3;
     VirtualPak& pak = g_paks[static_cast<std::size_t>(channel)];
     {
         std::scoped_lock lock(pak.mutex);
-        pak.files = {};
-        pak.loaded = true;
-        pak.corrupt = false;
-        pak.generation = 0;
+        pak.files[0].data[0] ^= 0x5AU;
         if (!SavePakLocked(channel, pak)) {
-            error = "could not create an empty virtual Pak";
-            return false;
-        }
-        PakFile& file = pak.files[0];
-        file.used = true;
-        file.company_code = 0x3459;
-        file.game_code = 0x4E445945;
-        file.extension = {0, 0, 0, 1};
-        file.name[0] = 'D';
-        file.name[1] = 'K';
-        file.name[2] = 'R';
-        file.data.resize(1024U);
-        for (std::size_t index = 0; index < file.data.size(); ++index) {
-            file.data[index] = static_cast<std::uint8_t>((index * 37U) & 0xFFU);
-        }
-        if (!SavePakLocked(channel, pak)) {
-            error = "could not persist test data";
-            return false;
-        }
-        file.data[0] ^= 0x5AU;
-        if (!SavePakLocked(channel, pak)) {
-            error = "could not create the recovery generation";
+            error = "could not create Player 4's recovery generation";
             return false;
         }
     }
-
-    VirtualPak decoded;
-    if (!DecodePak(PakPath(channel), decoded) || !decoded.files[0].used ||
-        decoded.files[0].data.size() != 1024U ||
-        decoded.files[0].data[0] != static_cast<std::uint8_t>(0x5AU)) {
-        error = "round-trip validation failed";
-        return false;
-    }
-
     const std::filesystem::path path = PakPath(channel);
     {
         std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
@@ -394,7 +439,7 @@ bool dkr::runtime::pak::self_test(const std::filesystem::path& directory,
     {
         std::scoped_lock lock(recovered->mutex);
         if (!recovered->files[0].used || recovered->files[0].data.size() != 1024U ||
-            recovered->files[0].data[0] != 0U) {
+            recovered->files[0].data[0] != static_cast<std::uint8_t>(channel)) {
             error = "backup recovery returned the wrong generation";
             return false;
         }
@@ -404,7 +449,7 @@ bool dkr::runtime::pak::self_test(const std::filesystem::path& directory,
 }
 
 extern "C" void osPfsIsPlug_recomp(std::uint8_t* rdram, recomp_context* context) {
-    MEM_B(0, context->r5) = dkr::runtime::pak::enabled() ? 1 : 0;
+    MEM_B(0, context->r5) = ConnectedPortMask();
     context->r2 = kPfsOk;
 }
 

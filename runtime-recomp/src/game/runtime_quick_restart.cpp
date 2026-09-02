@@ -1,20 +1,26 @@
 #include "quick_restart_policy.hpp"
 
+#include "game_payload.hpp"
 #include "runtime_enhancements.hpp"
 #include "runtime_input.hpp"
+#include "revision_addresses.hpp"
 
-#include "funcs.h"
 #include "recomp.h"
 
 #include <cstdint>
 
 namespace {
 
-constexpr std::uint32_t kTrophyRaceWorldIdAddress = 0x800E0FE8U;
-constexpr std::uint32_t kTracksModeAddress = 0x800DF4B8U;
-constexpr std::uint32_t kLevelLoadTimerAddress = 0x800DD394U;
-constexpr std::uint32_t kPausedAddress = 0x80123515U;
-constexpr std::uint32_t kPostRaceAddress = 0x80123516U;
+const std::uint32_t& kTrophyRaceWorldIdAddress =
+    dkr::runtime::revision_addresses::TrophyRaceWorldId;
+const std::uint32_t& kTracksModeAddress =
+    dkr::runtime::revision_addresses::TracksMode;
+const std::uint32_t& kLevelLoadTimerAddress =
+    dkr::runtime::revision_addresses::LevelLoadTimer;
+const std::uint32_t& kPausedAddress =
+    dkr::runtime::revision_addresses::IsPaused;
+const std::uint32_t& kPostRaceAddress =
+    dkr::runtime::revision_addresses::PostRaceViewport;
 constexpr std::uint32_t kSettingsWorldIdOffset = 0x48U;
 constexpr std::uint32_t kSettingsCourseIdOffset = 0x49U;
 constexpr gpr kRetailRestartButtons = 0x2020U; // L_TRIG | Z_TRIG
@@ -22,7 +28,6 @@ constexpr gpr kRetailRestartButtons = 0x2020U; // L_TRIG | Z_TRIG
 gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
 }
-
 std::int32_t ReadWord(std::uint8_t* rdram, std::uint32_t address) {
     return static_cast<std::int32_t>(MEM_W(0, RdramAddress(address)));
 }
@@ -55,6 +60,18 @@ extern "C" void dkr_quick_restart_poll(std::uint8_t* rdram,
         return;
     }
 
+    const dkr::runtime::GamePayload* payload =
+        dkr::runtime::active_payload();
+    if (payload == nullptr || payload->get_settings == nullptr ||
+        payload->leveltable_type == nullptr ||
+        payload->sound_clear_delayed == nullptr ||
+        payload->reset_delayed_text == nullptr ||
+        payload->should_check_lead_player == nullptr ||
+        payload->is_in_two_player_adventure == nullptr ||
+        payload->swap_lead_player == nullptr) {
+        return;
+    }
+
     dkr::runtime::quick_restart::State state{};
     state.modern_profile =
         dkr::runtime::enhancements::modern_presentation_enabled();
@@ -64,7 +81,8 @@ extern "C" void dkr_quick_restart_poll(std::uint8_t* rdram,
     state.trophy_race_world = ReadWord(rdram, kTrophyRaceWorldIdAddress);
     state.tracks_mode = ReadWord(rdram, kTracksModeAddress) != 0;
 
-    const gpr settings = CallAndReadV0(get_settings, rdram, *context);
+    const gpr settings = CallAndReadV0(
+        payload->get_settings, rdram, *context);
     const std::uint32_t settings_address = static_cast<std::uint32_t>(settings);
     if (settings_address < 0x80000000U || settings_address > 0x807FFFB6U) {
         return;
@@ -74,7 +92,7 @@ extern "C" void dkr_quick_restart_poll(std::uint8_t* rdram,
     const std::int32_t course_id = ReadUnsignedByte(
         rdram, settings_address + kSettingsCourseIdOffset);
     state.race_type = static_cast<std::int32_t>(CallAndReadV0(
-        leveltable_type, rdram, *context,
+        payload->leveltable_type, rdram, *context,
         static_cast<gpr>(course_id), true));
 
     if (!dkr::runtime::quick_restart::retail_restart_available(state)) {
@@ -82,16 +100,18 @@ extern "C" void dkr_quick_restart_poll(std::uint8_t* rdram,
     }
 
     recomp_context call = *context;
-    sound_clear_delayed(rdram, &call);
+    payload->sound_clear_delayed(rdram, &call);
     call = *context;
-    reset_delayed_text(rdram, &call);
+    payload->reset_delayed_text(rdram, &call);
 
     const bool should_check_lead_player =
-        CallAndReadV0(func_80023568, rdram, *context) != 0;
+        CallAndReadV0(payload->should_check_lead_player,
+                      rdram, *context) != 0;
     if (should_check_lead_player &&
-        CallAndReadV0(is_in_two_player_adventure, rdram, *context) != 0) {
+        CallAndReadV0(payload->is_in_two_player_adventure,
+                      rdram, *context) != 0) {
         call = *context;
-        swap_lead_player(rdram, &call);
+        payload->swap_lead_player(rdram, &call);
     }
 
     // mode_game keeps buttonHeldInputs in s0 at this boundary. Feed the same

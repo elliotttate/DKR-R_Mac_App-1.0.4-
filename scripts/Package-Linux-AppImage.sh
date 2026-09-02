@@ -4,7 +4,11 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIRECTORY="${DKR_LINUX_BUILD_DIR:-${PROJECT_ROOT}/build/dkr-runtime-linux}"
 BINARY="${BUILD_DIRECTORY}/bin/Release/DKR-R"
-VERSION="${DKR_RELEASE_VERSION:-$(tr -d '\r\n' < "${PROJECT_ROOT}/VERSION")}"
+INPUT_HOST_DIRECTORY="${BUILD_DIRECTORY}/bin/Release/libexec/dkr-r"
+INPUT_HOST="${INPUT_HOST_DIRECTORY}/DKR-R-InputHost"
+SDL3_LIBRARY="${INPUT_HOST_DIRECTORY}/libSDL3.so.0"
+VERSION_FILE_VALUE="$(tr -d '\r\n' < "${PROJECT_ROOT}/VERSION")"
+VERSION="${DKR_RELEASE_VERSION:-${VERSION_FILE_VALUE}}"
 APPDIR="${DKR_APPDIR:-${PROJECT_ROOT}/dist/DKR-R-${VERSION}-Linux-x86_64.AppDir}"
 OUTPUT="${DKR_APPIMAGE_OUTPUT:-${PROJECT_ROOT}/dist/DKR-R-${VERSION}-Linux-x86_64.AppImage}"
 LINUXDEPLOY="${LINUXDEPLOY:-${PROJECT_ROOT}/.deps/tools/linuxdeploy-x86_64.AppImage}"
@@ -13,7 +17,8 @@ ICON_FILE="${DKR_LINUX_ICON_FILE:-${PROJECT_ROOT}/assets/ui/Icons/256x256.png}"
 ICON_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/dkr-r-icon.XXXXXX")"
 BINARY_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/dkr-r-binary.XXXXXX")"
 PAK_TEST="$(mktemp -d "${TMPDIR:-/tmp}/dkr-r-appimage-pak.XXXXXX")"
-trap 'rm -rf -- "${ICON_STAGE}" "${BINARY_STAGE}" "${PAK_TEST}"' EXIT
+INPUT_SWITCH_TEST="$(mktemp -d "${TMPDIR:-/tmp}/dkr-r-appimage-input-switch.XXXXXX")"
+trap 'rm -rf -- "${ICON_STAGE}" "${BINARY_STAGE}" "${PAK_TEST}" "${INPUT_SWITCH_TEST}"' EXIT
 
 validate_release_tree() {
   local root="$1"
@@ -78,9 +83,12 @@ collect_linux_dependency_notices() {
 }
 
 [[ -x "${BINARY}" ]] || { echo "Missing Linux release binary: ${BINARY}" >&2; exit 1; }
+[[ -x "${INPUT_HOST}" ]] || { echo "Missing private SDL3 input host: ${INPUT_HOST}" >&2; exit 1; }
+[[ -f "${SDL3_LIBRARY}" ]] || { echo "Missing private SDL3 runtime: ${SDL3_LIBRARY}" >&2; exit 1; }
 [[ -x "${LINUXDEPLOY}" ]] || { echo "Missing linuxdeploy: ${LINUXDEPLOY}" >&2; exit 1; }
 [[ -x "${APPIMAGE_PLUGIN}" ]] || { echo "Missing linuxdeploy AppImage plugin: ${APPIMAGE_PLUGIN}" >&2; exit 1; }
 [[ -f "${ICON_FILE}" ]] || { echo "Missing Linux application icon: ${ICON_FILE}" >&2; exit 1; }
+command -v patchelf >/dev/null || { echo "Missing required command: patchelf" >&2; exit 1; }
 [[ ! -e "${APPDIR}" ]] || { echo "AppDir already exists; choose a fresh DKR_APPDIR: ${APPDIR}" >&2; exit 1; }
 [[ ! -e "${OUTPUT}" ]] || { echo "Output already exists; choose a fresh DKR_APPIMAGE_OUTPUT: ${OUTPUT}" >&2; exit 1; }
 
@@ -90,14 +98,25 @@ install -m 0644 "${ICON_FILE}" "${ICON_STAGE}/dkr-r.png"
 install -m 0755 "${BINARY}" "${BINARY_STAGE}/DKR-R"
 install -m 0644 "${PROJECT_ROOT}/LICENSE.md" "${APPDIR}/usr/share/doc/dkr-port/LICENSE.md"
 install -m 0644 "${PROJECT_ROOT}/THIRD_PARTY.md" "${APPDIR}/usr/share/doc/dkr-port/THIRD_PARTY.md"
+install -m 0644 "${PROJECT_ROOT}/docs/ONLINE_MULTIPLAYER.md" "${APPDIR}/usr/share/doc/dkr-port/ONLINE_MULTIPLAYER.md"
 install -m 0644 "${PROJECT_ROOT}/runtime-recomp/COPYING-NOTICE.md" "${APPDIR}/usr/share/doc/dkr-port/COPYING-NOTICE.md"
 install -m 0644 "${PROJECT_ROOT}/extern/rt64/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/RT64-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/rt64/src/contrib/imgui/LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/Dear-ImGui-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/rt64/src/contrib/mupen64plus-win32-deps/SDL2-2.26.3/COPYING.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/SDL2-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/sdl3/LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/SDL3-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/n64-modern-runtime/COPYING" "${APPDIR}/usr/share/doc/dkr-port/licenses/N64ModernRuntime-COPYING.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/n64-modern-runtime/N64Recomp/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/N64Recomp-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/Jumpman-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/Jumpman-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/CRT-FILTERS-NOTICE.md" "${APPDIR}/usr/share/doc/dkr-port/licenses/CRT-FILTERS-NOTICE.md"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/GEKKONET-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/GEKKONET-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/MONOCYPHER-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/MONOCYPHER-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/LIBDATACHANNEL-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/mbedtls/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/MBEDTLS-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/deps/libjuice/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/LIBJUICE-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/deps/usrsctp/LICENSE.md" "${APPDIR}/usr/share/doc/dkr-port/licenses/USRSCTP-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/deps/json/LICENSE.MIT" "${APPDIR}/usr/share/doc/dkr-port/licenses/NLOHMANN-JSON-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/deps/plog/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/PLOG-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/linux/dkr-port.appdata.xml" "${APPDIR}/usr/share/metainfo/dkr-port.appdata.xml"
 
 export PATH="$(dirname "${APPIMAGE_PLUGIN}"):${PATH}"
@@ -118,16 +137,43 @@ export LDAI_NO_APPSTREAM=1
   --icon-file "${ICON_STAGE}/dkr-r.png"
 
 mkdir -p "${APPDIR}/usr/bin/assets/ui/Icons"
-install -m 0644 "${PROJECT_ROOT}/assets/ui/Icons/DKR-R8.bmp" \
-  "${APPDIR}/usr/bin/assets/ui/Icons/DKR-R8.bmp"
+install -m 0644 "${PROJECT_ROOT}/assets/ui/Icons/DKR-R-Logo.bmp" \
+  "${APPDIR}/usr/bin/assets/ui/Icons/DKR-R-Logo.bmp"
+install -m 0644 "${PROJECT_ROOT}/assets/ui/Icons/DKR-R-Spinning-Icon.png" \
+  "${APPDIR}/usr/bin/assets/ui/Icons/DKR-R-Spinning-Icon.png"
+install -m 0644 "${PROJECT_ROOT}/assets/ui/Icons/DKR-R-Short-Logo.png" \
+  "${APPDIR}/usr/bin/assets/ui/Icons/DKR-R-Short-Logo.png"
+mkdir -p "${APPDIR}/usr/bin/assets/ui/Backgrounds"
+install -m 0644 \
+  "${PROJECT_ROOT}/assets/ui/Backgrounds/DKR-R-Launcher-Background.png" \
+  "${APPDIR}/usr/bin/assets/ui/Backgrounds/DKR-R-Launcher-Background.png"
 mkdir -p "${APPDIR}/usr/bin/assets/filters"
 install -m 0644 "${PROJECT_ROOT}"/assets/filters/*.png \
   "${APPDIR}/usr/bin/assets/filters/"
+mkdir -p "${APPDIR}/usr/bin/assets/controllers"
+install -m 0644 "${PROJECT_ROOT}/assets/controllers/gamecontrollerdb.txt" \
+  "${APPDIR}/usr/bin/assets/controllers/gamecontrollerdb.txt"
+
+# Keep SDL3 outside usr/bin so it cannot replace or interpose on the SDL2 ABI
+# used by the single launcher/game window. The helper has an $ORIGIN rpath and
+# therefore resolves only the private copy installed beside it.
+mkdir -p "${APPDIR}/usr/libexec/dkr-r"
+install -m 0755 "${INPUT_HOST}" \
+  "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost"
+install -m 0755 "${SDL3_LIBRARY}" \
+  "${APPDIR}/usr/libexec/dkr-r/libSDL3.so.0"
+patchelf --set-rpath '$ORIGIN' \
+  "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost"
+LD_LIBRARY_PATH="${APPDIR}/usr/libexec/dkr-r${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+  "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost" --self-test --mappings \
+  "${APPDIR}/usr/bin/assets/controllers/gamecontrollerdb.txt"
 
 collect_linux_dependency_notices "${APPDIR}"
 validate_release_tree "${APPDIR}"
 "${APPIMAGE_PLUGIN}" --appdir "${APPDIR}"
 [[ -s "${OUTPUT}" ]] || { echo "AppImage output is missing or empty: ${OUTPUT}" >&2; exit 1; }
 APPIMAGE_EXTRACT_AND_RUN=1 "${OUTPUT}" --self-test-pak "${PAK_TEST}"
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy APPIMAGE_EXTRACT_AND_RUN=1 \
+  "${OUTPUT}" --self-test-input-switch "${INPUT_SWITCH_TEST}"
 echo "Created ${OUTPUT}"
 sha256sum "${OUTPUT}"

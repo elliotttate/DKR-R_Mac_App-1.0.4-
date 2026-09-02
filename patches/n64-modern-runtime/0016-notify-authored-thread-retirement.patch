@@ -1,0 +1,26 @@
+diff --git a/librecomp/include/librecomp/game.hpp b/librecomp/include/librecomp/game.hpp
+index c453d54..52dc982 100644
+--- a/librecomp/include/librecomp/game.hpp
++++ b/librecomp/include/librecomp/game.hpp
+@@ -34,5 +34,6 @@ namespace recomp {
+ 
+         void (*thread_create_callback)(uint8_t* rdram, recomp_context* context) = nullptr;
++        void (*thread_destroy_callback)(uint8_t* rdram, recomp_context* context) = nullptr;
+ 
+         void (*on_init_callback)(uint8_t* rdram, recomp_context* context) = nullptr;
+ 
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index d551a81..94fe8cb 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -476,6 +476,10 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
+ 
+     recomp_func_t* func = get_function(addr);
+     func(rdram, &ctx);
++
++    if (game_entry.thread_destroy_callback != nullptr) {
++        game_entry.thread_destroy_callback(rdram, &ctx);
++    }
+ }
+ 
+ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {

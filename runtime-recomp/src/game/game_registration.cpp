@@ -1,46 +1,94 @@
 #include "game_registration.hpp"
 
-#include "funcs.h"
-#include "librecomp/game.hpp"
-#include "librecomp/overlays.hpp"
+#include "game_payload.hpp"
+#include "revision_addresses.hpp"
+#include "runtime_netplay.hpp"
+#include "runtime_save_routing.hpp"
 
-#include "../../RecompiledFuncs/recomp_overlays.inl"
+#include "librecomp/game.hpp"
+#include "ultramodern/ultramodern.hpp"
 
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
-constexpr std::uint64_t kRomXxh3 = 0x68512C37A6FDA951ULL;
 constexpr gpr kInitialCodeAddress = static_cast<gpr>(static_cast<std::int32_t>(0x80000400U));
-constexpr gpr kEntrypointStackTop = static_cast<gpr>(static_cast<std::int32_t>(0x80120AC0U));
 
 void InitialiseEntrypointContext(std::uint8_t*, recomp_context* context) {
     // The CIC 6103/bootstrap path clears BSS and establishes this stack before
     // tail-calling mainproc. RDRAM is already zeroed by N64ModernRuntime.
-    context->r29 = kEntrypointStackTop;
+    context->r29 = static_cast<gpr>(static_cast<std::int32_t>(
+        dkr::runtime::revision_addresses::EntrypointStackTop));
+    dkr::runtime::netplay::register_runtime_context(nullptr, context);
+}
+
+void RegisterThreadContext(std::uint8_t* rdram, recomp_context* context) {
+    dkr::runtime::netplay::register_runtime_context(rdram, context);
+}
+
+void UnregisterThreadContext(std::uint8_t* rdram, recomp_context* context) {
+    dkr::runtime::netplay::unregister_runtime_context(rdram, context);
+}
+
+void RunDkrEntrypoint(std::uint8_t* rdram, recomp_context* context) {
+    const dkr::runtime::GamePayload* payload = dkr::runtime::active_payload();
+    if (payload == nullptr || payload->entrypoint == nullptr) {
+        ultramodern::quit();
+        return;
+    }
+
+    dkr::runtime::saves::reset_runtime_online_save_status();
+    const auto online = dkr::runtime::netplay::session().runtime_view();
+    if (online.active) {
+        if (!online.launch_descriptor) {
+            dkr::runtime::netplay::session().fail_runtime_start(
+                "The online launch has no authenticated match descriptor.");
+            ultramodern::quit();
+            return;
+        }
+        std::string error;
+        if (!dkr::runtime::saves::activate_online_save_for_runtime(
+                online.host, online.launch_descriptor->match_id,
+                online.online_save_hash, error)) {
+            dkr::runtime::netplay::session().fail_runtime_start(
+                "The isolated online save could not be activated: " + error);
+            std::fprintf(stderr, "[netplay][save] %s\n", error.c_str());
+            ultramodern::quit();
+            return;
+        }
+        std::fprintf(stderr,
+                     "[netplay][save] isolated online EEPROM activated\n");
+    } else {
+        // A game can return to this launcher and start again in the same
+        // process. Explicitly leave any prior online route before a local
+        // launch so single-player always reopens its ordinary EEPROM.
+        ultramodern::change_save_file(u8"", u8"dkr.us.v77");
+    }
+    payload->entrypoint(rdram, context);
 }
 
 } // namespace
 
-void dkr::runtime::RegisterGeneratedSections() {
-    const recomp::overlays::overlay_section_table_data_t sections{
-        .code_sections = section_table,
-        .num_code_sections = ARRLEN(section_table),
-        .total_num_sections = num_sections,
-    };
-    const recomp::overlays::overlays_by_index_t overlays{
-        .table = overlay_sections_by_index,
-        .len = ARRLEN(overlay_sections_by_index),
-    };
-    recomp::overlays::register_overlays(sections, overlays);
-}
+bool dkr::runtime::RegisterGame(const std::filesystem::path& config_directory,
+                                rom::Revision revision, std::string& error) {
+    const GamePayload* payload = payload_for(revision);
+    if (payload == nullptr || payload->entrypoint == nullptr ||
+        payload->register_sections == nullptr) {
+        error = "The selected ROM revision has no linked CPU payload.";
+        return false;
+    }
 
-void dkr::runtime::RegisterGame(const std::filesystem::path& config_directory) {
+    if (!select_payload(revision)) {
+        error = "The selected ROM revision could not activate its CPU payload.";
+        return false;
+    }
+    revision_addresses::select(revision);
     recomp::register_config_path(config_directory);
-    RegisterGeneratedSections();
+    payload->register_sections();
 
     const recomp::GameEntry game{
-        .rom_hash = kRomXxh3,
+        .rom_hash = payload->rom_hash,
         .internal_name = "DIDDY KONG RACING",
         .game_id = kGameId,
         .mod_game_id = "dkr",
@@ -49,14 +97,26 @@ void dkr::runtime::RegisterGame(const std::filesystem::path& config_directory) {
         .decompression_routine = nullptr,
         .has_compressed_code = false,
         .entrypoint_address = kInitialCodeAddress,
-        .entrypoint = recomp_entrypoint,
-        .thread_create_callback = nullptr,
+        .entrypoint = RunDkrEntrypoint,
+        .thread_create_callback = RegisterThreadContext,
+        .thread_destroy_callback = UnregisterThreadContext,
         .on_init_callback = InitialiseEntrypointContext,
     };
     recomp::register_game(game);
+    error.clear();
+    return true;
 }
 
 bool dkr::runtime::SelectRom(const std::filesystem::path& rom_path, std::string& error) {
+    rom::Identity identity{};
+    if (!ValidateRomForLauncher(rom_path, identity, error)) {
+        return false;
+    }
+    if (identity.revision != revision_addresses::selected_revision()) {
+        error = "The selected ROM changed after its CPU payload was registered.";
+        return false;
+    }
+
     std::u8string game_id{kGameId};
     const recomp::RomValidationError result = recomp::select_rom(rom_path, game_id);
     if (result == recomp::RomValidationError::Good) {
@@ -71,14 +131,26 @@ bool dkr::runtime::SelectRom(const std::filesystem::path& rom_path, std::string&
         error = "The selected file is not a recognized N64 ROM.";
         break;
     case recomp::RomValidationError::IncorrectVersion:
-        error = "The ROM is Diddy Kong Racing, but not the supported US v1.0/v77 revision.";
+        error = "The ROM is Diddy Kong Racing, but does not match its selected CPU payload.";
         break;
     case recomp::RomValidationError::IncorrectRom:
-        error = "The selected ROM is not Diddy Kong Racing US v1.0/v77.";
+        error = "The selected ROM is not a supported Diddy Kong Racing US revision.";
         break;
     default:
         error = "The runtime rejected the selected ROM.";
         break;
     }
     return false;
+}
+
+bool dkr::runtime::ValidateRomForLauncher(const std::filesystem::path& rom_path,
+                                          rom::Identity& identity,
+                                          std::string& error) {
+    identity = rom::inspect(rom_path);
+    if (!identity.supported()) {
+        error = rom::describe(identity);
+        return false;
+    }
+    error.clear();
+    return true;
 }

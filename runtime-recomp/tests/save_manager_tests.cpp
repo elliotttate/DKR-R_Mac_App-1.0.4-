@@ -44,10 +44,17 @@ std::vector<std::uint8_t> valid_pak() {
 
 void write_bytes(const std::filesystem::path& path,
                  const std::vector<std::uint8_t>& bytes) {
+    std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(bytes.data()),
                  static_cast<std::streamsize>(bytes.size()));
     assert(output.good());
+}
+
+std::vector<std::uint8_t> read_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
 }
 
 } // namespace
@@ -92,6 +99,30 @@ int main() {
     assert(dkr::runtime::saves::load_adventure(erased_slot_image, error));
     assert(erased_slot_image.slots[1].name.empty());
 
+    std::fputs("[test][save-manager] checksum-only recovery\n", stderr);
+    const auto live_save = dkr::runtime::saves::adventure_info().path;
+    auto corrupt_live = read_bytes(live_save);
+    corrupt_live[0] ^= 0x5AU;
+    corrupt_live[0x78U] ^= 0x40U;
+    write_bytes(live_save, corrupt_live);
+    assert(!dkr::runtime::saves::adventure_info().valid);
+    bool repaired = false;
+    std::filesystem::path repair_backup;
+    assert(dkr::runtime::saves::repair_adventure_checksums(
+        repaired, repair_backup, error));
+    assert(repaired && std::filesystem::exists(repair_backup));
+    assert(read_bytes(repair_backup) == corrupt_live);
+    assert(dkr::runtime::saves::adventure_info().valid);
+    std::vector<std::uint8_t> canonical_live;
+    assert(dkr::runtime::saves::canonical_adventure_bytes(
+        canonical_live, error));
+    assert(canonical_live == dkr::runtime::saves::codec::blank_bytes());
+    repaired = true;
+    repair_backup.clear();
+    assert(dkr::runtime::saves::repair_adventure_checksums(
+        repaired, repair_backup, error));
+    assert(!repaired && repair_backup.empty());
+
     const auto invalid = root / "invalid.bin";
     std::ofstream(invalid, std::ios::binary).put('x');
     assert(!dkr::runtime::saves::import_adventure(invalid, error));
@@ -99,7 +130,58 @@ int main() {
     auto corrupt_adventure = dkr::runtime::saves::codec::blank_bytes();
     corrupt_adventure[12] ^= 1U;
     write_bytes(bad_checksum, corrupt_adventure);
-    assert(!dkr::runtime::saves::import_adventure(bad_checksum, error));
+    assert(dkr::runtime::saves::import_adventure(bad_checksum, error));
+    assert(dkr::runtime::saves::adventure_info().valid);
+    assert(read_bytes(dkr::runtime::saves::adventure_info().path)[12] ==
+           corrupt_adventure[12]);
+
+    std::fputs("[test][save-manager] isolated online saves\n", stderr);
+    auto host_image = dkr::runtime::saves::codec::blank_image();
+    host_image.slots[0].name = "NET";
+    host_image.slots[0].balloons = {1, 0, 0, 0, 0, 0};
+    const auto host_save = dkr::runtime::saves::codec::encode(host_image);
+    const auto single_player_before_online = read_bytes(
+        dkr::runtime::saves::adventure_info().path);
+    const std::size_t backups_before_online =
+        dkr::runtime::saves::adventure_backups().size();
+    std::vector<std::uint8_t> seeded_online;
+    assert(dkr::runtime::saves::prepare_host_online_adventure(
+        dkr::runtime::saves::OnlineSaveSeedMode::CopySinglePlayer,
+        seeded_online, error));
+    assert(seeded_online == single_player_before_online);
+    assert(read_bytes(dkr::runtime::saves::adventure_info().path) ==
+           single_player_before_online);
+
+    assert(dkr::runtime::saves::prepare_host_online_adventure(
+        dkr::runtime::saves::OnlineSaveSeedMode::Fresh,
+        seeded_online, error));
+    assert(seeded_online == dkr::runtime::saves::codec::blank_bytes());
+    const auto host_online_info =
+        dkr::runtime::saves::previous_online_adventure_info();
+    assert(host_online_info.exists && host_online_info.valid);
+    write_bytes(host_online_info.path, host_save);
+    assert(dkr::runtime::saves::prepare_host_online_adventure(
+        dkr::runtime::saves::OnlineSaveSeedMode::ContinuePreviousSession,
+        seeded_online, error));
+    assert(seeded_online == host_save);
+
+    constexpr std::uint64_t match_id = 0x1234ABCDEF987654ULL;
+    std::filesystem::path installed_online;
+    assert(dkr::runtime::saves::install_synchronized_online_adventure(
+        match_id, host_save, installed_online, error));
+    assert(read_bytes(installed_online) == host_save);
+    assert(installed_online.parent_path().filename() == "1234abcdef987654");
+    std::vector<std::uint8_t> readback_online;
+    std::filesystem::path readback_path;
+    assert(dkr::runtime::saves::read_online_adventure(
+        false, match_id, readback_online, readback_path, error));
+    assert(readback_path == installed_online && readback_online == host_save);
+    assert(!dkr::runtime::saves::install_synchronized_online_adventure(
+        0U, host_save, installed_online, error));
+    assert(read_bytes(dkr::runtime::saves::adventure_info().path) ==
+           single_player_before_online);
+    assert(dkr::runtime::saves::adventure_backups().size() ==
+           backups_before_online);
 
     dkr::runtime::saves::codec::SaveImage editable{};
     assert(dkr::runtime::saves::load_adventure(editable, error));

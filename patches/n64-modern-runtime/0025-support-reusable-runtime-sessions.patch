@@ -1,0 +1,375 @@
+Exit code: 0
+Wall time: 0.3 seconds
+Output:
+From c306d452b4624943eaefacb1dff261e2524aeb5d Mon Sep 17 00:00:00 2001
+From: DKR-R Patch Pipeline <patch-pipeline@local.invalid>
+Date: Thu, 27 Aug 2026 18:54:06 +0100
+Subject: [PATCH] Support reusable runtime sessions
+
+---
+ librecomp/src/pi.cpp                          |  7 +++
+ librecomp/src/recomp.cpp                      | 17 ++++--
+ .../include/ultramodern/ultramodern.hpp       |  2 +
+ ultramodern/src/events.cpp                    | 56 +++++++++++++++++--
+ ultramodern/src/mesgqueue.cpp                 | 25 +++++++++
+ ultramodern/src/threads.cpp                   | 26 ++++++++-
+ ultramodern/src/timer.cpp                     | 35 ++++++++++--
+ ultramodern/src/ultrainit.cpp                 |  2 +-
+ 8 files changed, 153 insertions(+), 17 deletions(-)
+
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 5cfd9c0..1ef7291 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -244,6 +244,10 @@ void read_save_file() {
+ }
+ 
+ void ultramodern::init_saving(RDRAM_ARG1) {
++    while (save_context.write_sempahore.tryWait()) {}
++    while (save_context.swap_file_pending_sempahore.tryWait()) {}
++    while (save_context.swap_file_ready_sempahore.tryWait()) {}
++
+     set_save_file_path(u8"", recomp::current_game_id());
+ 
+     save_context.save_buffer.resize(get_save_size(recomp::get_save_type()));
+@@ -267,6 +271,9 @@ void ultramodern::join_saving_thread() {
+     if (save_context.saving_thread.joinable()) {
+         save_context.saving_thread.join();
+     }
++    while (save_context.write_sempahore.tryWait()) {}
++    while (save_context.swap_file_pending_sempahore.tryWait()) {}
++    while (save_context.swap_file_ready_sempahore.tryWait()) {}
+ }
+ 
+ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_addr, uint32_t size, uint32_t direction) {
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index f783d08..fc40fc3 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -544,11 +544,8 @@ moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ void ultramodern::quit() {
+     exited.store(true);
+     ultramodern::notify_external_message_waiters();
+-    GameStatus desired = GameStatus::None;
+-    game_status.compare_exchange_strong(desired, GameStatus::Quit);
++    game_status.store(GameStatus::Quit);
+     game_status.notify_all();
+-    std::lock_guard<std::mutex> lock(current_game_mutex);
+-    current_game.reset();
+ }
+ 
+ void recomp::mods::enable_mod(const std::string& mod_id, bool enabled) {
+@@ -740,6 +737,10 @@ bool recomp::flashram_allowed() {
+ }
+ 
+ void recomp::start(const recomp::Configuration& cfg) {
++    exited.store(false);
++    while (graphics_shutdown_ready.tryWait()) {}
++    ultramodern::reset_external_message_state();
++
+     project_version = cfg.project_version;
+     save_write_allowed_callback = cfg.save_write_allowed_callback;
+     recomp::check_all_stored_roms();
+@@ -836,8 +837,16 @@ void recomp::start(const recomp::Configuration& cfg) {
+ 
+     game_thread.join();
+     ultramodern::join_event_threads();
++    ultramodern::join_timer_thread();
+     ultramodern::join_thread_cleaner_thread();
+     ultramodern::join_saving_thread();
++
++    game_status.store(GameStatus::None);
++    game_status.notify_all();
++    {
++        std::lock_guard<std::mutex> lock(current_game_mutex);
++        current_game.reset();
++    }
+     
+     // Free rdram.
+     bool free_failed;
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 0378f63..ed7b282 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -150,6 +150,8 @@ struct gfx_callbacks_t {
+ 
+ bool is_game_started();
+ void quit();
++void reset_external_message_state();
++void join_timer_thread();
+ void join_event_threads();
+ void join_thread_cleaner_thread();
+ void join_saving_thread();
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index f969908..ff47613 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -614,9 +614,46 @@ void ultramodern::send_si_message() {
+     ultramodern::enqueue_external_message_src(events_context.si.mq, events_context.si.msg, false, ultramodern::EventMessageSource::Si);
+ }
+ 
++static void reset_event_state() {
++    Action action;
++    while (events_context.action_queue.try_dequeue(action)) {}
++
++    OSTask* task = nullptr;
++    while (events_context.sp_task_queue.try_dequeue(task)) {}
++
++    OSThread* deleted_thread = nullptr;
++    while (events_context.deleted_threads.try_dequeue(deleted_thread)) {}
++
++    {
++        std::lock_guard lock{ events_context.message_mutex };
++        events_context.vi.cur_state = 0;
++        events_context.vi.field = 0;
++        events_context.vi.states[0] = ViState{};
++        events_context.vi.states[1] = ViState{};
++        events_context.vi.regs = {};
++        events_context.vi.update_screen_regs = {};
++        events_context.sp.mq = NULLPTR;
++        events_context.sp.msg = (OSMesg)0;
++        events_context.dp.mq = NULLPTR;
++        events_context.dp.msg = (OSMesg)0;
++        events_context.ai.mq = NULLPTR;
++        events_context.ai.msg = (OSMesg)0;
++        events_context.si.mq = NULLPTR;
++        events_context.si.msg = (OSMesg)0;
++    }
++
++    screen_update_action_pending.store(false);
++    total_vis = 0;
++    display_refresh_rate.store(60);
++    resolution_scale.store(1.0f);
++    renderer_setup_result.store(ultramodern::renderer::SetupResult::Success);
++    renderer_chosen_api.store(ultramodern::renderer::GraphicsApi::Auto);
++}
++
+ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {
+     moodycamel::LightweightSemaphore gfx_thread_ready;
+     moodycamel::LightweightSemaphore task_thread_ready;
++    reset_event_state();
+     events_context.rdram = rdram;
+     events_context.sp.gfx_thread = std::thread{ gfx_thread_func, rdram, &gfx_thread_ready, window_handle };
+     events_context.sp.task_thread = std::thread{ task_thread_func, rdram, &task_thread_ready };
+@@ -658,10 +695,21 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
+ }
+ 
+ void ultramodern::join_event_threads() {
+-    events_context.sp.gfx_thread.join();
+-    events_context.vi.thread.join();
++    if (events_context.sp.gfx_thread.joinable()) {
++        events_context.sp.gfx_thread.join();
++    }
++    if (events_context.vi.thread.joinable()) {
++        events_context.vi.thread.join();
++    }
+ 
+     // Send a null RSP task to indicate that the RSP task thread should exit.
+-    events_context.sp_task_queue.enqueue(nullptr);
+-    events_context.sp.task_thread.join();
++    if (events_context.sp.task_thread.joinable()) {
++        events_context.sp_task_queue.enqueue(nullptr);
++        events_context.sp.task_thread.join();
++    }
++
++    Action action;
++    while (events_context.action_queue.try_dequeue(action)) {}
++    OSTask* task = nullptr;
++    while (events_context.sp_task_queue.try_dequeue(task)) {}
+ }
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 6ed0d32..d5ec199 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -7,6 +7,7 @@
+ #include <mutex>
+ #include <thread>
+ #include <utility>
++#include <vector>
+ 
+ #include "blockingconcurrentqueue.h"
+ 
+@@ -96,6 +97,30 @@ static void complete_delivery(const std::shared_ptr<MessageDeliveryState>& deliv
+     delivery->condition.notify_all();
+ }
+ 
++void ultramodern::reset_external_message_state() {
++    std::vector<std::shared_ptr<MessageDeliveryState>> deliveries;
++    QueuedMessage queued{};
++    while (external_messages.try_dequeue(queued)) {
++        if (queued.delivery != nullptr) {
++            deliveries.push_back(std::move(queued.delivery));
++        }
++    }
++
++    {
++        std::lock_guard lock{ pending_delivery_mutex };
++        for (auto& pending : pending_deliveries) {
++            while (!pending.empty()) {
++                deliveries.push_back(std::move(pending.front()));
++                pending.pop_front();
++            }
++        }
++    }
++
++    for (const auto& delivery : deliveries) {
++        complete_delivery(delivery);
++    }
++}
++
+ static void defer_delivery_completion(
+     const std::shared_ptr<MessageDeliveryState>& delivery) {
+     if (delivery == nullptr) {
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index e033a78..c6a0295 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -348,6 +348,23 @@ static std::thread thread_cleaner_thread;
+ static moodycamel::BlockingConcurrentQueue<UltraThreadContext*> deleted_threads{};
+ extern std::atomic_bool exited;
+ 
++static void delete_thread_context(UltraThreadContext* context) {
++    if (context == nullptr) {
++        return;
++    }
++    if (context->host_thread.joinable()) {
++        context->host_thread.join();
++    }
++    delete context;
++}
++
++static void drain_deleted_threads() {
++    UltraThreadContext* context = nullptr;
++    while (deleted_threads.try_dequeue(context)) {
++        delete_thread_context(context);
++    }
++}
++
+ void thread_cleaner_func() {
+     using namespace std::chrono_literals;
+     while (!exited) {
+@@ -355,13 +372,13 @@ void thread_cleaner_func() {
+         if (deleted_threads.wait_dequeue_timed(to_delete, 10ms)) {
+             debug_printf("[Cleanup] Deleting thread context %p\n", to_delete);
+ 
+-            to_delete->host_thread.join();
+-            delete to_delete;
++            delete_thread_context(to_delete);
+         }
+     }
+ }
+ 
+ void ultramodern::init_thread_cleanup() {
++    drain_deleted_threads();
+     thread_cleaner_thread = std::thread{thread_cleaner_func};
+ }
+ 
+@@ -370,5 +387,8 @@ void ultramodern::cleanup_thread(UltraThreadContext *cur_context) {
+ }
+ 
+ void ultramodern::join_thread_cleaner_thread() {
+-    thread_cleaner_thread.join();
++    if (thread_cleaner_thread.joinable()) {
++        thread_cleaner_thread.join();
++    }
++    drain_deleted_threads();
+ }
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index ee26c45..99a8cf2 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -37,7 +37,9 @@ struct RemoveTimerAction {
+     PTR(OSTimer) timer;
+ };
+ 
+-using Action = std::variant<AddTimerAction, RemoveTimerAction>;
++struct ShutdownTimerAction {};
++
++using Action = std::variant<AddTimerAction, RemoveTimerAction, ShutdownTimerAction>;
+ 
+ struct {
+     std::thread thread;
+@@ -94,20 +96,27 @@ void timer_thread(RDRAM_ARG1) {
+             active_timers.insert(add_action->timer);
+         } else if (const auto* remove_action = std::get_if<RemoveTimerAction>(&action)) {
+             active_timers.erase(remove_action->timer);
++        } else if (std::holds_alternative<ShutdownTimerAction>(action)) {
++            return false;
+         }
++        return true;
+     };
+ 
+     while (true) {
+         // Empty the action queue
+         Action cur_action;
+         while (timer_context.action_queue.try_dequeue(cur_action)) {
+-            process_timer_action(cur_action);
++            if (!process_timer_action(cur_action)) {
++                return;
++            }
+         }
+ 
+         // If there's no timer to act on, wait for one to come in from the action queue
+         while (active_timers.empty()) {
+             timer_context.action_queue.wait_dequeue(cur_action);
+-            process_timer_action(cur_action);
++            if (!process_timer_action(cur_action)) {
++                return;
++            }
+         }
+ 
+         // Get the timer that's closest to running out
+@@ -126,7 +135,9 @@ void timer_thread(RDRAM_ARG1) {
+             // Add the current timer back to the queue (done first in case the action is to remove this timer)
+             active_timers.insert(cur_timer_);
+             // Process the new action
+-            process_timer_action(cur_action);
++            if (!process_timer_action(cur_action)) {
++                return;
++            }
+         }
+         else {
+             // Waiting for the timer completed, so send the timer's message to its message queue
+@@ -141,8 +152,22 @@ void timer_thread(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::init_timers(RDRAM_ARG1) {
++    Action stale_action;
++    while (timer_context.action_queue.try_dequeue(stale_action)) {}
++    start_time = std::chrono::high_resolution_clock::now();
++    ostime_offset = 0;
+     timer_context.thread = std::thread{ timer_thread, PASS_RDRAM1 };
+-    timer_context.thread.detach();
++}
++
++void ultramodern::join_timer_thread() {
++    if (!timer_context.thread.joinable()) {
++        return;
++    }
++    timer_context.action_queue.enqueue(ShutdownTimerAction{});
++    timer_context.thread.join();
++
++    Action stale_action;
++    while (timer_context.action_queue.try_dequeue(stale_action)) {}
+ }
+ 
+ uint32_t ultramodern::get_speed_multiplier() {
+diff --git a/ultramodern/src/ultrainit.cpp b/ultramodern/src/ultrainit.cpp
+index af5132c..6a6d1da 100644
+--- a/ultramodern/src/ultrainit.cpp
++++ b/ultramodern/src/ultrainit.cpp
+@@ -23,8 +23,8 @@ void ultramodern::set_callbacks(
+ 
+ void ultramodern::preinit(RDRAM_ARG ultramodern::renderer::WindowHandle window_handle) {
+     ultramodern::set_entrypoint_thread();
+-    ultramodern::init_events(PASS_RDRAM window_handle);
+     ultramodern::init_timers(PASS_RDRAM1);
++    ultramodern::init_events(PASS_RDRAM window_handle);
+     ultramodern::init_audio();
+     ultramodern::init_thread_cleanup();
+ }
+-- 
+2.49.0
+
+
+

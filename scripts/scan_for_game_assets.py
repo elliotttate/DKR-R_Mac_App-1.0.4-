@@ -13,7 +13,7 @@ ROOT = (
 )
 SKIP_PARTS = {
     ".git", ".deps", "build", "build-logs", "dist", "runtime", "extern",
-    "run-data", "--portable", "__pycache__",
+    "run-data", "--portable", "squashfs-root", "__pycache__",
 }
 DENIED_SUFFIXES = {".z64", ".v64", ".n64", ".o2r", ".otr", ".eep", ".mpk"}
 N64_HEADERS = {

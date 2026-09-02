@@ -1,0 +1,24 @@
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -580,12 +580,16 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+         const bool presentation_allowed =
+             events_callbacks.presentation_allowed_callback == nullptr ||
+             events_callbacks.presentation_allowed_callback();
+         if (!presentation_allowed) {
+-            // Historical rollback frames must satisfy the emulated scheduler
+-            // edges without leaving asynchronous renderer work behind.
+-            sp_complete();
+-            dp_complete();
++            // Historical/catch-up frames do not reach the renderer, but their
++            // emulated graphics task must retain the normal worker-owned SP/DP
++            // lifecycle. Completing both edges inline can publish DP before
++            // DKR has entered gfxtask_wait, permanently losing the completion.
++            // No RDRAM snapshot is needed because the worker skips display-list
++            // parsing whenever presentation_allowed is false.
++            events_context.action_queue.enqueue(SpTaskAction{
++                *task, std::unique_ptr<uint8_t[]>{}, false });
+             return;
+         }
+         constexpr size_t RDRAMSnapshotSize = 0x800000;
+         auto rdram_snapshot = std::make_unique<uint8_t[]>(RDRAMSnapshotSize);

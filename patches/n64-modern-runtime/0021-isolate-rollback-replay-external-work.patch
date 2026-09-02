@@ -1,0 +1,75 @@
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index f76d1b8..08f926f 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -29,6 +29,7 @@ namespace ultramodern {
+         struct callbacks_t {
+             using poll_input_t = void(void);
+             using frame_boundary_t = void(uint8_t* rdram, recomp_context* context);
++            using physical_poll_allowed_t = bool(void);
+             using get_input_t = bool(int controller_num, uint16_t* buttons, float* x, float* y);
+             using set_rumble_t = void(int controller_num, bool rumble);
+             using get_connected_device_info_t = connected_device_info_t(int controller_num);
+@@ -36,6 +37,7 @@ namespace ultramodern {
+ 
+             poll_input_t* poll_input;
+             frame_boundary_t* frame_boundary;
++            physical_poll_allowed_t* physical_poll_allowed;
+ 
+             /**
+              * Requests the state of the pressed buttons and the analog stick for the given `controller_num`.
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 9c7961d..db2c504 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -580,17 +580,28 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+         const bool presentation_allowed =
+             events_callbacks.presentation_allowed_callback == nullptr ||
+             events_callbacks.presentation_allowed_callback();
+-        std::unique_ptr<uint8_t[]> rdram_snapshot;
+-        if (presentation_allowed) {
+-            constexpr size_t RDRAMSnapshotSize = 0x800000;
+-            rdram_snapshot = std::make_unique<uint8_t[]>(RDRAMSnapshotSize);
+-            std::memcpy(rdram_snapshot.get(), rdram, RDRAMSnapshotSize);
++        if (!presentation_allowed) {
++            // Historical rollback frames must satisfy the emulated scheduler
++            // edges without leaving asynchronous renderer work behind.
++            sp_complete();
++            dp_complete();
++            return;
+         }
++        constexpr size_t RDRAMSnapshotSize = 0x800000;
++        auto rdram_snapshot = std::make_unique<uint8_t[]>(RDRAMSnapshotSize);
++        std::memcpy(rdram_snapshot.get(), rdram, RDRAMSnapshotSize);
+         events_context.action_queue.enqueue(SpTaskAction{
+-            *task, std::move(rdram_snapshot), presentation_allowed });
++            *task, std::move(rdram_snapshot), true });
+     }
+     // Set all other tasks as the RSP task
+     else {
++        const bool external_work_allowed =
++            events_callbacks.presentation_allowed_callback == nullptr ||
++            events_callbacks.presentation_allowed_callback();
++        if (task->t.type == M_AUDTASK && !external_work_allowed) {
++            sp_complete();
++            return;
++        }
+         events_context.sp_task_queue.enqueue(task);
+     }
+ }
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index 82945d1..0184c34 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -122,7 +122,10 @@ extern "C" s32 osContStartQuery(RDRAM_ARG PTR(OSMesgQueue) mq) {
+ }
+ 
+ extern "C" s32 osContStartReadData(RDRAM_ARG PTR(OSMesgQueue) mq) {
+-    if (input_callbacks.poll_input != nullptr) {
++    const bool physical_poll_allowed =
++        input_callbacks.physical_poll_allowed == nullptr ||
++        input_callbacks.physical_poll_allowed();
++    if (physical_poll_allowed && input_callbacks.poll_input != nullptr) {
+         input_callbacks.poll_input();
+     }
+     update_poll_time();

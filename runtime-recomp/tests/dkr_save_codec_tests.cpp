@@ -1,5 +1,6 @@
 #include "dkr_save_codec.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <fstream>
@@ -77,6 +78,24 @@ int main(int argc, char** argv) {
     assert(decoded_erased_slot.slots[1].balloons ==
            (std::array<std::uint8_t, kWorldCount>{}));
     assert(validate(encode(decoded_erased_slot)));
+
+    std::vector<std::uint8_t> canonical;
+    std::string canonical_error;
+    assert(canonical_bytes(retail_erased_slot, canonical, &canonical_error));
+    assert(canonical == blank);
+
+    auto invalid_checksums = retail_erased_slot;
+    invalid_checksums[0] ^= 0x5AU;
+    invalid_checksums[0x78U] ^= 0x40U;
+    invalid_checksums[0x80U] ^= 0x21U;
+    assert(!validate(invalid_checksums));
+    std::vector<std::uint8_t> repaired;
+    assert(repair_checksums(invalid_checksums, repaired, &canonical_error));
+    assert(validate(repaired));
+    assert(repaired == retail_erased_slot);
+    assert(std::all_of(repaired.begin() + 0x28U,
+                       repaired.begin() + 0x50U,
+                       [](std::uint8_t value) { return value == 0xFFU; }));
 
     SaveImage bounded = blank_image();
     bounded.slots[0].balloons = {127, 12, 9, 8, 8, 8};

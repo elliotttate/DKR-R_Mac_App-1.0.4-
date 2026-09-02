@@ -11,12 +11,17 @@
 #include <json/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
+#include <chrono>
 #include <cctype>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <set>
 #include <system_error>
+#include <utility>
 
 namespace {
 
@@ -25,7 +30,10 @@ std::filesystem::path g_pack_directory;
 std::filesystem::path g_settings_path;
 std::vector<dkr::runtime::texture_packs::PackInfo> g_packs;
 std::set<std::string> g_enabled_ids;
+std::string g_last_selected_id;
 std::set<std::string> g_hidden_ids;
+std::map<std::string, std::int64_t> g_imported_at;
+std::map<std::string, std::uintmax_t> g_managed_sizes;
 std::set<std::string> g_applied_ids;
 std::string g_status;
 std::uint64_t g_generation = 1;
@@ -40,6 +48,14 @@ struct PendingDeletion {
 };
 
 std::vector<PendingDeletion> g_pending_deletions;
+
+bool ReportImportProgress(
+    const dkr::runtime::texture_packs::ImportProgressCallback& callback,
+    float fraction, std::string stage, bool commit_started = false) {
+    if (!callback) return true;
+    return callback({std::clamp(fraction, 0.0F, 1.0F), std::move(stage),
+                     commit_started});
+}
 
 std::string Lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -64,6 +80,46 @@ std::string DisplayName(const std::filesystem::path& path) {
     return result.empty() ? path.filename().string() : result;
 }
 
+std::uintmax_t ManagedSize(const std::filesystem::path& path) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(path, error)) {
+        const auto size = std::filesystem::file_size(path, error);
+        return error ? 0U : size;
+    }
+    error.clear();
+    if (!std::filesystem::is_directory(path, error)) return 0U;
+
+    std::uintmax_t total = 0U;
+    std::filesystem::recursive_directory_iterator iterator(
+        path, std::filesystem::directory_options::skip_permission_denied,
+        error);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!error && iterator != end) {
+        if (iterator->is_regular_file(error)) {
+            const auto size = iterator->file_size(error);
+            if (!error) total += size;
+        }
+        error.clear();
+        iterator.increment(error);
+    }
+    return total;
+}
+
+std::int64_t ManagedTimestamp(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto written = std::filesystem::last_write_time(path, error);
+    if (error) return 0;
+    const auto system_time = std::chrono::time_point_cast<std::chrono::seconds>(
+        written - decltype(written)::clock::now() +
+        std::chrono::system_clock::now());
+    return system_time.time_since_epoch().count();
+}
+
+std::int64_t CurrentTimestamp() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 bool IsImage(const std::string& entry) {
     const std::string extension = Lower(
         std::filesystem::path(entry).extension().string());
@@ -82,15 +138,52 @@ bool LooksLikeRiceName(const std::string& entry) {
 void LoadSettingsLocked() {
     g_enabled_ids.clear();
     g_hidden_ids.clear();
+    g_imported_at.clear();
+    g_managed_sizes.clear();
+    g_last_selected_id.clear();
     std::ifstream input(g_settings_path);
     std::string line;
     while (std::getline(input, line)) {
         constexpr const char* enabled_prefix = "enabled=";
         constexpr const char* hidden_prefix = "hidden=";
+        constexpr const char* selected_prefix = "last_selected=";
+        constexpr const char* imported_prefix = "imported_at=";
+        constexpr const char* size_prefix = "managed_size=";
         if (line.rfind(enabled_prefix, 0) == 0 && line.size() > 8) {
             g_enabled_ids.insert(Lower(line.substr(8)));
         } else if (line.rfind(hidden_prefix, 0) == 0 && line.size() > 7) {
             g_hidden_ids.insert(Lower(line.substr(7)));
+        } else if (line.rfind(selected_prefix, 0) == 0 && line.size() > 14) {
+            g_last_selected_id = Lower(line.substr(14));
+        } else if (line.rfind(imported_prefix, 0) == 0 && line.size() > 12) {
+            const std::string value = line.substr(12);
+            const auto separator = value.find('\t');
+            if (separator == std::string::npos || separator == 0U ||
+                separator + 1U >= value.size()) {
+                continue;
+            }
+            std::int64_t timestamp = 0;
+            const char* begin = value.data() + separator + 1U;
+            const char* end = value.data() + value.size();
+            const auto parsed = std::from_chars(begin, end, timestamp);
+            if (parsed.ec == std::errc{} && parsed.ptr == end &&
+                timestamp > 0) {
+                g_imported_at[Lower(value.substr(0, separator))] = timestamp;
+            }
+        } else if (line.rfind(size_prefix, 0) == 0 && line.size() > 13) {
+            const std::string value = line.substr(13);
+            const auto separator = value.find('\t');
+            if (separator == std::string::npos || separator == 0U ||
+                separator + 1U >= value.size()) {
+                continue;
+            }
+            std::uintmax_t size = 0U;
+            const char* begin = value.data() + separator + 1U;
+            const char* end = value.data() + value.size();
+            const auto parsed = std::from_chars(begin, end, size);
+            if (parsed.ec == std::errc{} && parsed.ptr == end) {
+                g_managed_sizes[Lower(value.substr(0, separator))] = size;
+            }
         }
     }
     for (const auto& id : g_hidden_ids) g_enabled_ids.erase(id);
@@ -106,8 +199,17 @@ void SaveSettingsLocked() {
         return;
     }
     output << "# DKR-R native texture-pack state\n";
+    if (!g_last_selected_id.empty()) {
+        output << "last_selected=" << g_last_selected_id << '\n';
+    }
     for (const auto& id : g_enabled_ids) output << "enabled=" << id << '\n';
     for (const auto& id : g_hidden_ids) output << "hidden=" << id << '\n';
+    for (const auto& [id, timestamp] : g_imported_at) {
+        output << "imported_at=" << id << '\t' << timestamp << '\n';
+    }
+    for (const auto& [id, size] : g_managed_sizes) {
+        output << "managed_size=" << id << '\t' << size << '\n';
+    }
     output.close();
     std::filesystem::rename(temporary, g_settings_path, error);
     if (error) {
@@ -233,6 +335,38 @@ std::filesystem::path UniqueManagedDestination(const std::filesystem::path& sour
     return destination;
 }
 
+bool EnsureManagedRiceCoordinatePolicy(const std::filesystem::path& database_path,
+                                       nlohmann::json& database,
+                                       std::string& error_text) {
+    if (!database.contains("configuration") ||
+        !database["configuration"].is_object()) {
+        error_text = "Managed Rice database has no RT64 configuration.";
+        return false;
+    }
+    auto& configuration = database["configuration"];
+    if (configuration.value("defaultShift", std::string{}) ==
+        dkr::runtime::rice_texture::kLegacyCoordinateShift) {
+        return true;
+    }
+
+    // DKR-R owns directories carrying dkr-r-rice-import.json. Upgrade only
+    // those managed bridges; native RT64 packs retain the author's shift.
+    configuration["defaultShift"] = std::string(
+        dkr::runtime::rice_texture::kLegacyCoordinateShift);
+    std::ofstream database_file(database_path, std::ios::trunc);
+    if (!database_file) {
+        error_text = "Managed Rice coordinates could not be upgraded safely.";
+        return false;
+    }
+    database_file << database.dump(2) << '\n';
+    database_file.close();
+    if (!database_file) {
+        error_text = "Managed Rice coordinate upgrade could not be committed.";
+        return false;
+    }
+    return true;
+}
+
 dkr::runtime::texture_packs::PackInfo InspectDirectory(
     const std::filesystem::path& path) {
     using dkr::runtime::texture_packs::Format;
@@ -254,10 +388,14 @@ dkr::runtime::texture_packs::PackInfo InspectDirectory(
     }
     try {
         std::ifstream database_file(database_path);
-        const auto database = nlohmann::json::parse(database_file);
+        auto database = nlohmann::json::parse(database_file);
         if (!database.is_object() || !database.contains("configuration") ||
             !database.contains("textures") || !database["textures"].is_array()) {
             info.detail = "Managed rt64.json does not contain a native RT64 database.";
+            return info;
+        }
+        if (managed_rice && !EnsureManagedRiceCoordinatePolicy(
+                database_path, database, info.detail)) {
             return info;
         }
         if (!managed_rice) {
@@ -401,13 +539,39 @@ void refresh() {
     std::filesystem::path directory;
     std::set<std::string> enabled;
     std::set<std::string> hidden;
+    std::map<std::string, std::int64_t> imported_at;
+    std::map<std::string, std::uintmax_t> managed_sizes;
     {
         std::scoped_lock lock(g_mutex);
         directory = g_pack_directory;
         enabled = g_enabled_ids;
         hidden = g_hidden_ids;
+        imported_at = g_imported_at;
+        managed_sizes = g_managed_sizes;
     }
     std::vector<PackInfo> scanned;
+    bool imported_metadata_changed = false;
+    const auto populate_metadata = [&](PackInfo& info) {
+        const auto managed_size = managed_sizes.find(info.id);
+        if (managed_size != managed_sizes.end()) {
+            info.managed_size_bytes = managed_size->second;
+        } else {
+            info.managed_size_bytes = ManagedSize(info.path);
+            managed_sizes[info.id] = info.managed_size_bytes;
+            imported_metadata_changed = true;
+        }
+        const auto imported = imported_at.find(info.id);
+        if (imported != imported_at.end()) {
+            info.imported_at_unix_seconds = imported->second;
+            return;
+        }
+        info.imported_at_unix_seconds = ManagedTimestamp(info.path);
+        if (info.imported_at_unix_seconds <= 0) {
+            info.imported_at_unix_seconds = CurrentTimestamp();
+        }
+        imported_at[info.id] = info.imported_at_unix_seconds;
+        imported_metadata_changed = true;
+    };
     std::error_code error;
     if (!directory.empty()) {
         std::filesystem::create_directories(directory, error);
@@ -416,6 +580,7 @@ void refresh() {
             if (entry.is_directory(error)) {
                 if (Lower(entry.path().extension().string()) == ".importing") continue;
                 auto info = InspectDirectory(entry.path());
+                populate_metadata(info);
                 info.hidden = hidden.contains(info.id);
                 info.enabled = !info.hidden && info.compatible && enabled.contains(info.id);
                 scanned.emplace_back(std::move(info));
@@ -425,6 +590,7 @@ void refresh() {
             const std::string extension = Lower(entry.path().extension().string());
             if (extension != ".zip" && extension != ".rtz") continue;
             auto info = InspectArchive(entry.path());
+            populate_metadata(info);
             info.hidden = hidden.contains(info.id);
             info.enabled = !info.hidden && info.compatible && enabled.contains(info.id);
             scanned.emplace_back(std::move(info));
@@ -436,6 +602,11 @@ void refresh() {
               });
     {
         std::scoped_lock lock(g_mutex);
+        if (imported_metadata_changed) {
+            g_imported_at = std::move(imported_at);
+            g_managed_sizes = std::move(managed_sizes);
+            SaveSettingsLocked();
+        }
         g_packs = std::move(scanned);
         ++g_generation;
         if (error) g_status = "The texture-pack folder could not be scanned: " + error.message();
@@ -453,7 +624,18 @@ std::vector<PackInfo> snapshot(bool include_hidden) {
     return visible;
 }
 
-bool import_archive(const std::filesystem::path& source, std::string& status_text) {
+std::uint64_t generation() {
+    std::scoped_lock lock(g_mutex);
+    return g_generation;
+}
+
+bool import_archive(const std::filesystem::path& source, std::string& status_text,
+                    const ImportProgressCallback& progress) {
+    if (!ReportImportProgress(progress, 0.01F,
+                              "Validating texture-pack archive")) {
+        status_text = "Texture-pack import cancelled.";
+        return false;
+    }
     std::error_code error;
     if (!std::filesystem::is_regular_file(source, error)) {
         status_text = "Choose a readable ZIP or RTZ texture-pack archive.";
@@ -472,6 +654,11 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
         return false;
     }
 
+    if (!ReportImportProgress(progress, 0.04F,
+                              "Inspecting texture-pack archive")) {
+        status_text = "Texture-pack import cancelled.";
+        return false;
+    }
     PackInfo inspection = InspectArchive(source);
     if (inspection.detail.find("unreadable") != std::string::npos) {
         status_text = inspection.detail;
@@ -504,19 +691,41 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
 
         rice_texture::ImportResult conversion;
         std::string conversion_error;
+        const auto rice_progress = [&](std::size_t completed,
+                                       std::size_t total,
+                                       const char* stage) {
+            const float conversion_fraction = total == 0
+                ? 0.08F
+                : 0.08F + 0.82F * static_cast<float>(completed) /
+                    static_cast<float>(total);
+            return ReportImportProgress(progress, conversion_fraction, stage);
+        };
         if (!rice_texture::convert_archive(*archive, temporary,
                                            source.filename().string(),
-                                           conversion, conversion_error)) {
+                                           conversion, conversion_error,
+                                           rice_progress)) {
             std::filesystem::remove_all(temporary, error);
-            status_text = "Rice import failed: " + conversion_error;
+            status_text = conversion_error == "Import cancelled."
+                ? "Texture-pack import cancelled."
+                : "Rice import failed: " + conversion_error;
             return false;
         }
+        // From this point forward cancellation is disabled: rename is the
+        // atomic commit and must be allowed to finish once announced.
+        ReportImportProgress(progress, 0.94F,
+                             "Committing converted texture pack", true);
         std::filesystem::rename(temporary, destination, error);
         if (error) {
             const std::string rename_error = error.message();
             std::filesystem::remove_all(temporary, error);
             status_text = "The converted Rice pack could not be committed: " + rename_error;
             return false;
+        }
+        {
+            std::scoped_lock lock(g_mutex);
+            g_imported_at[StableId(destination)] = CurrentTimestamp();
+            g_managed_sizes[StableId(destination)] = ManagedSize(destination);
+            SaveSettingsLocked();
         }
         refresh();
         const auto imported = InspectDirectory(destination);
@@ -526,6 +735,7 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
             std::scoped_lock lock(g_mutex);
             g_status = status_text;
         }
+        ReportImportProgress(progress, 1.0F, "Texture pack imported", true);
         return imported.compatible;
     }
 
@@ -535,11 +745,71 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
         std::filesystem::create_directories(g_pack_directory, error);
         destination = UniqueDestination(source);
     }
-    std::filesystem::copy_file(source, destination,
-                               std::filesystem::copy_options::none, error);
-    if (error) {
-        status_text = "The texture pack could not be imported: " + error.message();
+    const std::filesystem::path temporary = destination.parent_path() /
+        (destination.filename().string() + ".importing");
+    if (temporary.parent_path() != g_pack_directory ||
+        destination.parent_path() != g_pack_directory) {
+        status_text = "The managed texture-pack destination failed its safety check.";
         return false;
+    }
+    std::filesystem::remove(temporary, error);
+    error.clear();
+    std::ifstream input(source, std::ios::binary);
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!input || !output) {
+        std::filesystem::remove(temporary, error);
+        status_text = "The texture pack could not be opened for managed import.";
+        return false;
+    }
+    // Imports run on a background jthread whose Windows stack is smaller than
+    // the main thread's. Keeping this 1 MiB transfer buffer as a local array
+    // made the function's stack frame overflow before either the Rice or RTZ
+    // branch could execute. Allocate the workspace on the heap instead.
+    std::vector<char> buffer(1024U * 1024U);
+    std::uintmax_t copied = 0;
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        if (count <= 0) break;
+        output.write(buffer.data(), count);
+        if (!output) {
+            output.close();
+            std::filesystem::remove(temporary, error);
+            status_text = "The managed texture-pack copy could not be written.";
+            return false;
+        }
+        copied += static_cast<std::uintmax_t>(count);
+        const float copy_fraction = 0.08F + 0.84F *
+            static_cast<float>(copied) / static_cast<float>(size);
+        if (!ReportImportProgress(progress, copy_fraction,
+                                  "Copying texture-pack archive")) {
+            output.close();
+            input.close();
+            std::filesystem::remove(temporary, error);
+            status_text = "Texture-pack import cancelled.";
+            return false;
+        }
+    }
+    output.close();
+    input.close();
+    if (!output || (copied != size)) {
+        std::filesystem::remove(temporary, error);
+        status_text = "The managed texture-pack copy ended before the archive was complete.";
+        return false;
+    }
+    ReportImportProgress(progress, 0.96F, "Committing texture pack", true);
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        const std::string rename_error = error.message();
+        std::filesystem::remove(temporary, error);
+        status_text = "The texture pack could not be committed: " + rename_error;
+        return false;
+    }
+    {
+        std::scoped_lock lock(g_mutex);
+        g_imported_at[StableId(destination)] = CurrentTimestamp();
+        g_managed_sizes[StableId(destination)] = size;
+        SaveSettingsLocked();
     }
     refresh();
     const auto imported = InspectArchive(destination);
@@ -549,6 +819,7 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
         std::scoped_lock lock(g_mutex);
         g_status = status_text;
     }
+    ReportImportProgress(progress, 1.0F, "Texture pack imported", true);
     return true;
 }
 
@@ -559,11 +830,35 @@ void set_enabled(const std::string& id, bool enabled) {
         [&](const PackInfo& pack) { return pack.id == normalized; });
     if (match == g_packs.end() || !match->compatible || match->hidden) return;
     match->enabled = enabled;
+    g_last_selected_id = normalized;
     if (enabled) g_enabled_ids.insert(normalized);
     else g_enabled_ids.erase(normalized);
     ++g_generation;
     SaveSettingsLocked();
     g_status = match->name + (enabled ? " queued for live activation." : " queued for live removal.");
+}
+
+bool toggle_last_selected(std::string& status) {
+    std::scoped_lock lock(g_mutex);
+    auto match = std::find_if(g_packs.begin(), g_packs.end(),
+        [](const PackInfo& pack) {
+            return Lower(pack.id) == g_last_selected_id;
+        });
+    if (match == g_packs.end() || !match->compatible || match->hidden) {
+        status = "No available texture pack has been selected yet.";
+        g_status = status;
+        return false;
+    }
+    match->enabled = !match->enabled;
+    if (match->enabled) g_enabled_ids.insert(g_last_selected_id);
+    else g_enabled_ids.erase(g_last_selected_id);
+    SaveSettingsLocked();
+    ++g_generation;
+    status = match->name + (match->enabled
+        ? " queued for live activation."
+        : " queued for live removal.");
+    g_status = status;
+    return true;
 }
 
 bool set_hidden(const std::string& id, bool hidden, std::string& status_text) {
@@ -628,6 +923,8 @@ bool delete_managed(const std::string& id, std::string& status_text) {
                 {normalized, selected.path, selected.name});
         } else {
             g_hidden_ids.erase(normalized);
+            g_imported_at.erase(normalized);
+            g_managed_sizes.erase(normalized);
         }
         g_packs.erase(std::remove_if(g_packs.begin(), g_packs.end(),
             [&](const PackInfo& pack) { return pack.id == normalized; }),
@@ -713,6 +1010,8 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
         std::scoped_lock lock(g_mutex);
         for (const auto& deleted_id : deleted_ids) {
             g_hidden_ids.erase(deleted_id);
+            g_imported_at.erase(deleted_id);
+            g_managed_sizes.erase(deleted_id);
         }
         SaveSettingsLocked();
         if (!deletion_error.empty()) {

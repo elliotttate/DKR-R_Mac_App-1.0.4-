@@ -1,0 +1,14 @@
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index ba13b2e..7a6107d 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -3,7 +3,8 @@
+ #define __ULTRAMODERN_INPUT_HPP__
+ 
+ #include <cstdint>
+-#include "recomp.h"
++
++typedef struct recomp_context recomp_context;
+ 
+ namespace ultramodern {
+     namespace input {

@@ -112,8 +112,13 @@ bool convert_archive(RT64::FileSystem& archive,
                      const std::filesystem::path& destination,
                      const std::string& source_name,
                      ImportResult& result,
-                     std::string& error) {
+                     std::string& error,
+                     const ProgressCallback& progress) {
     result = {};
+    if (progress && !progress(0, 0, "Inspecting Rice texture identities")) {
+        error = "Import cancelled.";
+        return false;
+    }
     std::map<std::string, Sources> identities;
     std::size_t entry_count = 0;
     for (auto iterator = archive.begin(); iterator != archive.end(); ++iterator) {
@@ -143,6 +148,11 @@ bool convert_archive(RT64::FileSystem& archive,
             break;
         }
         if (!assigned) return false;
+        if (progress && (entry_count & 0xFFU) == 0U &&
+            !progress(0, 0, "Inspecting Rice texture identities")) {
+            error = "Import cancelled.";
+            return false;
+        }
     }
     if (identities.empty()) {
         error = "No valid Rice PNG names were found in the archive.";
@@ -173,7 +183,14 @@ bool convert_archive(RT64::FileSystem& archive,
 
     nlohmann::json textures = nlohmann::json::array();
     std::uint64_t total_loaded = 0;
+    std::size_t completed_identities = 0;
     for (const auto& [identity, sources] : identities) {
+        if (progress &&
+            !progress(completed_identities, identities.size(),
+                      "Converting Rice textures")) {
+            error = "Import cancelled.";
+            return false;
+        }
         Image colour;
         if (sources.all.has_value()) {
             if (!LoadImage(archive, *sources.all, colour, total_loaded, error)) return false;
@@ -208,6 +225,14 @@ bool convert_archive(RT64::FileSystem& archive,
                 {"rice", identity}
             }}
         });
+        ++completed_identities;
+    }
+
+    if (progress &&
+        !progress(completed_identities, identities.size(),
+                  "Writing texture database")) {
+        error = "Import cancelled.";
+        return false;
     }
 
     nlohmann::json database = {
@@ -215,7 +240,7 @@ bool convert_archive(RT64::FileSystem& archive,
             {"configurationVersion", 3},
             {"autoPath", "rice"},
             {"defaultOperation", "stream"},
-            {"defaultShift", "half"},
+            {"defaultShift", std::string(kLegacyCoordinateShift)},
             {"hashVersion", 5}
         }},
         {"textures", std::move(textures)},
@@ -239,7 +264,8 @@ bool convert_archive(RT64::FileSystem& archive,
         {"convertedIdentities", result.identities},
         {"mergedRgbAlphaPairs", result.merged_pairs},
         {"opaqueRgbImages", result.opaque_rgb},
-        {"nativeAllImages", result.all_images}
+        {"nativeAllImages", result.all_images},
+        {"coordinatePolicy", std::string(kLegacyCoordinatePolicy)}
     };
     std::ofstream metadata_file(destination / "dkr-r-rice-import.json", std::ios::trunc);
     if (!metadata_file) {

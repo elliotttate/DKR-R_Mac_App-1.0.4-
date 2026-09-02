@@ -7,6 +7,31 @@ namespace dkr::runtime::presentation {
 inline constexpr std::uint32_t kCanonicalViWidth = 320U;
 inline constexpr std::uint32_t kCanonicalViHeight = 240U;
 
+// gDPSetScissor stores its lower-right corner in quarter-pixel units and
+// treats that corner as exclusive. DKR's full-frame clear incorrectly emits
+// (width - 1, height - 1), which leaves the final framebuffer row and column
+// outside the clear. Keep this correction narrowly conditional so authored
+// viewport, menu-frame and split-screen scissors are never rewritten.
+constexpr std::uint32_t pack_scissor_lower_right(std::uint32_t width,
+                                                 std::uint32_t height) {
+    return (((width << 2U) & 0xFFFU) << 12U) |
+           ((height << 2U) & 0xFFFU);
+}
+
+constexpr std::uint32_t correct_fullscreen_clear_scissor(
+    std::uint32_t lower_right, std::uint32_t width,
+    std::uint32_t height) {
+    if (width == 0U || height == 0U || width > 0x3FFU ||
+        height > 0x3FFU) {
+        return lower_right;
+    }
+    const std::uint32_t retail_lower_right =
+        pack_scissor_lower_right(width - 1U, height - 1U);
+    return lower_right == retail_lower_right
+        ? pack_scissor_lower_right(width, height)
+        : lower_right;
+}
+
 constexpr std::uint32_t vi_region_start(std::uint32_t region) {
     return (region >> 16U) & 0x3FFU;
 }

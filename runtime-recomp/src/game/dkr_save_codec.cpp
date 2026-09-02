@@ -335,6 +335,71 @@ bool dkr::runtime::saves::codec::validate(std::span<const std::uint8_t> bytes,
     return decode(bytes, ignored, error);
 }
 
+bool dkr::runtime::saves::codec::repair_checksums(
+    std::span<const std::uint8_t> bytes,
+    std::vector<std::uint8_t>& repaired,
+    std::string* error) {
+    if (bytes.size() != kImageSize) {
+        if (error) *error = "Adventure EEPROM must be exactly 512 bytes.";
+        repaired.clear();
+        return false;
+    }
+
+    repaired.assign(bytes.begin(), bytes.end());
+    for (std::size_t index = 0; index < kAdventureSlotCount; ++index) {
+        const std::size_t offset = index * kSlotSize;
+        const auto slot = bytes.subspan(offset, kSlotSize);
+        // The retail game accepts an untouched erased slot. Preserve all of
+        // its 0xFF bytes instead of converting it as a side effect of repair.
+        if (std::all_of(slot.begin(), slot.end(),
+                        [](std::uint8_t value) { return value == 0xFFU; })) {
+            continue;
+        }
+        write_be16(repaired, offset,
+                   block_checksum(repaired, offset, kSlotSize));
+    }
+
+    const std::uint64_t payload =
+        read_be64(repaired, kConfigOffset) & kConfigPayloadMask;
+    write_be64(repaired, kConfigOffset,
+               payload |
+                   (static_cast<std::uint64_t>(config_checksum(payload)) << 56U));
+    write_be16(repaired, kFastestLapsOffset,
+               block_checksum(repaired, kFastestLapsOffset, kRecordBlockSize));
+    write_be16(repaired, kCourseTimesOffset,
+               block_checksum(repaired, kCourseTimesOffset, kRecordBlockSize));
+
+    std::string validation_error;
+    if (!validate(repaired, &validation_error)) {
+        if (error) {
+            *error = "The checksum-repaired EEPROM did not validate: " +
+                     validation_error;
+        }
+        repaired.clear();
+        return false;
+    }
+    if (error) error->clear();
+    return true;
+}
+
+bool dkr::runtime::saves::codec::canonical_bytes(
+    std::span<const std::uint8_t> bytes,
+    std::vector<std::uint8_t>& canonical,
+    std::string* error) {
+    SaveImage image{};
+    if (!decode(bytes, image, error)) {
+        canonical.clear();
+        return false;
+    }
+    canonical = encode(image);
+    if (!validate(canonical, error)) {
+        canonical.clear();
+        return false;
+    }
+    if (error) error->clear();
+    return true;
+}
+
 void dkr::runtime::saves::codec::normalise_editable_fields(SaveImage& image) {
     for (auto& slot : image.slots) {
         for (auto& status : slot.course_status) {

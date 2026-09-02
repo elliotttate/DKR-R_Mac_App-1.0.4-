@@ -1,9 +1,10 @@
 #include "runtime_audio_controls.hpp"
 #include "audio_mix_policy.hpp"
+#include "game_payload.hpp"
 #include "runtime_enhancements.hpp"
+#include "revision_addresses.hpp"
 
 #include "recomp.h"
-#include "funcs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -19,13 +20,14 @@ std::atomic<float> g_nature_volume{1.0F};
 thread_local int g_vehicle_audio_scope_depth = 0;
 thread_local int g_nature_audio_scope_depth = 0;
 
-constexpr std::uint32_t kMusicPlayerAddress = 0x800DC630U;
-constexpr std::uint32_t kMusicBaseVolumeAddress = 0x800DC638U;
+const std::uint32_t& kMusicPlayerAddress =
+    dkr::runtime::revision_addresses::MusicPlayer;
+const std::uint32_t& kMusicBaseVolumeAddress =
+    dkr::runtime::revision_addresses::MusicBaseVolume;
 
 gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
 }
-
 } // namespace
 
 float dkr::runtime::audio::music_volume() {
@@ -83,7 +85,7 @@ extern "C" void dkr_audio_mix_tick(std::uint8_t* rdram,
         if (previous != 1.0F) {
             recomp_context call = *context;
             call.r4 = MEM_BU(0, RdramAddress(kMusicBaseVolumeAddress));
-            music_volume_set(rdram, &call);
+            dkr::runtime::invoke_music_volume_set(rdram, &call);
         }
         return;
     }
@@ -101,7 +103,7 @@ extern "C" void dkr_audio_mix_tick(std::uint8_t* rdram,
     // corrupting gMusicBaseVolume or waiting for the next map.
     recomp_context call = *context;
     call.r4 = MEM_BU(0, RdramAddress(kMusicBaseVolumeAddress));
-    music_volume_set(rdram, &call);
+    dkr::runtime::invoke_music_volume_set(rdram, &call);
 }
 
 extern "C" void dkr_enter_vehicle_audio_scope(std::uint8_t*, recomp_context*) {

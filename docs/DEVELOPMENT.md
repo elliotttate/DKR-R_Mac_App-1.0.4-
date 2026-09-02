@@ -12,10 +12,13 @@ Never edit these generated or dependency paths directly:
 - `extern/n64-modern-runtime/N64Recomp`
 - `extern/rt64`
 
-Game hooks and instruction changes are declared in
-`runtime-recomp/dkr.us.v77.recomp-policy.json`. Dependency changes are patch
-files with SHA-256 entries in `patches/manifest.json`. Regenerate after policy
-changes and validate every dependency patch from its pinned clean commit.
+Game hooks and instruction changes are declared in the versioned
+`runtime-recomp/dkr.us.v77.recomp-policy.json` and
+`runtime-recomp/dkr.us.v80.recomp-policy.json` files. Revision policies are
+mapped by named function and checked intra-function offset, never by a global
+VRAM delta. Dependency changes are patch files with SHA-256 entries in
+`patches/manifest.json`. Regenerate after policy changes and validate every
+dependency patch from its pinned clean commit.
 
 Keep Accurate as the regression baseline. Modern features must not change the
 simulation clock, race results, AI, audio cadence, save data or original input

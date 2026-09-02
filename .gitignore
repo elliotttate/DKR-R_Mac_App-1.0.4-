@@ -4,10 +4,28 @@
 /build-logs/
 /.deps/
 /out/
+/artifacts/
+/squashfs-root/
 /.vs/
 /.vscode/
 /--portable/
 CMakeUserPresets.json
+
+# Build-system and compiler intermediates
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+Testing/
+_deps/
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+*.ilk
+*.pdb
 
 # Runtime data
 /runtime/
@@ -26,9 +44,12 @@ mods/*
 !mods/.gitkeep
 
 # Dependencies fetched locally
-/extern/dkr-decomp/
+/extern/*/
 /extern/.resolved-dependencies.json
 /extern/.resolved-dkr-source.json
+
+# Local development utilities and extracted package worktrees
+/tools/
 
 # Copyrighted / ROM-derived data
 *.z64
@@ -47,14 +68,40 @@ baserom*
 # Platform files
 .DS_Store
 Thumbs.db
+Desktop.ini
 *.user
 *.suo
 *.VC.db
 *.VC.VC.opendb
+/.idea/
+
+# Local diagnostics, caches and temporary files
+*.dmp
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*~
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+token*.json
 
 # DKR decomp/recomp working data generated locally
-extern/dkr-decomp/baseroms/
-extern/n64-modern-runtime/
-extern/rt64/
 runtime-recomp/RecompiledFuncs/
+runtime-recomp/RecompiledPatches/
 build/runtime-tools/

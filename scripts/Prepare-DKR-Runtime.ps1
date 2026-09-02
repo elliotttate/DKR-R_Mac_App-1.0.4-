@@ -403,6 +403,11 @@ try {
     $modernRuntimePath = Join-Path $ProjectRoot 'extern\n64-modern-runtime'
     $n64RecompPath = Join-Path $modernRuntimePath 'N64Recomp'
     $rt64Path = Join-Path $ProjectRoot 'extern\rt64'
+    $gekkoNetPath = Join-Path $ProjectRoot 'extern\gekkonet'
+    $monocypherPath = Join-Path $ProjectRoot 'extern\monocypher'
+    $libdatachannelPath = Join-Path $ProjectRoot 'extern\libdatachannel'
+    $mbedTlsPath = Join-Path $ProjectRoot 'extern\mbedtls'
+    $sdl3Path = Join-Path $ProjectRoot 'extern\sdl3'
     $resolved = [ordered]@{}
     $patchManifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'patches\manifest.json') -Raw |
         ConvertFrom-Json
@@ -411,6 +416,21 @@ try {
         Select-Object -ExpandProperty expectedCommit)
     $rt64Commit = [string](
         $patchManifest.dependencies | Where-Object name -eq 'RT64' |
+        Select-Object -ExpandProperty expectedCommit)
+    $gekkoNetCommit = [string](
+        $patchManifest.dependencies | Where-Object name -eq 'GekkoNet' |
+        Select-Object -ExpandProperty expectedCommit)
+    $monocypherCommit = [string](
+        $patchManifest.dependencies | Where-Object name -eq 'Monocypher' |
+        Select-Object -ExpandProperty expectedCommit)
+    $libdatachannelCommit = [string](
+        $patchManifest.dependencies | Where-Object name -eq 'libdatachannel' |
+        Select-Object -ExpandProperty expectedCommit)
+    $mbedTlsCommit = [string](
+        $patchManifest.dependencies | Where-Object name -eq 'MbedTLS' |
+        Select-Object -ExpandProperty expectedCommit)
+    $sdl3Commit = [string](
+        $patchManifest.dependencies | Where-Object name -eq 'SDL3' |
         Select-Object -ExpandProperty expectedCommit)
 
     # N64ModernRuntime pins the N64Recomp revision it is compatible with as a
@@ -427,6 +447,14 @@ try {
         Fail 'Could not resolve the N64Recomp commit pinned by N64ModernRuntime.'
     }
     Write-Host "[OK] N64Recomp (runtime-pinned submodule): $($resolved.n64recomp)" -ForegroundColor Green
+
+    # Keep the rollback coordinator pinned and unmodified. DKR-R owns the
+    # transport, lobby protocol and complete simulation-state adapter.
+    $resolved.gekkoNet = Clone-Or-Update 'GekkoNet' 'https://github.com/HeatXD/GekkoNet.git' $gekkoNetPath $gekkoNetCommit
+    $resolved.monocypher = Clone-Or-Update 'Monocypher' 'https://github.com/LoupVaillant/Monocypher.git' $monocypherPath $monocypherCommit
+    $resolved.libdatachannel = Clone-Or-Update 'libdatachannel' 'https://github.com/paullouisageneau/libdatachannel.git' $libdatachannelPath $libdatachannelCommit -Recursive
+    $resolved.mbedTls = Clone-Or-Update 'MbedTLS' 'https://github.com/Mbed-TLS/mbedtls.git' $mbedTlsPath $mbedTlsCommit -Recursive
+    $resolved.sdl3 = Clone-Or-Update 'SDL3' 'https://github.com/libsdl-org/SDL.git' $sdl3Path $sdl3Commit
 
     if ($BuildRenderer) {
         $resolved.rt64 = Clone-Or-Update 'RT64' 'https://github.com/rt64/rt64.git' $rt64Path $rt64Commit -Recursive

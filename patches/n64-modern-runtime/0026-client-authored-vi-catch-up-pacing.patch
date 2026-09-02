@@ -1,0 +1,110 @@
+From 82d5b96d60a0e88a558bc752c19e8b0c8c2da7f4 Mon Sep 17 00:00:00 2001
+From: DKR-R Patch Pipeline <patch-pipeline@local.invalid>
+Date: Fri, 28 Aug 2026 11:20:00 +0100
+Subject: [PATCH] Add bounded client authored VI catch-up pacing
+
+---
+ ultramodern/include/ultramodern/events.hpp | 10 ++++++++
+ ultramodern/src/events.cpp                 | 36 ++++++++++++++++++++++-------
+ 2 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/ultramodern/include/ultramodern/events.hpp b/ultramodern/include/ultramodern/events.hpp
+index 020dafa..2545570 100644
+--- a/ultramodern/include/ultramodern/events.hpp
++++ b/ultramodern/include/ultramodern/events.hpp
+@@ -1,11 +1,14 @@
+ #ifndef __EVENTS_HPP__
+ #define __EVENTS_HPP__
+ 
++#include <cstdint>
++
+ namespace ultramodern {
+     namespace events {
+         struct callbacks_t {
+             using vi_callback_t = void();
+             using gfx_init_callback_t = void();
++            using authored_simulation_pacing_scale_milli_callback_t = std::uint32_t();
+             using presentation_allowed_callback_t = bool();
+ 
+             /**
+@@ -21,6 +24,13 @@ namespace ultramodern {
+              */
+             gfx_init_callback_t* gfx_init_callback;
+ 
++            /**
++             * Returns the client-authored simulation pacing scale in
++             * thousandths. 1000 preserves the game's normal VI cadence.
++             */
++            authored_simulation_pacing_scale_milli_callback_t*
++                authored_simulation_pacing_scale_milli_callback;
++
+             /**
+              * Sampled when an authored graphics task is submitted. Rollback
+              * replay still completes SP/DP but must not reach the renderer.
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index b1a123c..2449003 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -186,7 +186,8 @@ void vi_thread_func() {
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
+     using namespace std::chrono_literals;
+ 
+-    int remaining_retraces = 1;
++    std::uint32_t authored_vi_phase_milli = 0U;
++    int authored_vi_retrace_count = 0;
+ 
+     while (!exited) {
+         // Determine the next VI time (more accurate than adding 16ms each VI interrupt)
+@@ -218,6 +219,8 @@ void vi_thread_func() {
+             static bool odd = false;
+             set_dummy_vi(odd);
+             odd = !odd;
++            authored_vi_phase_milli = 0U;
++            authored_vi_retrace_count = 0;
+         }
+ 
+         // Queue a screen update for the graphics thread with the current VI register state.
+@@ -233,17 +236,37 @@ void vi_thread_func() {
+ 
+         // If the game has started, handle sending VI and AI events.
+         if (ultramodern::is_game_started()) {
+-            remaining_retraces--;
+-            
+             std::lock_guard lock{ events_context.message_mutex };
+             ViState* cur_state = events_context.vi.get_cur_state();
+-            if (remaining_retraces == 0) {
++            const int retrace_count = cur_state->retrace_count > 0
++                ? cur_state->retrace_count
++                : 1;
++            if (authored_vi_retrace_count != retrace_count) {
++                authored_vi_retrace_count = retrace_count;
++                // Preserve the original first-VI delivery when the authored
++                // retrace cadence is installed or changes.
++                authored_vi_phase_milli =
++                    static_cast<std::uint32_t>(retrace_count - 1) * 1000U;
++            }
++
++            std::uint32_t pacing_scale_milli = 1000U;
++            if (events_callbacks.authored_simulation_pacing_scale_milli_callback != nullptr) {
++                pacing_scale_milli =
++                    events_callbacks.authored_simulation_pacing_scale_milli_callback();
++            }
++            pacing_scale_milli = pacing_scale_milli < 1000U
++                ? 1000U
++                : (pacing_scale_milli > 1333U ? 1333U : pacing_scale_milli);
++            authored_vi_phase_milli += pacing_scale_milli;
++            const std::uint32_t authored_vi_threshold_milli =
++                static_cast<std::uint32_t>(retrace_count) * 1000U;
++            if (authored_vi_phase_milli >= authored_vi_threshold_milli) {
+                 if (cur_state->mq != NULLPTR) {
+                     // Send a message to the VI queue, and do not set it to be requeued if the queue was full.
+                     // The worst case scenario is that the game misses a VI message and has to wait a little longer for the next. 
+                     ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
+                 }
+-                remaining_retraces = cur_state->retrace_count;
++                authored_vi_phase_milli -= authored_vi_threshold_milli;
+             }
+             if (events_context.ai.mq != NULLPTR) {
+                 // Send a message to the VI queue, and do not set it to be requeued if the queue was full for the same reason as the VI message above.
+-- 
+2.51.0.windows.1

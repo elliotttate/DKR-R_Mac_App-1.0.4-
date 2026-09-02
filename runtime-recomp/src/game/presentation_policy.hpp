@@ -11,7 +11,7 @@ enum class PresentationProfile : std::uint8_t {
 
 inline constexpr int kMinimumPresentationRate = 30;
 inline constexpr int kMaximumPresentationRate = 500;
-inline constexpr int kCurrentSettingsVersion = 7;
+inline constexpr int kCurrentSettingsVersion = 9;
 inline constexpr int kOldestCompatibleSettingsVersion = 6;
 
 constexpr PresentationProfile normalise_presentation_profile(int value) {
@@ -37,6 +37,12 @@ constexpr bool maximum_detail_effective(PresentationProfile profile,
                                          bool requested) {
     return normalise_presentation_profile(profile) == PresentationProfile::Modern &&
            requested;
+}
+
+constexpr bool multiplayer_race_music_effective(
+    PresentationProfile profile, bool requested) {
+    return normalise_presentation_profile(profile) ==
+               PresentationProfile::Modern && requested;
 }
 
 constexpr bool interpolation_allowed(PresentationProfile profile) {

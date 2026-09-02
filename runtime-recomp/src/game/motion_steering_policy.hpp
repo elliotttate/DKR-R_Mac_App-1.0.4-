@@ -63,4 +63,25 @@ constexpr float blend_gyro_steering(float analogue, float gyro) {
     return std::clamp(analogue + gyro, -1.0F, 1.0F);
 }
 
+constexpr float gyro_sample_delta_seconds(
+    unsigned long long sensor_timestamp_us,
+    unsigned long long previous_sensor_timestamp_us,
+    float host_delta_seconds, bool have_previous_sample) {
+    if (!have_previous_sample) return 0.0F;
+    if (sensor_timestamp_us != 0ULL &&
+        previous_sensor_timestamp_us != 0ULL) {
+        if (sensor_timestamp_us == previous_sensor_timestamp_us) {
+            // The game can poll faster than the IMU. Never integrate the same
+            // physical reading twice merely because presentation is faster.
+            return 0.0F;
+        }
+        if (sensor_timestamp_us > previous_sensor_timestamp_us) {
+            return std::clamp(static_cast<float>(
+                sensor_timestamp_us - previous_sensor_timestamp_us) /
+                1000000.0F, 0.0F, 0.1F);
+        }
+    }
+    return std::clamp(host_delta_seconds, 0.0F, 0.1F);
+}
+
 } // namespace dkr::runtime::input

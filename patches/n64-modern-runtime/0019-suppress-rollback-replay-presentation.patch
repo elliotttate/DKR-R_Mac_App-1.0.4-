@@ -1,0 +1,103 @@
+diff --git a/ultramodern/include/ultramodern/events.hpp b/ultramodern/include/ultramodern/events.hpp
+index 8c66294..c212a58 100644
+--- a/ultramodern/include/ultramodern/events.hpp
++++ b/ultramodern/include/ultramodern/events.hpp
+@@ -6,6 +6,7 @@ namespace ultramodern {
+         struct callbacks_t {
+             using vi_callback_t = void();
+             using gfx_init_callback_t = void();
++            using presentation_allowed_callback_t = bool();
+ 
+             /**
+              * Called in each VI.
+@@ -17,6 +18,12 @@ namespace ultramodern {
+              * Called before entering the gfx main loop.
+              */
+             gfx_init_callback_t* gfx_init_callback;
++
++            /**
++             * Sampled when an authored graphics task is submitted. Rollback
++             * replay still completes SP/DP but must not reach the renderer.
++             */
++            presentation_allowed_callback_t* presentation_allowed_callback;
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 8df19a0..9c7961d 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -29,6 +29,7 @@ static std::atomic_bool screen_update_action_pending = false;
+ struct SpTaskAction {
+     OSTask task;
+     std::unique_ptr<uint8_t[]> rdram_snapshot;
++    bool presentation_allowed;
+ };
+ 
+ struct ScreenUpdateAction {
+@@ -369,28 +370,29 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+-                // Turn on instant present if the game has been started and it hasn't been turned on yet.
+-                if (ultramodern::is_game_started() && !enabled_instant_present) {
+-                    renderer_context->enable_instant_present();
+-                    enabled_instant_present = true;
+-                }
+-                ultramodern::measure_input_latency();
+                 // The queued task owns an immutable RDRAM snapshot, so the CPU
+                 // can safely recycle its live display-list buffers as soon as
+                 // the emulated RSP completes. Deliver this edge before parsing
+                 // to keep SP and DP interrupts from racing back-to-back through
+                 // games such as DKR that schedule their next task on SP.
+                 sp_complete();
+ 
+-                PTR(u64) displaylist = task_action->task.t.data_ptr;
+-                ultramodern::extensions::on_displaylist_submitted(displaylist);
++                if (task_action->presentation_allowed) {
++                    // Turn on instant present if the game has been started and it hasn't been turned on yet.
++                    if (ultramodern::is_game_started() && !enabled_instant_present) {
++                        renderer_context->enable_instant_present();
++                        enabled_instant_present = true;
++                    }
++                    ultramodern::measure_input_latency();
++                    PTR(u64) displaylist = task_action->task.t.data_ptr;
++                    ultramodern::extensions::on_displaylist_submitted(displaylist);
+ 
+-                [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+-                renderer_context->send_dl(&task_action->task, task_action->rdram_snapshot.get());
+-                [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
++                    [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
++                    renderer_context->send_dl(&task_action->task, task_action->rdram_snapshot.get());
++                    [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
++                    ultramodern::extensions::on_displaylist_parsed(displaylist);
++                    ultramodern::extensions::on_displaylist_completed(displaylist);
++                }
+ 
+                 dp_complete();
+-                // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+-                ultramodern::extensions::on_displaylist_parsed(displaylist);
+-                ultramodern::extensions::on_displaylist_completed(displaylist);
+                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+             }
+@@ -575,10 +578,17 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+ 
+     // Send gfx tasks to the graphics action queue
+     if (task->t.type == M_GFXTASK) {
+-        constexpr size_t RDRAMSnapshotSize = 0x800000;
+-        auto rdram_snapshot = std::make_unique<uint8_t[]>(RDRAMSnapshotSize);
+-        std::memcpy(rdram_snapshot.get(), rdram, RDRAMSnapshotSize);
+-        events_context.action_queue.enqueue(SpTaskAction{ *task, std::move(rdram_snapshot) });
++        const bool presentation_allowed =
++            events_callbacks.presentation_allowed_callback == nullptr ||
++            events_callbacks.presentation_allowed_callback();
++        std::unique_ptr<uint8_t[]> rdram_snapshot;
++        if (presentation_allowed) {
++            constexpr size_t RDRAMSnapshotSize = 0x800000;
++            rdram_snapshot = std::make_unique<uint8_t[]>(RDRAMSnapshotSize);
++            std::memcpy(rdram_snapshot.get(), rdram, RDRAMSnapshotSize);
++        }
++        events_context.action_queue.enqueue(SpTaskAction{
++            *task, std::move(rdram_snapshot), presentation_allowed });
+     }
+     // Set all other tasks as the RSP task
+     else {

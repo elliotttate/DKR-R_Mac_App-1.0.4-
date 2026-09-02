@@ -3,17 +3,26 @@
 #include "game_registration.hpp"
 #include "generated/jumpman_font.h"
 #include "generated/racing_banana_font.h"
+#include "countdown_tone_policy.hpp"
 #include "magic_code_policy.hpp"
 #include "modern_camera_policy.hpp"
+#include "rom_revision.hpp"
 #include "runtime_enhancements.hpp"
+#include "runtime_hud_layout.hpp"
 #include "runtime_audio_controls.hpp"
 #include "runtime_crt_overlay.hpp"
 #include "runtime_input.hpp"
 #include "runtime_magic_codes.hpp"
+#include "runtime_netplay.hpp"
+#include "netplay/friend_service.hpp"
+#include "netplay/netplay_build_identity.hpp"
 #include "runtime_platform.hpp"
+#include "runtime_support.hpp"
 #include "runtime_telemetry.hpp"
 #include "runtime_texture_packs.hpp"
 #include "save_manager.hpp"
+#include "texture_pack_browser_policy.hpp"
+#include "ui_notification_policy.hpp"
 #include "virtual_pak.hpp"
 
 #if defined(_WIN32)
@@ -29,11 +38,13 @@
 #include "hle/rt64_application.h"
 #include "hle/rt64_present_queue.h"
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 #include "imgui/imgui_impl_sdl2_custom.h"
 #include "imgui/backends/imgui_impl_sdlrenderer2.h"
 #include "nfd.h"
 #include "ultramodern/config.hpp"
 #include "ultramodern/ultramodern.hpp"
+#include "stb/stb_image.h"
 
 #include <SDL.h>
 
@@ -47,13 +58,141 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <exception>
 #include <fstream>
+#include <functional>
+#include <future>
+#include <initializer_list>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+namespace {
+
+// A single bounded checker texture replaces the old per-frame, per-strip
+// tessellation. It lives in ImGui's existing font atlas, so the launcher and
+// RT64 overlay use the same cached artwork without another renderer resource.
+// Leave one full checker period for the font atlas packer's padded border.
+// The atlas itself is 2048 px wide; 1984 is 31 exact 64 px pattern periods and
+// therefore packs without a separate renderer texture or a partial tile.
+constexpr int kRaceButtonAtlasWidth = 2048;
+constexpr int kRaceButtonPatternWidth = 1984;
+constexpr int kRaceButtonPatternHeight = 64;
+constexpr int kRaceButtonPatternCell = 32;
+int g_race_button_pattern_rect = -1;
+
+}  // namespace
+
+namespace ImGui {
+
+// Keep every launcher and in-game overlay button on the same racing-themed
+// interaction primitive. The checker layer is painted after the ordinary
+// ImGui button so existing sizing, navigation, disabled-state and activation
+// behaviour remain untouched.
+bool DkrRaceButton(const char* label, const ImVec2& size = ImVec2(0.0F, 0.0F)) {
+    const bool pressed = Button(label, size);
+    if (!IsItemHovered() && !IsItemFocused()) return pressed;
+
+    const ImVec2 minimum = GetItemRectMin();
+    const ImVec2 maximum = GetItemRectMax();
+    if (maximum.x <= minimum.x || maximum.y <= minimum.y) return pressed;
+
+    ImDrawList* draw = GetWindowDrawList();
+    const float width = maximum.x - minimum.x;
+    const float height = maximum.y - minimum.y;
+    const float rounding = std::clamp(GetStyle().FrameRounding, 0.0F,
+                                      std::min(width, height) * 0.5F);
+    // Keep the racing motif broad and calm. A dense black/cream grid creates
+    // high-frequency noise behind the label (especially on handheld panels),
+    // while two or three rows remain recognisably checkered without competing
+    // with the text.
+    const float cell = std::clamp(height * 0.62F, 20.0F, 34.0F);
+    const float time = static_cast<float>(GetTime());
+    const float pattern_period = cell * 2.0F;
+    const float travel = std::fmod(time * 16.0F, pattern_period);
+    ImFontAtlas* atlas = GetIO().Fonts;
+    ImFontAtlasCustomRect* pattern =
+        g_race_button_pattern_rect >= 0
+            ? atlas->GetCustomRectByIndex(g_race_button_pattern_rect)
+            : nullptr;
+    if (pattern != nullptr && pattern->IsPacked() && atlas->TexID != nullptr &&
+        atlas->TexWidth > 0 && atlas->TexHeight > 0) {
+        const float source_scale =
+            static_cast<float>(kRaceButtonPatternCell) / cell;
+        const float source_phase = std::fmod(
+            static_cast<float>(kRaceButtonPatternCell * 2) -
+                travel * source_scale,
+            static_cast<float>(kRaceButtonPatternCell * 2));
+        const float source_width = std::min(
+            width * source_scale,
+            std::max(static_cast<float>(pattern->Width) - source_phase, 1.0F));
+        const float source_height = std::min(
+            height * source_scale, static_cast<float>(pattern->Height));
+        const ImVec2 uv_min{
+            (static_cast<float>(pattern->X) + source_phase) /
+                static_cast<float>(atlas->TexWidth),
+            static_cast<float>(pattern->Y) /
+                static_cast<float>(atlas->TexHeight)};
+        const ImVec2 uv_max{
+            (static_cast<float>(pattern->X) + source_phase + source_width) /
+                static_cast<float>(atlas->TexWidth),
+            (static_cast<float>(pattern->Y) + source_height) /
+                static_cast<float>(atlas->TexHeight)};
+        draw->AddImageRounded(atlas->TexID, minimum, maximum, uv_min, uv_max,
+                              IM_COL32_WHITE, rounding);
+    } else {
+        // Preserve a readable hover state if a constrained backend cannot
+        // pack the optional checker artwork into its atlas.
+        draw->AddRectFilled(minimum, maximum, IM_COL32(226, 112, 25, 255),
+                            rounding);
+    }
+    draw->AddRect(minimum, maximum, IM_COL32(255, 218, 99, 245),
+                  rounding, 0, 1.5F);
+    const char* rendered_end = FindRenderedTextEnd(label);
+    const ImVec2 text_size = CalcTextSize(label, rendered_end, true);
+    const ImVec2 text_position{
+        minimum.x + (width - text_size.x) * GetStyle().ButtonTextAlign.x,
+        minimum.y + (height - text_size.y) * GetStyle().ButtonTextAlign.y};
+    const float plate_padding_x = std::clamp(height * 0.22F, 8.0F, 15.0F);
+    const float plate_padding_y = std::clamp(height * 0.09F, 3.0F, 6.0F);
+    ImVec2 plate_min{text_position.x - plate_padding_x,
+                     text_position.y - plate_padding_y};
+    ImVec2 plate_max{text_position.x + text_size.x + plate_padding_x,
+                     text_position.y + text_size.y + plate_padding_y};
+    plate_min.x = std::max(plate_min.x, minimum.x + 5.0F);
+    plate_max.x = std::min(plate_max.x, maximum.x - 5.0F);
+    plate_min.y = std::max(plate_min.y, minimum.y + 4.0F);
+    plate_max.y = std::min(plate_max.y, maximum.y - 4.0F);
+    const float plate_rounding = std::min((plate_max.y - plate_min.y) * 0.5F,
+                                          9.0F);
+
+    // Give the label its own stable contrast surface. This deliberately does
+    // not share the checker animation, so readability is identical at every
+    // animation phase and for both mouse hover and controller focus.
+    draw->AddRectFilled(plate_min, plate_max, IM_COL32(7, 28, 39, 242),
+                        plate_rounding);
+    draw->AddRect(plate_min, plate_max, IM_COL32(255, 204, 75, 225),
+                  plate_rounding, 0, 1.0F);
+    draw->PushClipRect(plate_min, plate_max, true);
+    draw->AddText({text_position.x + 1.0F, text_position.y + 1.0F},
+                  IM_COL32(0, 0, 0, 185), label, rendered_end);
+    draw->AddText(text_position, IM_COL32(255, 249, 222, 255), label,
+                  rendered_end);
+    draw->PopClipRect();
+    return pressed;
+}
+
+}  // namespace ImGui
+
+// Route existing ImGui::Button calls through the shared primitive without
+// changing call sites or widget IDs.
+#define Button DkrRaceButton
 
 namespace {
 
@@ -80,11 +219,31 @@ std::atomic<dkr::runtime::ui::LifecycleRequest> g_lifecycle_request{
 std::mutex g_inspector_guard;
 RT64::Inspector* g_inspector = nullptr;
 std::atomic<int> g_overlay_page{0};
+std::atomic<int> g_overlay_last_rendered_page{-1};
+// Shoulder buttons exclusively own this ten-entry rail. Entries 0-7 switch
+// pages immediately; Restart and Exit require an explicit A press.
+std::atomic<int> g_overlay_sidebar_selection{0};
+std::atomic<int> g_overlay_sidebar_action{0};
 ImFont* g_font_heading = nullptr;
 ImFont* g_font_title = nullptr;
 ImFont* g_font_controls = nullptr;
 ImFont* g_font_fps = nullptr;
-int g_brand_logo_rect = -1;
+std::array<int, 2> g_brand_logo_rects{{-1, -1}};
+constexpr int kOnlineGuideVersion = 1;
+int g_online_guide_acknowledged_version = 0;
+bool g_online_guide_opened_this_run = false;
+// The standalone launcher has its own display-paced monotonic clock. Its SDL
+// GPU renderer and non-Vulkan window are destroyed before the explicit Vulkan
+// game-window handoff; in-game overlays continue to use ImGui's normal clock.
+double g_launcher_animation_seconds = -1.0;
+
+double UiAnimationSeconds() {
+    return g_launcher_animation_seconds >= 0.0
+        ? g_launcher_animation_seconds
+        : ImGui::GetTime();
+}
+bool g_online_guide_do_not_show_again = true;
+bool g_online_guide_reopen_requested = false;
 RefreshRate g_modern_refresh_mode = RefreshRate::Display;
 int g_modern_refresh_target = 60;
 Resolution g_modern_resolution = Resolution::Auto;
@@ -114,9 +273,107 @@ int g_crt_scale_mode = 0;
 float g_crt_strength = 0.35F;
 std::string g_crt_status;
 std::string g_texture_pack_status;
-bool g_show_hidden_texture_packs = false;
+struct TextureImportState {
+    bool running = false;
+    bool finished = false;
+    bool succeeded = false;
+    bool commit_started = false;
+    bool modal_visible = false;
+    float progress = 0.0F;
+    std::string stage;
+    std::string result;
+};
+std::mutex g_texture_import_mutex;
+std::atomic<bool> g_texture_import_cancel_requested{false};
+TextureImportState g_texture_import_state;
+// Keep the worker last so it is stopped and joined before the state, cancel
+// flag, and mutex it can still touch are destroyed during application exit.
+std::jthread g_texture_import_worker;
+char g_texture_pack_search[160]{};
+int g_texture_pack_sort = 0;
+int g_texture_pack_state_filter = 0;
+int g_texture_pack_compatibility_filter = 0;
+int g_texture_pack_type_filter = 0;
+int g_texture_pack_visibility_filter = 0;
+std::string g_texture_pack_manage_id;
 std::string g_texture_pack_remove_id;
 std::string g_texture_pack_remove_name;
+int g_online_offline_section = 0;
+int g_online_active_section = 0;
+char g_online_player_name[25] = "Racer";
+char g_online_room_name[49] = "DKR-R Grand Prix";
+char g_online_invite[1024]{};
+char g_online_code_entry[6]{};
+char g_online_profile_name[25] = "Racer";
+char g_friend_code_entry[128]{};
+char g_friend_search[64]{};
+char g_friend_search_edit[64]{};
+char g_friend_nickname[25]{};
+enum class TextEntryTarget {
+    None,
+    RacerName,
+    LobbyName,
+    OnlineProfileName,
+    FriendNickname,
+    TexturePackSearch,
+};
+TextEntryTarget g_text_entry_target = TextEntryTarget::None;
+char g_text_entry_edit[160]{};
+bool g_text_entry_keyboard_pending = false;
+bool g_friend_code_keyboard_pending = false;
+bool g_friend_search_keyboard_pending = false;
+int g_friend_invite_lifetime = 0;
+int g_friend_invite_minutes = 60;
+int g_friend_filter = 0;
+int g_friend_sort = 0;
+bool g_friend_online_notifications = true;
+int g_friend_online_notification_position = 2;
+std::string g_friend_action_identity;
+bool g_friend_remove_pending = false;
+bool g_friend_block_pending = false;
+std::map<std::string, bool> g_friend_presence_snapshot;
+bool g_friend_presence_seeded = false;
+dkr::runtime::ui_notifications::Queue g_online_notifications;
+std::set<std::uint64_t> g_seen_friend_lobby_invites;
+bool g_open_host_friend_invites = false;
+bool g_online_code_keyboard_pending = false;
+std::atomic<bool> g_online_code_keyboard_visible{false};
+std::atomic<bool> g_online_code_keyboard_cancel_requested{false};
+int g_online_host_control = static_cast<int>(
+    dkr::runtime::netplay::HostControlPolicy::GuidedUntilCharacterSelect);
+int g_online_maximum_players = static_cast<int>(
+    dkr::runtime::netplay::kSupportedOnlinePlayers);
+int g_online_synchronization = static_cast<int>(
+    dkr::runtime::netplay::SynchronizationMode::Rollback);
+int g_online_rollback_window = 10;
+bool g_online_automatic_delay = true;
+int g_online_manual_delay = 2;
+bool g_online_record_replay = true;
+int g_online_save_seed_mode = static_cast<int>(
+    dkr::runtime::saves::OnlineSaveSeedMode::CopySinglePlayer);
+int g_online_input_profile = 0;
+std::string g_online_action_status;
+std::string g_online_error_notification;
+std::string g_last_online_error;
+bool g_online_error_was_active = false;
+std::chrono::steady_clock::time_point g_online_error_started{};
+dkr::runtime::netplay::OnlineFailure g_online_failure_modal{};
+std::string g_online_failure_modal_message;
+bool g_online_failure_modal_requested = false;
+bool g_online_failure_modal_active = false;
+bool g_network_overlay_enabled = false;
+int g_network_overlay_position = 0;
+int g_network_overlay_detail = 1;
+bool g_network_overlay_single_row = false;
+bool g_controller_input_overlay_enabled = false;
+int g_controller_input_overlay_position = 2;
+ImVec2 g_fps_overlay_extent{};
+ImVec2 g_network_overlay_extent{};
+std::future<dkr::runtime::support::SystemSummary> g_support_summary_future;
+std::optional<dkr::runtime::support::SystemSummary> g_support_summary;
+bool g_support_summary_requested = false;
+std::string g_support_action_status;
+bool g_patch_notes_requested = false;
 
 constexpr int kPagePlay = 0;
 constexpr int kPageGraphics = 1;
@@ -139,17 +396,72 @@ std::vector<CrtFilterEntry> g_crt_filters;
 #ifndef DKR_RELEASE_VERSION
 #define DKR_RELEASE_VERSION "development"
 #endif
+#ifndef DKR_NETWORK_RELEASE_VERSION
+#define DKR_NETWORK_RELEASE_VERSION "development"
+#endif
 enum class CaptureDevice { None, Keyboard, Controller };
 CaptureDevice g_capture_device = CaptureDevice::None;
 int g_capture_action = -1;
 bool g_capture_popup_pending = false;
 bool g_capture_finished = false;
+std::size_t g_selected_player = 0;
+int g_controls_section = 0;
 constexpr int kShortcutCaptureAction = -2;
+constexpr int kAssignControllerCaptureAction = -3;
+constexpr std::size_t kShortcutActionCount = static_cast<std::size_t>(
+    dkr::runtime::input::ShortcutAction::Count);
+constexpr std::array<const char*, kShortcutActionCount> kShortcutSettingNames{
+    "quick_restart", "toggle_overlay", "toggle_texture_pack",
+    "toggle_fullscreen", "recenter_gyro"};
+bool g_capture_secondary_controller = false;
+dkr::runtime::input::ShortcutAction g_capture_shortcut_action =
+    dkr::runtime::input::ShortcutAction::QuickRestart;
 std::array<int, 2> g_shortcut_capture_sources{
     dkr::runtime::input::kUnbound, dkr::runtime::input::kUnbound};
 int g_shortcut_capture_count = 0;
 std::chrono::steady_clock::time_point g_shortcut_capture_deadline{};
 std::string g_save_manager_status;
+struct SaveManagerViewCache {
+    bool valid = false;
+    std::chrono::steady_clock::time_point next_refresh{};
+    dkr::runtime::saves::SaveInfo adventure;
+    std::array<dkr::runtime::saves::SaveInfo,
+               dkr::runtime::saves::kControllerPakCount> controller_paks{};
+    std::vector<std::filesystem::path> adventure_backups;
+};
+SaveManagerViewCache g_save_manager_view_cache;
+
+void InvalidateSaveManagerViewCache() {
+    g_save_manager_view_cache.valid = false;
+}
+
+const SaveManagerViewCache& CachedSaveManagerView() {
+    const auto now = std::chrono::steady_clock::now();
+    if (g_save_manager_view_cache.valid &&
+        now < g_save_manager_view_cache.next_refresh) {
+        return g_save_manager_view_cache;
+    }
+    g_save_manager_view_cache.adventure =
+        dkr::runtime::saves::adventure_info();
+    for (int channel = 0;
+         channel < dkr::runtime::saves::kControllerPakCount; ++channel) {
+        g_save_manager_view_cache.controller_paks[
+            static_cast<std::size_t>(channel)] =
+            dkr::runtime::saves::controller_pak_info(channel);
+    }
+    g_save_manager_view_cache.adventure_backups =
+        dkr::runtime::saves::adventure_backups();
+    g_save_manager_view_cache.next_refresh =
+        now + std::chrono::milliseconds{500};
+    g_save_manager_view_cache.valid = true;
+    return g_save_manager_view_cache;
+}
+
+std::string g_magic_codes_status;
+bool g_online_compatibility_sync_requested = false;
+std::string g_controller_mapping_status;
+bool g_controller_mapping_popup_pending = false;
+bool g_controller_mapping_completion_saved = false;
 std::optional<dkr::runtime::saves::codec::SaveImage> g_save_builder_image;
 int g_save_builder_slot = 0;
 
@@ -158,6 +470,11 @@ bool HandleInputCaptureEvent(SDL_Event* event);
 struct BrowserEntry {
     std::filesystem::path path;
     bool directory = false;
+};
+
+struct RomCatalogEntry {
+    std::filesystem::path path;
+    std::string label;
 };
 
 struct RomBrowserState {
@@ -204,8 +521,67 @@ std::filesystem::path RuntimeAssetPath(const std::filesystem::path& relative) {
         ? candidate : std::filesystem::path{};
 }
 
-std::filesystem::path BrandLogoPath() {
-    return RuntimeAssetPath("assets/ui/Icons/DKR-R8.bmp");
+std::array<std::filesystem::path, 2> BrandLogoPaths() {
+    return {
+        RuntimeAssetPath("assets/ui/Icons/DKR-R-Spinning-Icon.png"),
+        RuntimeAssetPath("assets/ui/Icons/DKR-R-Short-Logo.png"),
+    };
+}
+
+std::filesystem::path LauncherBackgroundPath() {
+    return RuntimeAssetPath(
+        "assets/ui/Backgrounds/DKR-R-Launcher-Background.png");
+}
+
+struct LauncherBackgroundTexture {
+    SDL_Texture* texture = nullptr;
+    int width = 0;
+    int height = 0;
+};
+
+LauncherBackgroundTexture LoadLauncherBackground(SDL_Renderer* renderer) {
+    LauncherBackgroundTexture result{};
+    if (renderer == nullptr) return result;
+
+    const std::filesystem::path path = LauncherBackgroundPath();
+    if (path.empty()) {
+        std::fprintf(stderr,
+                     "[boot][ui] DKR-R launcher background was not found beside the runtime\n");
+        return result;
+    }
+
+    int channels = 0;
+    stbi_uc* pixels = stbi_load(PathUtf8(path).c_str(), &result.width,
+                                &result.height, &channels, STBI_rgb_alpha);
+    if (pixels == nullptr || result.width <= 0 || result.height <= 0) {
+        std::fprintf(stderr,
+                     "[boot][ui] launcher background could not be loaded: %s\n",
+                     stbi_failure_reason() != nullptr ? stbi_failure_reason()
+                                                      : "unknown image error");
+        if (pixels != nullptr) stbi_image_free(pixels);
+        result.width = 0;
+        result.height = 0;
+        return result;
+    }
+
+    result.texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32,
+                                       SDL_TEXTUREACCESS_STATIC, result.width,
+                                       result.height);
+    if (result.texture == nullptr ||
+        SDL_UpdateTexture(result.texture, nullptr, pixels,
+                          result.width * STBI_rgb_alpha) != 0) {
+        std::fprintf(stderr,
+                     "[boot][ui] launcher background texture creation failed: %s\n",
+                     SDL_GetError());
+        if (result.texture != nullptr) SDL_DestroyTexture(result.texture);
+        result.texture = nullptr;
+        result.width = 0;
+        result.height = 0;
+    } else {
+        SDL_SetTextureBlendMode(result.texture, SDL_BLENDMODE_NONE);
+    }
+    stbi_image_free(pixels);
+    return result;
 }
 
 void RefreshCrtFilters() {
@@ -266,54 +642,106 @@ bool CrtFilterGetter(void* data, int index, const char** output) {
 }
 
 void LoadBrandLogoIntoAtlas() {
-    g_brand_logo_rect = -1;
-    const std::filesystem::path path = BrandLogoPath();
-    if (path.empty()) {
-        std::fprintf(stderr,
-                     "[boot][ui] DKR-R8 launcher logo was not found beside the runtime\n");
-        return;
-    }
-    SDL_Surface* source = SDL_LoadBMP(PathUtf8(path).c_str());
-    if (source == nullptr) {
-        std::fprintf(stderr, "[boot][ui] launcher logo could not be loaded: %s\n",
-                     SDL_GetError());
-        return;
-    }
-    SDL_Surface* rgba = SDL_ConvertSurfaceFormat(
-        source, SDL_PIXELFORMAT_RGBA32, 0);
-    SDL_FreeSurface(source);
-    if (rgba == nullptr || rgba->w <= 0 || rgba->h <= 0) {
-        std::fprintf(stderr, "[boot][ui] launcher logo conversion failed: %s\n",
-                     SDL_GetError());
-        if (rgba != nullptr) SDL_FreeSurface(rgba);
-        return;
-    }
-
+    g_brand_logo_rects = {{-1, -1}};
+    g_race_button_pattern_rect = -1;
+    struct LoadedLogo {
+        stbi_uc* pixels = nullptr;
+        int width = 0;
+        int height = 0;
+        int rect_index = -1;
+    };
+    std::array<LoadedLogo, 2> logos{};
+    const auto paths = BrandLogoPaths();
     ImFontAtlas* atlas = ImGui::GetIO().Fonts;
-    const int rect_index = atlas->AddCustomRectRegular(rgba->w, rgba->h);
+    atlas->TexDesiredWidth = std::max(atlas->TexDesiredWidth,
+                                      kRaceButtonAtlasWidth);
+    for (std::size_t index = 0; index < logos.size(); ++index) {
+        if (paths[index].empty()) continue;
+        int channels = 0;
+        logos[index].pixels = stbi_load(PathUtf8(paths[index]).c_str(),
+                                        &logos[index].width,
+                                        &logos[index].height, &channels,
+                                        STBI_rgb_alpha);
+        if (logos[index].pixels == nullptr || logos[index].width <= 0 ||
+            logos[index].height <= 0) {
+            std::fprintf(stderr,
+                         "[boot][ui] launcher logo face %zu could not be loaded: %s\n",
+                         index,
+                         stbi_failure_reason() != nullptr
+                             ? stbi_failure_reason()
+                             : "unknown image error");
+            if (logos[index].pixels != nullptr) {
+                stbi_image_free(logos[index].pixels);
+                logos[index].pixels = nullptr;
+            }
+            continue;
+        }
+        logos[index].rect_index = atlas->AddCustomRectRegular(
+            logos[index].width, logos[index].height);
+    }
+    const int pattern_rect_index = atlas->AddCustomRectRegular(
+        kRaceButtonPatternWidth, kRaceButtonPatternHeight);
+
     unsigned char* pixels = nullptr;
     int atlas_width = 0;
     int atlas_height = 0;
     atlas->GetTexDataAsRGBA32(&pixels, &atlas_width, &atlas_height);
-    ImFontAtlasCustomRect* rect = atlas->GetCustomRectByIndex(rect_index);
-    if (pixels == nullptr || rect == nullptr || !rect->IsPacked() ||
-        rect->X + rect->Width > atlas_width ||
-        rect->Y + rect->Height > atlas_height) {
-        std::fprintf(stderr, "[boot][ui] launcher logo would not fit the font atlas\n");
-        SDL_FreeSurface(rgba);
-        return;
+    for (std::size_t index = 0; index < logos.size(); ++index) {
+        LoadedLogo& logo = logos[index];
+        ImFontAtlasCustomRect* rect = logo.rect_index >= 0
+            ? atlas->GetCustomRectByIndex(logo.rect_index)
+            : nullptr;
+        const bool fits = pixels != nullptr && logo.pixels != nullptr &&
+            rect != nullptr && rect->IsPacked() &&
+            rect->X + rect->Width <= atlas_width &&
+            rect->Y + rect->Height <= atlas_height;
+        if (!fits) {
+            if (logo.pixels != nullptr) {
+                std::fprintf(stderr,
+                             "[boot][ui] launcher logo face %zu would not fit the font atlas\n",
+                             index);
+            }
+        } else {
+            for (int row = 0; row < logo.height; ++row) {
+                const auto* source_row = logo.pixels +
+                    static_cast<std::size_t>(row) * logo.width * 4U;
+                auto* destination_row = pixels +
+                    (static_cast<std::size_t>(rect->Y + row) * atlas_width +
+                     rect->X) * 4U;
+                std::memcpy(destination_row, source_row,
+                            static_cast<std::size_t>(logo.width) * 4U);
+            }
+            g_brand_logo_rects[index] = logo.rect_index;
+        }
+        if (logo.pixels != nullptr) stbi_image_free(logo.pixels);
     }
-    for (int row = 0; row < rgba->h; ++row) {
-        const auto* source_row = static_cast<const unsigned char*>(rgba->pixels) +
-            static_cast<std::size_t>(row) * rgba->pitch;
-        auto* destination_row = pixels +
-            (static_cast<std::size_t>(rect->Y + row) * atlas_width + rect->X) * 4U;
-        std::memcpy(destination_row, source_row,
-                    static_cast<std::size_t>(rgba->w) * 4U);
+    ImFontAtlasCustomRect* pattern = pattern_rect_index >= 0
+        ? atlas->GetCustomRectByIndex(pattern_rect_index)
+        : nullptr;
+    const bool pattern_fits = pixels != nullptr && pattern != nullptr &&
+        pattern->IsPacked() && pattern->X + pattern->Width <= atlas_width &&
+        pattern->Y + pattern->Height <= atlas_height;
+    if (pattern_fits) {
+        constexpr std::array<unsigned char, 4> kCheckerDark{{176, 67, 22, 255}};
+        constexpr std::array<unsigned char, 4> kCheckerLight{{244, 145, 31, 255}};
+        for (int row = 0; row < pattern->Height; ++row) {
+            for (int column = 0; column < pattern->Width; ++column) {
+                const bool dark =
+                    (((column / kRaceButtonPatternCell) +
+                      (row / kRaceButtonPatternCell)) & 1) != 0;
+                const auto& colour = dark ? kCheckerDark : kCheckerLight;
+                auto* destination = pixels +
+                    (static_cast<std::size_t>(pattern->Y + row) * atlas_width +
+                     pattern->X + column) * 4U;
+                std::memcpy(destination, colour.data(), colour.size());
+            }
+        }
+        g_race_button_pattern_rect = pattern_rect_index;
+    } else {
+        std::fprintf(stderr,
+                     "[boot][ui] racing button pattern would not fit the font atlas\n");
     }
     atlas->TexPixelsUseColors = true;
-    g_brand_logo_rect = rect_index;
-    SDL_FreeSurface(rgba);
 }
 
 std::filesystem::path SettingsPath() {
@@ -322,6 +750,10 @@ std::filesystem::path SettingsPath() {
 
 std::filesystem::path LastRomPath() {
     return g_config_directory / "last-rom.txt";
+}
+
+std::filesystem::path RomCatalogPath() {
+    return g_config_directory / "rom-catalog.txt";
 }
 
 bool ReplaceSettingsFile(const std::filesystem::path& temporary,
@@ -380,8 +812,17 @@ void LoadLauncherFonts() {
         0x0020, 0x00FF, // Basic Latin and Latin-1 Supplement.
         0,
     };
+    static constexpr ImWchar kLauncherNonDigitGlyphRanges[] = {
+        0x0020, 0x002F,
+        0x003A, 0x00FF,
+        0,
+    };
+    static constexpr ImWchar kJumpmanDigitGlyphRanges[] = {
+        0x0030, 0x0039,
+        0,
+    };
 
-    const auto merge_fallback = [&](float size) {
+    const auto merge_fallback = [&](float size, const ImWchar* ranges) {
         ImFontConfig fallback_config{};
         fallback_config.MergeMode = true;
         fallback_config.PixelSnapH = true;
@@ -389,43 +830,71 @@ void LoadLauncherFonts() {
         fallback_config.OversampleV = 1;
         fallback_config.SizePixels = size;
         fallback_config.RasterizerMultiply = 1.35F;
-        fallback_config.GlyphRanges = kLauncherGlyphRanges;
+        fallback_config.GlyphRanges = ranges;
         io.Fonts->AddFontDefault(&fallback_config);
+    };
+    const auto merge_jumpman_digits = [&](float size) -> bool {
+        // Jumpman's glyphs occupy substantially less of their em square than
+        // Racing Banana. Merge them from a larger source size so digits have
+        // the same visual cap height as the surrounding launcher text.
+        constexpr float kJumpmanVisualScale = 1.42F;
+        ImFontConfig config{};
+        config.FontDataOwnedByAtlas = false;
+        config.MergeMode = true;
+        config.PixelSnapH = true;
+        config.OversampleH = 2;
+        config.OversampleV = 2;
+        config.GlyphRanges = kJumpmanDigitGlyphRanges;
+        return io.Fonts->AddFontFromMemoryTTF(
+                   const_cast<unsigned char*>(dkr_jumpman_font),
+                   static_cast<int>(dkr_jumpman_font_size),
+                   size * kJumpmanVisualScale, &config,
+                   kJumpmanDigitGlyphRanges) != nullptr;
     };
     const auto add_racing_font = [&](float size) -> ImFont* {
         ImFontConfig config{};
         config.FontDataOwnedByAtlas = false;
         config.OversampleH = 2;
         config.OversampleV = 2;
-        config.GlyphRanges = kLauncherGlyphRanges;
+        config.GlyphRanges = kLauncherNonDigitGlyphRanges;
         ImFont* font = io.Fonts->AddFontFromMemoryTTF(
             const_cast<char*>(dkr_racing_banana_font),
             static_cast<int>(dkr_racing_banana_font_size), size, &config,
-            kLauncherGlyphRanges);
+            kLauncherNonDigitGlyphRanges);
         if (font != nullptr) {
-            merge_fallback(size);
+            if (!merge_jumpman_digits(size)) {
+                merge_fallback(size, kJumpmanDigitGlyphRanges);
+            }
+            merge_fallback(size, kLauncherNonDigitGlyphRanges);
         }
         return font;
     };
 
-    // Numeric and selectable controls use one coherent sans face. Racing
-    // Banana deliberately remains the launcher's body font, but its missing
-    // digits otherwise force ImGui to mix fallback glyphs of a different
-    // apparent size inside sliders and combo previews.
+    // Controls retain the highly legible default face for words and symbols,
+    // while Jumpman owns every digit. Building the base without 0-9 is
+    // important because ImGui deliberately refuses to overwrite an existing
+    // glyph during a MergeMode font addition.
     ImFontConfig control_config{};
     control_config.SizePixels = 21.0F;
     control_config.OversampleH = 2;
     control_config.OversampleV = 2;
     control_config.PixelSnapH = true;
     control_config.RasterizerMultiply = 1.20F;
-    control_config.GlyphRanges = kLauncherGlyphRanges;
+    control_config.GlyphRanges = kLauncherNonDigitGlyphRanges;
     g_font_controls = io.Fonts->AddFontDefault(&control_config);
+    if (g_font_controls != nullptr && !merge_jumpman_digits(21.0F)) {
+        merge_fallback(21.0F, kJumpmanDigitGlyphRanges);
+    }
 
     ImFont* body_font = add_racing_font(19.0F);
     if (body_font == nullptr) {
         ImFontConfig fallback_config{};
         fallback_config.SizePixels = 19.0F;
+        fallback_config.GlyphRanges = kLauncherNonDigitGlyphRanges;
         body_font = io.Fonts->AddFontDefault(&fallback_config);
+        if (body_font != nullptr && !merge_jumpman_digits(19.0F)) {
+            merge_fallback(19.0F, kJumpmanDigitGlyphRanges);
+        }
         std::fprintf(stderr,
                      "[boot][ui] Racing Banana body font could not be loaded; using fallback\n");
     }
@@ -445,11 +914,11 @@ void LoadLauncherFonts() {
             static_cast<int>(dkr_jumpman_font_size), size, &config,
             kLauncherGlyphRanges);
         if (font != nullptr) {
-            merge_fallback(size);
+            merge_fallback(size, kLauncherGlyphRanges);
         }
         return font;
     };
-    g_font_heading = add_jumpman_font(52.0F);
+    g_font_heading = add_jumpman_font(58.0F);
     g_font_title = add_jumpman_font(68.0F);
     g_font_fps = add_jumpman_font(24.0F);
     if (g_font_heading == nullptr || g_font_title == nullptr) {
@@ -566,6 +1035,38 @@ void PopHeadingFont(bool title = false) {
     }
 }
 
+float TrackedTextWidth(ImFont* font, float size, const char* text,
+                       float tracking) {
+    if (font == nullptr || text == nullptr || *text == '\0') return 0.0F;
+    const float scale = size / std::max(font->FontSize, 1.0F);
+    float width = 0.0F;
+    const std::size_t length = std::strlen(text);
+    for (std::size_t index = 0; index < length; ++index) {
+        const auto character = static_cast<unsigned char>(text[index]);
+        const ImFontGlyph* glyph = font->FindGlyph(character);
+        if (glyph != nullptr) width += glyph->AdvanceX * scale;
+        if (index + 1U < length) width += tracking;
+    }
+    return width;
+}
+
+void AddTrackedText(ImDrawList* draw, ImFont* font, float size,
+                    ImVec2 position, ImU32 colour, const char* text,
+                    float tracking) {
+    if (draw == nullptr || font == nullptr || text == nullptr) return;
+    const float scale = size / std::max(font->FontSize, 1.0F);
+    const std::size_t length = std::strlen(text);
+    for (std::size_t index = 0; index < length; ++index) {
+        const char glyph_text[2]{text[index], '\0'};
+        draw->AddText(font, size, position, colour, glyph_text,
+                      glyph_text + 1);
+        const ImFontGlyph* glyph = font->FindGlyph(
+            static_cast<unsigned char>(text[index]));
+        position.x += glyph != nullptr ? glyph->AdvanceX * scale : 0.0F;
+        if (index + 1U < length) position.x += tracking;
+    }
+}
+
 void DrawPageHeading(const char* text, bool title = false) {
     ImFont* font = title ? g_font_title : g_font_heading;
     if (font == nullptr || text == nullptr) {
@@ -573,18 +1074,35 @@ void DrawPageHeading(const char* text, bool title = false) {
         return;
     }
     const ImVec2 position = ImGui::GetCursorScreenPos();
-    const float size = font->FontSize;
+    const float available_width =
+        std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+    float size = font->FontSize;
+    float tracking = size * (title ? 0.03F : 0.04F);
+    float width = TrackedTextWidth(font, size, text, tracking);
+    if (width > available_width) {
+        const float fit = std::clamp(available_width / width, 0.62F, 1.0F);
+        size *= fit;
+        tracking *= fit;
+        width = TrackedTextWidth(font, size, text, tracking);
+    }
     const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0F, text);
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    constexpr float outline = 2.0F;
+    const float outline = std::clamp(size * 0.055F, 2.0F, 4.0F);
     const ImU32 orange = ImGui::ColorConvertFloat4ToU32(kWarm);
     const ImU32 red = ImGui::ColorConvertFloat4ToU32(kRaceRed);
-    draw->AddText(font, size, {position.x - outline, position.y}, orange, text);
-    draw->AddText(font, size, {position.x + outline, position.y}, orange, text);
-    draw->AddText(font, size, {position.x, position.y - outline}, orange, text);
-    draw->AddText(font, size, {position.x, position.y + outline}, orange, text);
-    draw->AddText(font, size, position, red, text);
-    ImGui::Dummy({extent.x, extent.y + 2.0F});
+    constexpr std::array<ImVec2, 8> directions{{
+        {-1.0F, 0.0F}, {1.0F, 0.0F}, {0.0F, -1.0F}, {0.0F, 1.0F},
+        {-0.72F, -0.72F}, {0.72F, -0.72F},
+        {-0.72F, 0.72F}, {0.72F, 0.72F},
+    }};
+    for (const ImVec2 direction : directions) {
+        AddTrackedText(draw, font, size,
+            {position.x + direction.x * outline,
+             position.y + direction.y * outline},
+            orange, text, tracking);
+    }
+    AddTrackedText(draw, font, size, position, red, text, tracking);
+    ImGui::Dummy({std::min(width, available_width), extent.y + outline + 2.0F});
 }
 
 void RememberModernGraphics(const GraphicsConfig& config) {
@@ -701,6 +1219,16 @@ void SaveSettings() {
         output << "fps_outline_g=" << static_cast<int>(g_fps_outline_colour.y * 255.0F) << '\n';
         output << "fps_outline_b=" << static_cast<int>(g_fps_outline_colour.z * 255.0F) << '\n';
         output << "fps_outline_a=" << static_cast<int>(g_fps_outline_colour.w * 255.0F) << '\n';
+        output << "network_overlay_enabled="
+               << (g_network_overlay_enabled ? 1 : 0) << '\n';
+        output << "network_overlay_position=" << g_network_overlay_position << '\n';
+        output << "network_overlay_detail=" << g_network_overlay_detail << '\n';
+        output << "network_overlay_single_row="
+               << (g_network_overlay_single_row ? 1 : 0) << '\n';
+        output << "controller_input_overlay_enabled="
+               << (g_controller_input_overlay_enabled ? 1 : 0) << '\n';
+        output << "controller_input_overlay_position="
+               << g_controller_input_overlay_position << '\n';
         output << "crt_enabled=" << (g_crt_enabled ? 1 : 0) << '\n';
         output << "crt_filter_index=" << g_crt_filter_index << '\n';
         output << "crt_scale_mode=" << g_crt_scale_mode << '\n';
@@ -713,6 +1241,10 @@ void SaveSettings() {
         output << "sound_effects_volume=" << dkr::runtime::audio::sound_effects_volume() << '\n';
         output << "vehicle_volume=" << dkr::runtime::audio::vehicle_volume() << '\n';
         output << "nature_volume=" << dkr::runtime::audio::nature_volume() << '\n';
+        output << "modern_multiplayer_race_music="
+               << (dkr::runtime::enhancements::multiplayer_race_music_requested()
+                       ? 1 : 0)
+               << '\n';
         output << "eq_bass=" << dkr::runtime::platform::bass_gain() << '\n';
         output << "eq_mid=" << dkr::runtime::platform::mid_gain() << '\n';
         output << "eq_treble=" << dkr::runtime::platform::treble_gain() << '\n';
@@ -724,8 +1256,28 @@ void SaveSettings() {
                << dkr::runtime::magic_codes::persistent_mask() << '\n';
         output << "modern_view_distance_multiplier="
                << dkr::runtime::enhancements::view_distance_multiplier() << '\n';
+        output << "modern_scenery_settings_version=2\n";
         output << "modern_keep_hub_scenery="
                << (dkr::runtime::enhancements::keep_hub_scenery_requested() ? 1 : 0)
+               << '\n';
+        output << "modern_keep_track_scenery="
+               << (dkr::runtime::enhancements::keep_track_scenery_requested() ? 1 : 0)
+               << '\n';
+        output << "modern_keep_minigame_scenery="
+               << (dkr::runtime::enhancements::keep_minigame_scenery_requested() ? 1 : 0)
+               << '\n';
+        output << "modern_scenery_retention_mode="
+               << static_cast<int>(
+                      dkr::runtime::enhancements::scenery_retention_mode())
+               << '\n';
+        output << "modern_animated_scenery_distance_multiplier="
+               << dkr::runtime::enhancements::animated_scenery_distance_multiplier()
+               << '\n';
+        output << "modern_billboard_effect_distance_multiplier="
+               << dkr::runtime::enhancements::billboard_effect_distance_multiplier()
+               << '\n';
+        output << "modern_water_lava_detail_multiplier="
+               << dkr::runtime::enhancements::water_lava_detail_multiplier()
                << '\n';
         output << "modern_extended_culling="
                << (dkr::runtime::enhancements::extended_culling_requested() ? 1 : 0)
@@ -741,6 +1293,18 @@ void SaveSettings() {
         output << "stick_curve=" << dkr::runtime::input::stick_curve() << '\n';
         output << "stick_x_inverted=" << (dkr::runtime::input::stick_x_inverted() ? 1 : 0) << '\n';
         output << "stick_y_inverted=" << (dkr::runtime::input::stick_y_inverted() ? 1 : 0) << '\n';
+        constexpr std::array<const char*, 3> vehicle_names{
+            "car", "hovercraft", "plane"};
+        for (std::size_t index = 0; index < vehicle_names.size(); ++index) {
+            const auto vehicle = static_cast<
+                dkr::runtime::input::VehicleClass>(index);
+            output << "stick_x_inverted_" << vehicle_names[index] << '='
+                   << (dkr::runtime::input::vehicle_stick_x_inverted(vehicle)
+                           ? 1 : 0) << '\n';
+            output << "stick_y_inverted_" << vehicle_names[index] << '='
+                   << (dkr::runtime::input::vehicle_stick_y_inverted(vehicle)
+                           ? 1 : 0) << '\n';
+        }
         output << "trigger_threshold=" << dkr::runtime::input::trigger_threshold() << '\n';
         const auto quick_keyboard =
             dkr::runtime::input::quick_restart_keyboard_binding();
@@ -752,6 +1316,22 @@ void SaveSettings() {
         output << "quick_restart_keyboard_secondary=" << quick_keyboard.secondary << '\n';
         output << "quick_restart_controller_primary=" << quick_controller.primary << '\n';
         output << "quick_restart_controller_secondary=" << quick_controller.secondary << '\n';
+        for (std::size_t index = 0; index < kShortcutSettingNames.size(); ++index) {
+            const auto action = static_cast<
+                dkr::runtime::input::ShortcutAction>(index);
+            const auto keyboard =
+                dkr::runtime::input::shortcut_keyboard_binding(action);
+            const auto controller =
+                dkr::runtime::input::shortcut_controller_binding(action);
+            output << "shortcut." << kShortcutSettingNames[index]
+                   << ".keyboard_primary=" << keyboard.primary << '\n';
+            output << "shortcut." << kShortcutSettingNames[index]
+                   << ".keyboard_secondary=" << keyboard.secondary << '\n';
+            output << "shortcut." << kShortcutSettingNames[index]
+                   << ".controller_primary=" << controller.primary << '\n';
+            output << "shortcut." << kShortcutSettingNames[index]
+                   << ".controller_secondary=" << controller.secondary << '\n';
+        }
         output << "gyro_enabled=" << (dkr::runtime::input::gyro_enabled() ? 1 : 0) << '\n';
         output << "gyro_sensitivity=" << dkr::runtime::input::gyro_sensitivity() << '\n';
         output << "gyro_y_sensitivity=" << dkr::runtime::input::gyro_y_sensitivity() << '\n';
@@ -759,12 +1339,75 @@ void SaveSettings() {
         output << "gyro_inverted=" << (dkr::runtime::input::gyro_inverted() ? 1 : 0) << '\n';
         output << "gyro_y_inverted=" << (dkr::runtime::input::gyro_y_inverted() ? 1 : 0) << '\n';
         output << "gyro_axis=" << static_cast<int>(dkr::runtime::input::gyro_axis()) << '\n';
-        for (std::size_t index = 0; index < dkr::runtime::input::action_count(); ++index) {
-            const auto action = static_cast<dkr::runtime::input::Action>(index);
-            output << "keyboard_binding." << dkr::runtime::input::action_identifier(action)
-                   << '=' << dkr::runtime::input::keyboard_binding(action) << '\n';
-            output << "controller_binding." << dkr::runtime::input::action_identifier(action)
-                   << '=' << dkr::runtime::input::controller_binding(action) << '\n';
+        for (std::size_t player = 0;
+             player < dkr::runtime::input::kPlayerCount; ++player) {
+            const std::string prefix = "player" + std::to_string(player + 1U) +
+                                       ".gyro_";
+            output << prefix << "enabled="
+                   << (dkr::runtime::input::gyro_enabled(player) ? 1 : 0) << '\n';
+            output << prefix << "sensitivity="
+                   << dkr::runtime::input::gyro_sensitivity(player) << '\n';
+            output << prefix << "y_sensitivity="
+                   << dkr::runtime::input::gyro_y_sensitivity(player) << '\n';
+            output << prefix << "deadzone="
+                   << dkr::runtime::input::gyro_deadzone(player) << '\n';
+            output << prefix << "inverted="
+                   << (dkr::runtime::input::gyro_inverted(player) ? 1 : 0) << '\n';
+            output << prefix << "y_inverted="
+                   << (dkr::runtime::input::gyro_y_inverted(player) ? 1 : 0) << '\n';
+            output << prefix << "axis="
+                   << static_cast<int>(dkr::runtime::input::gyro_axis(player))
+                   << '\n';
+        }
+        output << "online_player_name=" << g_online_player_name << '\n';
+        output << "online_room_name=" << g_online_room_name << '\n';
+        output << "online_host_control=" << g_online_host_control << '\n';
+        output << "online_maximum_players=" << g_online_maximum_players << '\n';
+        output << "online_synchronization=" << g_online_synchronization << '\n';
+        output << "online_rollback_window=" << g_online_rollback_window << '\n';
+        output << "online_automatic_delay=" << (g_online_automatic_delay ? 1 : 0) << '\n';
+        output << "online_manual_delay=" << g_online_manual_delay << '\n';
+        output << "online_record_replay=" << (g_online_record_replay ? 1 : 0) << '\n';
+        output << "online_save_seed_mode=" << g_online_save_seed_mode << '\n';
+        output << "online_input_profile=" << g_online_input_profile << '\n';
+        output << "friend_online_notifications="
+               << (g_friend_online_notifications ? 1 : 0) << '\n';
+        output << "friend_online_notification_position="
+               << g_friend_online_notification_position << '\n';
+        output << "online_guide_acknowledged_version="
+               << g_online_guide_acknowledged_version << '\n';
+        output << "input_backend=" << static_cast<int>(
+            dkr::runtime::platform::requested_input_backend()) << '\n';
+        output << "controller_assignment_mode=" << static_cast<int>(
+            dkr::runtime::platform::controller_assignment_mode()) << '\n';
+        output << "keyboard_player=" << dkr::runtime::input::keyboard_player() << '\n';
+        const auto controller_assignments =
+            dkr::runtime::platform::controller_assignment_keys();
+        for (std::size_t player = 0; player < dkr::runtime::input::kPlayerCount;
+             ++player) {
+            output << "player" << (player + 1U) << ".controller_key="
+                   << controller_assignments[player] << '\n';
+            output << "player" << (player + 1U)
+                   << ".allow_background_inputs="
+                   << (dkr::runtime::input::background_input_enabled(player)
+                           ? 1
+                           : 0)
+                   << '\n';
+            for (std::size_t index = 0;
+                 index < dkr::runtime::input::action_count(); ++index) {
+                const auto action = static_cast<dkr::runtime::input::Action>(index);
+                output << "player" << (player + 1U) << ".keyboard_binding."
+                       << dkr::runtime::input::action_identifier(action) << '='
+                       << dkr::runtime::input::keyboard_binding(player, action) << '\n';
+                output << "player" << (player + 1U) << ".controller_binding."
+                       << dkr::runtime::input::action_identifier(action) << '='
+                       << dkr::runtime::input::controller_binding(player, action) << '\n';
+                output << "player" << (player + 1U)
+                       << ".controller_binding_secondary."
+                       << dkr::runtime::input::action_identifier(action) << '='
+                       << dkr::runtime::input::secondary_controller_binding(
+                              player, action) << '\n';
+            }
         }
         // This must be the final record. A truncated settings file is never allowed
         // to reactivate experimental presentation features.
@@ -783,6 +1426,89 @@ void SaveSettings() {
     }
 }
 
+bool LoadPlayerBindingSetting(const std::string& key, int number) {
+    if (key.rfind("player", 0) != 0) {
+        return false;
+    }
+
+    for (std::size_t player = 0;
+         player < dkr::runtime::input::kPlayerCount; ++player) {
+        const std::string player_prefix =
+            "player" + std::to_string(player + 1U);
+        const std::string background_input_key =
+            player_prefix + ".allow_background_inputs";
+        if (key == background_input_key) {
+            dkr::runtime::input::set_background_input_enabled(
+                player, number != 0);
+            return true;
+        }
+
+        const std::string keyboard_prefix =
+            player_prefix + ".keyboard_binding.";
+        const std::string controller_prefix =
+            player_prefix + ".controller_binding.";
+        const std::string controller_secondary_prefix =
+            player_prefix + ".controller_binding_secondary.";
+        const bool keyboard = key.rfind(keyboard_prefix, 0) == 0;
+        const bool controller = key.rfind(controller_prefix, 0) == 0;
+        const bool controller_secondary =
+            key.rfind(controller_secondary_prefix, 0) == 0;
+        if (!keyboard && !controller && !controller_secondary) {
+            continue;
+        }
+
+        const std::string identifier = key.substr(
+            keyboard ? keyboard_prefix.size()
+                     : controller_secondary
+                         ? controller_secondary_prefix.size()
+                         : controller_prefix.size());
+        for (std::size_t index = 0;
+             index < dkr::runtime::input::action_count(); ++index) {
+            const auto action =
+                static_cast<dkr::runtime::input::Action>(index);
+            if (identifier != dkr::runtime::input::action_identifier(action)) {
+                continue;
+            }
+            if (keyboard) {
+                dkr::runtime::input::set_keyboard_binding(player, action, number);
+            } else if (controller_secondary) {
+                dkr::runtime::input::set_secondary_controller_binding(
+                    player, action, number);
+            } else {
+                dkr::runtime::input::set_controller_binding(player, action, number);
+            }
+            return true;
+        }
+        return true;
+    }
+    return true;
+}
+
+bool LoadLegacyBindingSetting(const std::string& key, int number) {
+    const bool keyboard = key.rfind("keyboard_binding.", 0) == 0;
+    const bool controller = key.rfind("controller_binding.", 0) == 0;
+    if (!keyboard && !controller) {
+        return false;
+    }
+
+    const std::size_t prefix = keyboard ? 17U : 19U;
+    const std::string identifier = key.substr(prefix);
+    for (std::size_t index = 0;
+         index < dkr::runtime::input::action_count(); ++index) {
+        const auto action = static_cast<dkr::runtime::input::Action>(index);
+        if (identifier != dkr::runtime::input::action_identifier(action)) {
+            continue;
+        }
+        if (keyboard) {
+            dkr::runtime::input::set_keyboard_binding(action, number);
+        } else {
+            dkr::runtime::input::set_controller_binding(action, number);
+        }
+        break;
+    }
+    return true;
+}
+
 void LoadSettings() {
     GraphicsConfig config = ultramodern::renderer::get_graphics_config();
     int settings_version = 0;
@@ -790,8 +1516,22 @@ void LoadSettings() {
     auto profile = dkr::runtime::enhancements::PresentationProfile::Accurate;
     bool profile_value_valid = true;
     bool migrated = false;
-    auto quick_keyboard = dkr::runtime::input::quick_restart_keyboard_binding();
-    auto quick_controller = dkr::runtime::input::quick_restart_controller_binding();
+    bool modern_scenery_settings_v2 = false;
+    std::array<dkr::runtime::input::ShortcutBinding, kShortcutActionCount>
+        shortcut_keyboard{};
+    std::array<dkr::runtime::input::ShortcutBinding, kShortcutActionCount>
+        shortcut_controller{};
+    for (std::size_t index = 0; index < shortcut_keyboard.size(); ++index) {
+        const auto action = static_cast<
+            dkr::runtime::input::ShortcutAction>(index);
+        shortcut_keyboard[index] =
+            dkr::runtime::input::shortcut_keyboard_binding(action);
+        shortcut_controller[index] =
+            dkr::runtime::input::shortcut_controller_binding(action);
+    }
+    auto assignment_mode = dkr::runtime::platform::controller_assignment_mode();
+    auto controller_assignments =
+        dkr::runtime::platform::controller_assignment_keys();
     std::ifstream input(SettingsPath());
     std::string line;
     while (std::getline(input, line)) {
@@ -801,8 +1541,97 @@ void LoadSettings() {
         }
         const std::string key = line.substr(0, separator);
         const std::string value = line.substr(separator + 1);
+        bool controller_key = false;
+        for (std::size_t player = 0; player < dkr::runtime::input::kPlayerCount;
+             ++player) {
+            const std::string expected = "player" + std::to_string(player + 1U) +
+                                         ".controller_key";
+            if (key == expected) {
+                controller_assignments[player] = value;
+                controller_key = true;
+                break;
+            }
+        }
+        if (controller_key) {
+            continue;
+        }
+        const auto copy_online_text = [](char* destination, std::size_t capacity,
+                                         const std::string& text) {
+            const std::size_t length = std::min(text.size(), capacity - 1U);
+            std::memcpy(destination, text.data(), length);
+            destination[length] = '\0';
+        };
+        if (key == "online_player_name") {
+            copy_online_text(g_online_player_name, sizeof(g_online_player_name), value);
+            continue;
+        }
+        if (key == "online_room_name") {
+            copy_online_text(g_online_room_name, sizeof(g_online_room_name), value);
+            continue;
+        }
+        bool player_gyro_key = false;
+        for (std::size_t player = 0;
+             player < dkr::runtime::input::kPlayerCount; ++player) {
+            const std::string prefix = "player" + std::to_string(player + 1U) +
+                                       ".gyro_";
+            if (!key.starts_with(prefix)) continue;
+            const std::string field = key.substr(prefix.size());
+            try {
+                if (field == "enabled") {
+                    dkr::runtime::input::set_gyro_enabled(std::stoi(value) != 0,
+                                                          player);
+                } else if (field == "sensitivity") {
+                    dkr::runtime::input::set_gyro_sensitivity(std::stof(value),
+                                                              player);
+                } else if (field == "y_sensitivity") {
+                    dkr::runtime::input::set_gyro_y_sensitivity(std::stof(value),
+                                                                player);
+                } else if (field == "deadzone") {
+                    dkr::runtime::input::set_gyro_deadzone(std::stof(value), player);
+                } else if (field == "inverted") {
+                    dkr::runtime::input::set_gyro_inverted(std::stoi(value) != 0,
+                                                           player);
+                } else if (field == "y_inverted") {
+                    dkr::runtime::input::set_gyro_y_inverted(std::stoi(value) != 0,
+                                                             player);
+                } else if (field == "axis") {
+                    dkr::runtime::input::set_gyro_axis(
+                        std::stoi(value) == static_cast<int>(
+                            dkr::runtime::input::GyroAxis::Yaw)
+                            ? dkr::runtime::input::GyroAxis::Yaw
+                            : dkr::runtime::input::GyroAxis::Roll,
+                        player);
+                }
+            } catch (...) {
+                std::fprintf(stderr,
+                             "[boot][settings] ignored malformed per-player gyro setting %s\n",
+                             key.c_str());
+            }
+            player_gyro_key = true;
+            break;
+        }
+        if (player_gyro_key) continue;
         try {
             const int number = std::stoi(value);
+            bool shortcut_setting = false;
+            for (std::size_t index = 0; index < kShortcutSettingNames.size(); ++index) {
+                const std::string prefix =
+                    "shortcut." + std::string(kShortcutSettingNames[index]) + ".";
+                if (key == prefix + "keyboard_primary") {
+                    shortcut_keyboard[index].primary = number;
+                } else if (key == prefix + "keyboard_secondary") {
+                    shortcut_keyboard[index].secondary = number;
+                } else if (key == prefix + "controller_primary") {
+                    shortcut_controller[index].primary = number;
+                } else if (key == prefix + "controller_secondary") {
+                    shortcut_controller[index].secondary = number;
+                } else {
+                    continue;
+                }
+                shortcut_setting = true;
+                break;
+            }
+            if (shortcut_setting) continue;
             if (key == "settings_version") {
                 settings_version = number;
             } else if (key == "settings_complete") {
@@ -851,6 +1680,34 @@ void LoadSettings() {
                 g_modern_graphics_api = static_cast<GraphicsApi>(number);
             } else if (key == "modern_downsample") {
                 g_modern_downsample = std::clamp(number, 1, 8);
+            } else if (key == "online_host_control") {
+                g_online_host_control = std::clamp(number, 0, 2);
+            } else if (key == "online_maximum_players") {
+                g_online_maximum_players = static_cast<int>(
+                    dkr::runtime::netplay::kSupportedOnlinePlayers);
+            } else if (key == "online_synchronization") {
+                g_online_synchronization = std::clamp(number, 0, 1);
+            } else if (key == "online_rollback_window") {
+                g_online_rollback_window = std::clamp(number, 2, 20);
+            } else if (key == "online_automatic_delay") {
+                g_online_automatic_delay = number != 0;
+            } else if (key == "online_manual_delay") {
+                g_online_manual_delay = std::clamp(number, 0, 9);
+            } else if (key == "online_record_replay") {
+                g_online_record_replay = number != 0;
+            } else if (key == "online_save_seed_mode") {
+                g_online_save_seed_mode = std::clamp(number, 0, 2);
+            } else if (key == "online_input_profile") {
+                g_online_input_profile = std::clamp(number, 0, 3);
+                dkr::runtime::platform::set_online_input_profile(
+                    static_cast<std::size_t>(g_online_input_profile));
+            } else if (key == "friend_online_notifications") {
+                g_friend_online_notifications = number != 0;
+            } else if (key == "friend_online_notification_position") {
+                g_friend_online_notification_position = std::clamp(number, 0, 3);
+            } else if (key == "online_guide_acknowledged_version") {
+                g_online_guide_acknowledged_version = std::clamp(
+                    number, 0, kOnlineGuideVersion);
             } else if (key == "modern_anisotropy") {
                 dkr::runtime::enhancements::set_anisotropy_level(number);
             } else if (key == "fps_overlay_enabled") {
@@ -895,6 +1752,18 @@ void LoadSettings() {
                 g_fps_outline_colour.z = std::clamp(number, 0, 255) / 255.0F;
             } else if (key == "fps_outline_a") {
                 g_fps_outline_colour.w = std::clamp(number, 0, 255) / 255.0F;
+            } else if (key == "network_overlay_enabled") {
+                g_network_overlay_enabled = number != 0;
+            } else if (key == "network_overlay_position") {
+                g_network_overlay_position = std::clamp(number, 0, 3);
+            } else if (key == "network_overlay_detail") {
+                g_network_overlay_detail = std::clamp(number, 0, 2);
+            } else if (key == "network_overlay_single_row") {
+                g_network_overlay_single_row = number != 0;
+            } else if (key == "controller_input_overlay_enabled") {
+                g_controller_input_overlay_enabled = number != 0;
+            } else if (key == "controller_input_overlay_position") {
+                g_controller_input_overlay_position = std::clamp(number, 0, 3);
             } else if (key == "crt_enabled") {
                 g_crt_enabled = number != 0;
             } else if (key == "crt_filter_index") {
@@ -913,6 +1782,9 @@ void LoadSettings() {
                 dkr::runtime::audio::set_vehicle_volume(std::stof(value));
             } else if (key == "nature_volume") {
                 dkr::runtime::audio::set_nature_volume(std::stof(value));
+            } else if (key == "modern_multiplayer_race_music") {
+                dkr::runtime::enhancements::set_multiplayer_race_music_enabled(
+                    number != 0);
             } else if (key == "eq_bass") {
                 dkr::runtime::platform::set_bass_gain(std::stof(value));
             } else if (key == "eq_mid") {
@@ -928,8 +1800,40 @@ void LoadSettings() {
                     static_cast<std::uint32_t>(std::max(number, 0)));
             } else if (key == "modern_view_distance_multiplier") {
                 dkr::runtime::enhancements::set_view_distance_multiplier(number);
+            } else if (key == "modern_scenery_settings_version") {
+                modern_scenery_settings_v2 = number >= 2;
             } else if (key == "modern_keep_hub_scenery") {
                 dkr::runtime::enhancements::set_keep_hub_scenery_enabled(number != 0);
+                if (number != 0 && !modern_scenery_settings_v2) {
+                    // This key meant "keep all scenery rendered" before the
+                    // granular controls existed. Preserve that intent once,
+                    // then persist the scoped v2 representation.
+                    dkr::runtime::enhancements::set_keep_track_scenery_enabled(true);
+                    dkr::runtime::enhancements::set_keep_minigame_scenery_enabled(true);
+                    dkr::runtime::enhancements::set_scenery_retention_mode(
+                        dkr::runtime::enhancements::SceneryRetentionMode::
+                            VisibleAndAdjacent);
+                    dkr::runtime::enhancements::set_water_lava_detail_multiplier(
+                        dkr::runtime::enhancements::
+                            kMaximumWaterLavaDetailMultiplier);
+                    migrated = true;
+                }
+            } else if (key == "modern_keep_track_scenery") {
+                dkr::runtime::enhancements::set_keep_track_scenery_enabled(number != 0);
+            } else if (key == "modern_keep_minigame_scenery") {
+                dkr::runtime::enhancements::set_keep_minigame_scenery_enabled(number != 0);
+            } else if (key == "modern_scenery_retention_mode") {
+                dkr::runtime::enhancements::set_scenery_retention_mode(
+                    dkr::runtime::enhancements::normalise_scenery_retention_mode(
+                        number));
+            } else if (key == "modern_animated_scenery_distance_multiplier") {
+                dkr::runtime::enhancements::
+                    set_animated_scenery_distance_multiplier(number);
+            } else if (key == "modern_billboard_effect_distance_multiplier") {
+                dkr::runtime::enhancements::
+                    set_billboard_effect_distance_multiplier(number);
+            } else if (key == "modern_water_lava_detail_multiplier") {
+                dkr::runtime::enhancements::set_water_lava_detail_multiplier(number);
             } else if (key == "modern_extended_culling") {
                 dkr::runtime::enhancements::set_extended_culling_enabled(number != 0);
             } else if (key == "modern_frustum_guard_percent") {
@@ -952,18 +1856,36 @@ void LoadSettings() {
                 dkr::runtime::input::set_stick_x_inverted(number != 0);
             } else if (key == "stick_y_inverted") {
                 dkr::runtime::input::set_stick_y_inverted(number != 0);
+            } else if (key == "stick_x_inverted_car") {
+                dkr::runtime::input::set_vehicle_stick_x_inverted(
+                    dkr::runtime::input::VehicleClass::Car, number != 0);
+            } else if (key == "stick_x_inverted_hovercraft") {
+                dkr::runtime::input::set_vehicle_stick_x_inverted(
+                    dkr::runtime::input::VehicleClass::Hovercraft, number != 0);
+            } else if (key == "stick_x_inverted_plane") {
+                dkr::runtime::input::set_vehicle_stick_x_inverted(
+                    dkr::runtime::input::VehicleClass::Plane, number != 0);
+            } else if (key == "stick_y_inverted_car") {
+                dkr::runtime::input::set_vehicle_stick_y_inverted(
+                    dkr::runtime::input::VehicleClass::Car, number != 0);
+            } else if (key == "stick_y_inverted_hovercraft") {
+                dkr::runtime::input::set_vehicle_stick_y_inverted(
+                    dkr::runtime::input::VehicleClass::Hovercraft, number != 0);
+            } else if (key == "stick_y_inverted_plane") {
+                dkr::runtime::input::set_vehicle_stick_y_inverted(
+                    dkr::runtime::input::VehicleClass::Plane, number != 0);
             } else if (key == "trigger_threshold") {
                 dkr::runtime::input::set_trigger_threshold(std::stof(value));
             } else if (key == "quick_restart_enabled") {
                 dkr::runtime::input::set_quick_restart_enabled(number != 0);
             } else if (key == "quick_restart_keyboard_primary") {
-                quick_keyboard.primary = number;
+                shortcut_keyboard[0].primary = number;
             } else if (key == "quick_restart_keyboard_secondary") {
-                quick_keyboard.secondary = number;
+                shortcut_keyboard[0].secondary = number;
             } else if (key == "quick_restart_controller_primary") {
-                quick_controller.primary = number;
+                shortcut_controller[0].primary = number;
             } else if (key == "quick_restart_controller_secondary") {
-                quick_controller.secondary = number;
+                shortcut_controller[0].secondary = number;
             } else if (key == "gyro_enabled") {
                 dkr::runtime::input::set_gyro_enabled(number != 0);
             } else if (key == "gyro_sensitivity") {
@@ -981,23 +1903,25 @@ void LoadSettings() {
                     number == static_cast<int>(dkr::runtime::input::GyroAxis::Yaw)
                         ? dkr::runtime::input::GyroAxis::Yaw
                         : dkr::runtime::input::GyroAxis::Roll);
-            } else if (key.rfind("keyboard_binding.", 0) == 0 ||
-                       key.rfind("controller_binding.", 0) == 0) {
-                const bool keyboard = key.rfind("keyboard_binding.", 0) == 0;
-                const std::size_t prefix = keyboard ? 17U : 19U;
-                const std::string identifier = key.substr(prefix);
-                for (std::size_t index = 0;
-                     index < dkr::runtime::input::action_count(); ++index) {
-                    const auto action = static_cast<dkr::runtime::input::Action>(index);
-                    if (identifier == dkr::runtime::input::action_identifier(action)) {
-                        if (keyboard) {
-                            dkr::runtime::input::set_keyboard_binding(action, number);
-                        } else {
-                            dkr::runtime::input::set_controller_binding(action, number);
-                        }
-                        break;
-                    }
-                }
+            } else if (key == "input_backend") {
+                const auto backend =
+                    number == static_cast<int>(
+                        dkr::runtime::platform::InputBackend::SDL2Compatibility)
+                        ? dkr::runtime::platform::InputBackend::SDL2Compatibility
+                    : number == static_cast<int>(
+                        dkr::runtime::platform::InputBackend::SDL3Native)
+                        ? dkr::runtime::platform::InputBackend::SDL3Native
+                        : dkr::runtime::platform::InputBackend::Automatic;
+                dkr::runtime::platform::set_requested_input_backend(backend);
+            } else if (key == "controller_assignment_mode") {
+                assignment_mode = number == static_cast<int>(
+                    dkr::runtime::controllers::AssignmentMode::Manual)
+                    ? dkr::runtime::controllers::AssignmentMode::Manual
+                    : dkr::runtime::controllers::AssignmentMode::Automatic;
+            } else if (key == "keyboard_player") {
+                dkr::runtime::input::set_keyboard_player(number);
+            } else if (LoadPlayerBindingSetting(key, number)) {
+            } else if (LoadLegacyBindingSetting(key, number)) {
             }
         } catch (...) {
             std::fprintf(stderr, "[boot][settings] ignored malformed setting %s\n", key.c_str());
@@ -1007,8 +1931,34 @@ void LoadSettings() {
     // still owns an open handle. Migration may call SaveSettings below, so
     // release the read handle before attempting that replacement.
     input.close();
-    dkr::runtime::input::set_quick_restart_keyboard_binding(quick_keyboard);
-    dkr::runtime::input::set_quick_restart_controller_binding(quick_controller);
+    if (settings_version < 8) {
+        // The former global gamepad map becomes the starting point for every
+        // local player. Keyboard ownership remains Player 1, matching all
+        // existing single-player settings and avoiding duplicate key input.
+        for (std::size_t player = 1; player < dkr::runtime::input::kPlayerCount;
+             ++player) {
+            dkr::runtime::input::copy_bindings(0U, player);
+        }
+        dkr::runtime::input::set_keyboard_player(0);
+        assignment_mode = dkr::runtime::controllers::AssignmentMode::Automatic;
+        migrated = true;
+    }
+    if (settings_version == 8 && settings_complete && profile_value_valid) {
+        // Version 9 adds secondary controller bindings, per-vehicle axis
+        // direction, configurable shortcuts, and online overlay preferences.
+        // Every addition is opt-in or begins from the established v8 value.
+        migrated = true;
+    }
+    dkr::runtime::platform::restore_controller_assignments(
+        assignment_mode, controller_assignments);
+    for (std::size_t index = 0; index < shortcut_keyboard.size(); ++index) {
+        const auto action = static_cast<
+            dkr::runtime::input::ShortcutAction>(index);
+        dkr::runtime::input::set_shortcut_keyboard_binding(
+            action, shortcut_keyboard[index]);
+        dkr::runtime::input::set_shortcut_controller_binding(
+            action, shortcut_controller[index]);
+    }
     // Early launcher builds defaulted to 8x MSAA, which can turn busy races
     // GPU-bound at high desktop resolutions. Migrate that one legacy default
     // to 2x; users can still explicitly choose 4x or 8x afterwards.
@@ -1080,6 +2030,163 @@ std::string Lowercase(std::string value) {
         return static_cast<char>(std::tolower(character));
     });
     return value;
+}
+
+std::filesystem::path NormalizeRomPath(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::path normalized =
+        std::filesystem::weakly_canonical(path, error);
+    if (!error) {
+        return normalized;
+    }
+    error.clear();
+    normalized = std::filesystem::absolute(path, error);
+    return error ? path.lexically_normal() : normalized.lexically_normal();
+}
+
+std::string RomPathKey(const std::filesystem::path& path) {
+    std::string key = PathUtf8(NormalizeRomPath(path));
+#if defined(_WIN32)
+    key = Lowercase(std::move(key));
+#endif
+    return key;
+}
+
+std::string RomCatalogLabel(const dkr::runtime::rom::Identity& identity) {
+    switch (identity.revision) {
+    case dkr::runtime::rom::Revision::UsV77:
+        return "Diddy Kong Racing - V1.0";
+    case dkr::runtime::rom::Revision::UsV80:
+        return identity.byte_order == dkr::runtime::rom::ByteOrder::BigEndian
+            ? "Diddy Kong Racing - V1.1"
+            : "Diddy Kong Racing - V1.1 ALT";
+    default:
+        return "Unsupported Diddy Kong Racing revision";
+    }
+}
+
+bool SaveRomCatalog(const std::vector<RomCatalogEntry>& catalog) {
+    std::error_code error;
+    std::filesystem::create_directories(g_config_directory, error);
+    if (error) {
+        return false;
+    }
+    const std::filesystem::path destination = RomCatalogPath();
+    std::filesystem::path temporary = destination;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::trunc);
+        if (!output) {
+            return false;
+        }
+        for (const RomCatalogEntry& entry : catalog) {
+            output << PathUtf8(entry.path) << '\n';
+        }
+        output.flush();
+        if (!output) {
+            output.close();
+            std::filesystem::remove(temporary, error);
+            return false;
+        }
+    }
+    if (!ReplaceSettingsFile(temporary, destination)) {
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    return true;
+}
+
+std::vector<RomCatalogEntry> LoadRomCatalog() {
+    std::vector<RomCatalogEntry> catalog;
+    std::ifstream input(RomCatalogPath());
+    if (!input) {
+        return catalog;
+    }
+    bool cleaned = false;
+    std::string encoded_path;
+    while (std::getline(input, encoded_path)) {
+        if (!encoded_path.empty() && encoded_path.back() == '\r') {
+            encoded_path.pop_back();
+        }
+        if (encoded_path.empty()) {
+            cleaned = true;
+            continue;
+        }
+        const std::filesystem::path path =
+            NormalizeRomPath(std::filesystem::u8path(encoded_path));
+        const std::string key = RomPathKey(path);
+        if (std::any_of(catalog.begin(), catalog.end(),
+                        [&](const RomCatalogEntry& entry) {
+                            return RomPathKey(entry.path) == key;
+                        })) {
+            cleaned = true;
+            continue;
+        }
+        std::string validation_error;
+        dkr::runtime::rom::Identity identity{};
+        if (!dkr::runtime::ValidateRomForLauncher(
+                path, identity, validation_error)) {
+            cleaned = true;
+            continue;
+        }
+        catalog.push_back({path, RomCatalogLabel(identity)});
+    }
+    if (cleaned) {
+        SaveRomCatalog(catalog);
+    }
+    return catalog;
+}
+
+void RememberRomInCatalog(const std::filesystem::path& path,
+                          const dkr::runtime::rom::Identity& identity,
+                          std::vector<RomCatalogEntry>& catalog) {
+    const std::filesystem::path normalized = NormalizeRomPath(path);
+    const std::string key = RomPathKey(normalized);
+    const std::string label = RomCatalogLabel(identity);
+    const auto existing = std::find_if(
+        catalog.begin(), catalog.end(), [&](const RomCatalogEntry& entry) {
+            return RomPathKey(entry.path) == key;
+        });
+    if (existing == catalog.end()) {
+        catalog.push_back({normalized, label});
+        SaveRomCatalog(catalog);
+        return;
+    }
+    if (existing->path != normalized || existing->label != label) {
+        existing->path = normalized;
+        existing->label = label;
+        SaveRomCatalog(catalog);
+    }
+}
+
+void CommitRomSelection(const std::filesystem::path& path,
+                        const dkr::runtime::rom::Identity& identity,
+                        std::filesystem::path& selected,
+                        std::vector<RomCatalogEntry>& catalog,
+                        std::string& status) {
+    selected = NormalizeRomPath(path);
+    SaveLastRom(selected);
+    RememberRomInCatalog(selected, identity, catalog);
+    status = dkr::runtime::rom::describe(identity) + ". Ready to race!";
+}
+
+bool SelectCatalogRom(const RomCatalogEntry& entry,
+                      std::filesystem::path& selected,
+                      std::vector<RomCatalogEntry>& catalog,
+                      std::string& status) {
+    std::string error;
+    dkr::runtime::rom::Identity identity{};
+    if (!dkr::runtime::ValidateRomForLauncher(entry.path, identity, error)) {
+        status = error;
+        const std::string invalid_key = RomPathKey(entry.path);
+        std::erase_if(catalog, [&](const RomCatalogEntry& candidate) {
+            return RomPathKey(candidate.path) == invalid_key;
+        });
+        SaveRomCatalog(catalog);
+        return false;
+    }
+    CommitRomSelection(entry.path, identity, selected, catalog, status);
+    return true;
 }
 
 bool IsRomFile(const std::filesystem::path& path) {
@@ -1188,22 +2295,23 @@ void RomBrowserBack() {
 }
 
 bool AcceptRom(const std::filesystem::path& path, std::filesystem::path& selected,
-               std::string& status) {
+               std::vector<RomCatalogEntry>& catalog, std::string& status) {
     std::string error;
-    if (!dkr::runtime::SelectRom(path, error)) {
+    dkr::runtime::rom::Identity identity{};
+    if (!dkr::runtime::ValidateRomForLauncher(path, identity, error)) {
         status = error;
         g_rom_browser.message = error;
         return false;
     }
-    selected = path;
-    SaveLastRom(selected);
-    status = "Game Pak ready. The adventure can begin!";
+    CommitRomSelection(path, identity, selected, catalog, status);
     g_rom_browser.open = false;
     g_rom_browser.close_requested = false;
     return true;
 }
 
-bool SelectRomWithDialog(std::filesystem::path& selected, std::string& status) {
+bool SelectRomWithDialog(std::filesystem::path& selected,
+                         std::vector<RomCatalogEntry>& catalog,
+                         std::string& status) {
     if (NFD_Init() != NFD_OKAY) {
         status = "The system file picker could not be initialized.";
         return false;
@@ -1212,16 +2320,16 @@ bool SelectRomWithDialog(std::filesystem::path& selected, std::string& status) {
     const nfdfilteritem_t filters[] = {{"Nintendo 64 ROM", "z64,v64,n64"}};
     const nfdresult_t dialog = NFD_OpenDialogU8(&result, filters, 1, nullptr);
     if (dialog == NFD_OKAY) {
-        selected = std::filesystem::u8path(result);
+        const std::filesystem::path candidate = std::filesystem::u8path(result);
         NFD_FreePathU8(result);
         std::string error;
-        if (!dkr::runtime::SelectRom(selected, error)) {
+        dkr::runtime::rom::Identity identity{};
+        if (!dkr::runtime::ValidateRomForLauncher(candidate, identity, error)) {
             status = error;
             NFD_Quit();
             return false;
         }
-        SaveLastRom(selected);
-        status = "Game Pak ready. The adventure can begin!";
+        CommitRomSelection(candidate, identity, selected, catalog, status);
         NFD_Quit();
         return true;
     }
@@ -1301,7 +2409,77 @@ bool ImportCrtFilterWithDialog() {
     return true;
 }
 
+bool TexturePackImportRunning() {
+    std::scoped_lock lock(g_texture_import_mutex);
+    return g_texture_import_state.running;
+}
+
+void StartTexturePackImport(const std::filesystem::path& source) {
+    {
+        std::scoped_lock lock(g_texture_import_mutex);
+        if (g_texture_import_state.running) return;
+    }
+
+    // A completed jthread remains joinable until joined. Retire it before
+    // assigning the next worker, outside the state mutex so its final update
+    // can never deadlock against this thread.
+    if (g_texture_import_worker.joinable()) {
+        g_texture_import_worker.join();
+    }
+
+    g_texture_import_cancel_requested.store(false, std::memory_order_release);
+    {
+        std::scoped_lock lock(g_texture_import_mutex);
+        g_texture_import_state = {};
+        g_texture_import_state.running = true;
+        g_texture_import_state.modal_visible = true;
+        g_texture_import_state.progress = 0.0F;
+        g_texture_import_state.stage = "Preparing texture-pack import";
+    }
+
+    g_texture_import_worker = std::jthread(
+        [source](std::stop_token stop_token) {
+            std::string status;
+            const auto progress = [stop_token](
+                                      const dkr::runtime::texture_packs::ImportProgress& update) {
+                {
+                    std::scoped_lock lock(g_texture_import_mutex);
+                    g_texture_import_state.progress = update.fraction;
+                    g_texture_import_state.stage = update.stage;
+                    g_texture_import_state.commit_started = update.commit_started;
+                }
+                if (update.commit_started) return true;
+                return !stop_token.stop_requested() &&
+                    !g_texture_import_cancel_requested.load(
+                        std::memory_order_acquire);
+            };
+            bool imported = false;
+            try {
+                imported = dkr::runtime::texture_packs::import_archive(
+                    source, status, progress);
+            } catch (const std::exception& exception) {
+                status = "Texture-pack import stopped safely: ";
+                status += exception.what();
+            } catch (...) {
+                status = "Texture-pack import stopped safely because archive "
+                         "processing raised an unknown error.";
+            }
+            std::scoped_lock lock(g_texture_import_mutex);
+            g_texture_import_state.running = false;
+            g_texture_import_state.finished = true;
+            g_texture_import_state.succeeded = imported;
+            g_texture_import_state.result = status;
+            if (imported) {
+                g_texture_import_state.progress = 1.0F;
+                g_texture_import_state.stage = "Texture pack imported";
+            } else if (g_texture_import_state.stage.empty()) {
+                g_texture_import_state.stage = "Texture-pack import stopped";
+            }
+        });
+}
+
 bool ImportTexturePackWithDialog() {
+    if (TexturePackImportRunning()) return false;
     if (NFD_Init() != NFD_OKAY) {
         g_texture_pack_status = "The system file picker could not be initialized.";
         return false;
@@ -1319,11 +2497,8 @@ bool ImportTexturePackWithDialog() {
     const std::filesystem::path source = std::filesystem::u8path(result);
     NFD_FreePathU8(result);
     NFD_Quit();
-    std::string status;
-    const bool imported =
-        dkr::runtime::texture_packs::import_archive(source, status);
-    g_texture_pack_status = status;
-    return imported;
+    StartTexturePackImport(source);
+    return true;
 }
 
 bool ImportAdventureWithDialog() {
@@ -1341,6 +2516,7 @@ bool ImportAdventureWithDialog() {
         std::string error;
         imported = dkr::runtime::saves::import_adventure(source, error);
         if (imported) {
+            InvalidateSaveManagerViewCache();
             g_save_builder_image.reset();
         }
         g_save_manager_status = imported
@@ -1396,6 +2572,7 @@ bool ImportSaveBundleWithDialog() {
         std::string error;
         imported = dkr::runtime::saves::import_bundle(source, error);
         if (imported) {
+            InvalidateSaveManagerViewCache();
             g_save_builder_image.reset();
         }
         g_save_manager_status = imported
@@ -1436,6 +2613,58 @@ bool ExportSaveBundleWithDialog() {
     return exported;
 }
 
+bool ImportControllerMappingsWithDialog() {
+    if (NFD_Init() != NFD_OKAY) {
+        g_controller_mapping_status =
+            "The system file picker could not be initialized.";
+        return false;
+    }
+    nfdu8char_t* result = nullptr;
+    const nfdfilteritem_t filters[] = {
+        {"SDL controller mappings", "txt,db"},
+    };
+    const nfdresult_t dialog = NFD_OpenDialogU8(&result, filters, 1, nullptr);
+    bool imported = false;
+    if (dialog == NFD_OKAY) {
+        const std::filesystem::path source = std::filesystem::u8path(result);
+        NFD_FreePathU8(result);
+        imported = dkr::runtime::platform::import_controller_mappings(
+            source, g_controller_mapping_status);
+    } else if (dialog == NFD_ERROR) {
+        g_controller_mapping_status = NFD_GetError();
+    }
+    NFD_Quit();
+    return imported;
+}
+
+bool ExportControllerMappingsWithDialog() {
+    if (NFD_Init() != NFD_OKAY) {
+        g_controller_mapping_status =
+            "The system file picker could not be initialized.";
+        return false;
+    }
+    nfdu8char_t* result = nullptr;
+    const nfdfilteritem_t filters[] = {
+        {"SDL controller mappings", "txt"},
+    };
+    const nfdresult_t dialog = NFD_SaveDialogU8(
+        &result, filters, 1, nullptr, "dkr-r-controller-mappings.txt");
+    bool exported = false;
+    if (dialog == NFD_OKAY) {
+        std::filesystem::path destination = std::filesystem::u8path(result);
+        NFD_FreePathU8(result);
+        if (destination.extension().empty()) {
+            destination += ".txt";
+        }
+        exported = dkr::runtime::platform::export_controller_mappings(
+            destination, g_controller_mapping_status);
+    } else if (dialog == NFD_ERROR) {
+        g_controller_mapping_status = NFD_GetError();
+    }
+    NFD_Quit();
+    return exported;
+}
+
 void DrawRaceBadge(const char* label, const ImVec4& color, float width = 0.0F);
 
 bool BeginPaddedChild(const char* id, const ImVec2& size, bool border = true,
@@ -1447,17 +2676,137 @@ bool BeginPaddedChild(const char* id, const ImVec2& size, bool border = true,
     return visible;
 }
 
+float WrappedTextHeight(std::string_view text, float wrap_width) {
+    if (text.empty()) return 0.0F;
+    return std::max(
+        ImGui::CalcTextSize(text.data(), text.data() + text.size(), false,
+                            std::max(wrap_width, 1.0F)).y,
+        ImGui::GetTextLineHeight());
+}
+
+float PaddedCardHeight(std::initializer_list<float> item_heights,
+                       const ImVec2& padding) {
+    float height = padding.y * 2.0F + 4.0F;
+    bool have_item = false;
+    for (const float item_height : item_heights) {
+        if (item_height <= 0.0F) continue;
+        if (have_item) height += ImGui::GetStyle().ItemSpacing.y;
+        height += item_height;
+        have_item = true;
+    }
+    return std::ceil(height);
+}
+
+void DrawDisabledWrapped(std::string_view text) {
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+    ImGui::PopStyleColor();
+}
+
+void DrawColoredWrapped(const ImVec4& color, std::string_view text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
+    ImGui::PopStyleColor();
+}
+
 bool BeginPaddedModal(const char* name, ImGuiWindowFlags flags = 0,
                       const ImVec2& padding = {26.0F, 24.0F}) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, padding);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18.0F);
+    // Modal actions must remain fully visible. Long pages may scroll behind a
+    // modal, and specialised children such as the ROM file list may scroll,
+    // but the modal window itself must never grow its own scrollbar.
+    flags |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     const bool visible = ImGui::BeginPopupModal(name, nullptr, flags);
     ImGui::PopStyleVar(2);
     return visible;
 }
 
+void DrawTexturePackImportModal() {
+    TextureImportState state;
+    {
+        std::scoped_lock lock(g_texture_import_mutex);
+        state = g_texture_import_state;
+    }
+    if (!state.modal_visible) return;
+
+    constexpr const char* popup_name = "Importing texture pack";
+    ImGui::OpenPopup(popup_name);
+    ImGui::SetNextWindowSize({540.0F, 0.0F}, ImGuiCond_Appearing);
+    if (!BeginPaddedModal(popup_name, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextUnformatted(state.running ? "PREPARING YOUR TEXTURE PACK"
+                                         : "TEXTURE-PACK IMPORT COMPLETE");
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::TextWrapped("%s", state.stage.empty()
+        ? "Inspecting the selected archive..."
+        : state.stage.c_str());
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::ProgressBar(std::clamp(state.progress, 0.0F, 1.0F),
+                       {ImGui::GetContentRegionAvail().x, 28.0F});
+
+    if (state.running) {
+        ImGui::Dummy({0.0F, 10.0F});
+        if (state.commit_started) {
+            ImGui::TextDisabled(
+                "Finishing the atomic install. DKR-R will not interrupt this step.");
+        } else if (ImGui::Button("CANCEL IMPORT", {170.0F, 42.0F})) {
+            g_texture_import_cancel_requested.store(true,
+                                                     std::memory_order_release);
+        }
+    } else {
+        ImGui::Dummy({0.0F, 10.0F});
+        if (!state.result.empty()) ImGui::TextWrapped("%s", state.result.c_str());
+        ImGui::Dummy({0.0F, 8.0F});
+        if (ImGui::Button(state.succeeded ? "READY TO RACE" : "CLOSE",
+                          {170.0F, 42.0F})) {
+            g_texture_pack_status = state.result;
+            {
+                std::scoped_lock lock(g_texture_import_mutex);
+                g_texture_import_state.modal_visible = false;
+            }
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+}
+
+void DrawLinuxSoftwarePanelUnderlay(const ImVec2& size,
+                                    const ImVec4& color) {
+#if defined(__linux__)
+    // Keep this underlay on Linux as a guard for software-renderer fallback and
+    // fractional scaling. A simple axis-aligned rounded rectangle beneath the
+    // normal ImGui child prevents raster seams from exposing or folding the
+    // checkerboard through the content panel.
+    if (size.x <= 0.0F || size.y <= 0.0F) return;
+    const ImVec2 minimum = ImGui::GetCursorScreenPos();
+    const ImVec2 maximum{minimum.x + size.x, minimum.y + size.y};
+    const float radius = std::min(
+        18.0F, std::max(std::min(size.x, size.y) * 0.5F, 0.0F));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImU32 fill = ImGui::ColorConvertFloat4ToU32(color);
+    draw->AddRectFilled(
+        {minimum.x + radius, minimum.y},
+        {maximum.x - radius, maximum.y}, fill);
+    draw->AddRectFilled(
+        {minimum.x, minimum.y + radius},
+        {maximum.x, maximum.y - radius}, fill);
+    const float half = radius * 0.5F;
+    draw->AddRectFilled(
+        {minimum.x + half, minimum.y + half},
+        {maximum.x - half, maximum.y - half}, fill);
+#else
+    (void)size;
+    (void)color;
+#endif
+}
+
 void DrawRomBrowser(std::filesystem::path& selected, std::string& status,
-                    bool& rom_ready) {
+                    bool& rom_ready,
+                    std::vector<RomCatalogEntry>& catalog) {
     constexpr const char* kPopupName = "Select Diddy Kong Racing ROM";
     if (g_rom_browser.open && !ImGui::IsPopupOpen(kPopupName)) {
         ImGui::OpenPopup(kPopupName);
@@ -1527,8 +2876,8 @@ void DrawRomBrowser(std::filesystem::path& selected, std::string& status,
                 RefreshRomBrowser();
                 break;
             }
-            rom_ready = AcceptRom(entry.path, selected, status);
-            if (rom_ready) {
+            if (AcceptRom(entry.path, selected, catalog, status)) {
+                rom_ready = true;
                 ImGui::CloseCurrentPopup();
                 break;
             }
@@ -1548,8 +2897,8 @@ void DrawRomBrowser(std::filesystem::path& selected, std::string& status,
     }
     ImGui::SameLine();
     if (ImGui::Button("SYSTEM FILE PICKER", {220.0F, 42.0F})) {
-        rom_ready = SelectRomWithDialog(selected, status);
-        if (rom_ready) {
+        if (SelectRomWithDialog(selected, catalog, status)) {
+            rom_ready = true;
             g_rom_browser.open = false;
             ImGui::CloseCurrentPopup();
         }
@@ -1566,41 +2915,57 @@ bool BeginMainWindow(const char* name, ImGuiWindowFlags extra = 0) {
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | extra);
 }
 
-ImU32 MixCheckerColor(const ImVec4& left, const ImVec4& right, float amount,
-                      float brightness, float alpha) {
-    const auto mix = [&](float a, float b) {
-        return std::clamp((a + (b - a) * amount) * brightness, 0.0F, 1.0F);
-    };
-    return ImGui::ColorConvertFloat4ToU32(
-        {mix(left.x, right.x), mix(left.y, right.y), mix(left.z, right.z), alpha});
-}
-
-void DrawRaceBackdrop(bool overlay) {
+void DrawLauncherBackdrop(const LauncherBackgroundTexture& background,
+                          double scroll_distance) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 origin = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
-    const float cell = std::clamp(std::min(size.x, size.y) * 0.055F, 34.0F, 68.0F);
-    const int columns = static_cast<int>(size.x / cell) + 1;
-    const int rows = static_cast<int>(size.y / cell) + 1;
-    const ImVec4 blue{0.025F, 0.25F, 0.66F, 1.0F};
-    const ImVec4 orange{0.98F, 0.34F, 0.055F, 1.0F};
-    const float alpha = overlay ? 0.92F : 1.0F;
-    for (int row = 0; row < rows; ++row) {
-        for (int column = 0; column < columns; ++column) {
-            const ImVec2 cell_min{origin.x + column * cell,
-                                  origin.y + row * cell};
-            const ImVec2 cell_max{
-                std::min(cell_min.x + cell, origin.x + size.x),
-                std::min(cell_min.y + cell, origin.y + size.y)};
-            const float amount = std::clamp(
-                ((cell_min.x + cell_max.x) * 0.5F - origin.x) /
-                    std::max(size.x, 1.0F),
-                0.0F, 1.0F);
-            const float brightness = ((row + column) & 1) ? 0.72F : 1.0F;
-            draw->AddRectFilled(cell_min, cell_max,
-                MixCheckerColor(blue, orange, amount, brightness, alpha));
-        }
+    const ImVec2 viewport_max{origin.x + size.x, origin.y + size.y};
+
+    // A quiet fallback keeps development builds usable if the packaged asset
+    // is missing. Release packages always stage the cloud texture.
+    draw->AddRectFilledMultiColor(
+        origin, viewport_max, IM_COL32(28, 127, 224, 255),
+        IM_COL32(62, 165, 239, 255), IM_COL32(93, 188, 242, 255),
+        IM_COL32(55, 150, 231, 255));
+    if (background.texture == nullptr || background.width <= 0 ||
+        background.height <= 0 || size.x <= 0.0F || size.y <= 0.0F) {
+        return;
     }
+
+    // Scale uniformly from the viewport height. This fills every aspect ratio
+    // without distorting the artwork; wide screens reveal additional mirrored
+    // tiles while narrow screens naturally crop the sides.
+    constexpr float kCoverOverscan = 1.03F;
+    const float scale = (size.y / static_cast<float>(background.height)) *
+                        kCoverOverscan;
+    const float tile_width = static_cast<float>(background.width) * scale;
+    const float tile_height = static_cast<float>(background.height) * scale;
+    if (tile_width <= 0.0F || tile_height <= 0.0F) return;
+
+    const float tile_period = tile_width * 2.0F;
+    const float phase = static_cast<float>(
+        std::fmod(std::max(scroll_distance, 0.0),
+                  static_cast<double>(tile_period)));
+    const float top = origin.y + (size.y - tile_height) * 0.5F;
+    // Advance toward the right. Starting three tiles to the left guarantees
+    // coverage throughout the two-tile mirrored period; wrapping relabels the
+    // same parity of tiles, so the cloud motion has no visible seam.
+    float left = origin.x - tile_width * 3.0F + phase;
+    int tile_index = -3;
+
+    draw->PushClipRect(origin, viewport_max, true);
+    while (left < viewport_max.x + tile_width) {
+        const bool mirrored = (tile_index & 1) != 0;
+        const ImVec2 uv_min{mirrored ? 1.0F : 0.0F, 0.0F};
+        const ImVec2 uv_max{mirrored ? 0.0F : 1.0F, 1.0F};
+        draw->AddImage(reinterpret_cast<ImTextureID>(background.texture),
+                       {left, top}, {left + tile_width, top + tile_height},
+                       uv_min, uv_max);
+        left += tile_width;
+        ++tile_index;
+    }
+    draw->PopClipRect();
 }
 
 void DrawRaceBadge(const char* label, const ImVec4& color, float width) {
@@ -1636,44 +3001,69 @@ void DrawStartingLights(bool ready) {
     ImGui::Dummy({42.0F, 112.0F});
 }
 
-void BrandBlock(float available_width, float maximum_size = 230.0F) {
-    if (g_brand_logo_rect >= 0) {
+void BrandBlock(float available_width, float maximum_size = 230.0F,
+                bool animate_as_coin = true) {
+    const float phase = animate_as_coin
+        ? static_cast<float>(UiAnimationSeconds()) *
+              (2.0F * 3.14159265358979323846F / 4.8F)
+        : 0.0F;
+    const float facing = animate_as_coin ? std::cos(phase) : 1.0F;
+    // Swap faces only while the coin is edge-on, so the change is hidden by
+    // the deliberately narrow silhouette rather than flashing mid-rotation.
+    const std::size_t face = animate_as_coin && facing < 0.0F ? 1U : 0U;
+    if (g_brand_logo_rects[face] >= 0) {
         ImFontAtlas* atlas = ImGui::GetIO().Fonts;
         const ImFontAtlasCustomRect* rect =
-            atlas->GetCustomRectByIndex(g_brand_logo_rect);
+            atlas->GetCustomRectByIndex(g_brand_logo_rects[face]);
         if (rect != nullptr && rect->IsPacked() && atlas->TexID != nullptr &&
             atlas->TexWidth > 0 && atlas->TexHeight > 0) {
-            constexpr float kContainerPadding = 8.0F;
-            const float container_width = std::min(available_width, maximum_size);
-            const float width = std::max(container_width - kContainerPadding * 2.0F, 1.0F);
-            const float height = width * static_cast<float>(rect->Height) /
-                static_cast<float>(rect->Width);
-            const float container_height = height + kContainerPadding * 2.0F;
-            const float indent = std::max((available_width - container_width) * 0.5F, 0.0F);
+            const float block_size = std::max(
+                std::min(available_width, maximum_size), 1.0F);
+            const float natural_aspect = static_cast<float>(rect->Width) /
+                static_cast<float>(rect->Height);
+            float image_width = block_size;
+            float image_height = image_width / natural_aspect;
+            if (image_height > block_size) {
+                image_height = block_size;
+                image_width = image_height * natural_aspect;
+            }
+            const float face_width = image_width *
+                (animate_as_coin ? 0.06F + 0.94F * std::abs(facing) : 1.0F);
+            const float indent = std::max(
+                (available_width - block_size) * 0.5F, 0.0F);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
-            const ImVec2 container_min = ImGui::GetCursorScreenPos();
-            const ImVec2 container_max{container_min.x + container_width,
-                                       container_min.y + container_height};
+            const ImVec2 block_min = ImGui::GetCursorScreenPos();
+            const float image_left = block_min.x +
+                (block_size - face_width) * 0.5F;
+            const float image_top = block_min.y +
+                (block_size - image_height) * 0.5F;
             ImVec2 uv_min{};
             ImVec2 uv_max{};
             atlas->CalcCustomRectUV(rect, &uv_min, &uv_max);
             ImDrawList* draw = ImGui::GetWindowDrawList();
-            draw->AddRectFilled(container_min, container_max,
-                                IM_COL32(3, 29, 44, 238), 20.0F);
-            draw->AddRect(container_min, container_max,
-                          ImGui::ColorConvertFloat4ToU32(kWarm), 20.0F, 0, 2.0F);
-            const ImVec2 image_min{container_min.x + kContainerPadding,
-                                   container_min.y + kContainerPadding};
-            const ImVec2 image_max{image_min.x + width, image_min.y + height};
-            draw->AddImageRounded(atlas->TexID, image_min, image_max, uv_min, uv_max,
-                                  IM_COL32_WHITE, 13.0F);
-            ImGui::Dummy({container_width, container_height});
+            const float perspective_tilt = animate_as_coin
+                ? std::sin(phase) * image_height * 0.022F
+                : 0.0F;
+            const float brightness = animate_as_coin
+                ? 0.72F + 0.28F * std::abs(facing)
+                : 1.0F;
+            const int tint = static_cast<int>(std::round(brightness * 255.0F));
+            draw->AddImageQuad(
+                atlas->TexID,
+                {image_left, image_top + perspective_tilt},
+                {image_left + face_width, image_top - perspective_tilt},
+                {image_left + face_width,
+                 image_top + image_height + perspective_tilt},
+                {image_left, image_top + image_height - perspective_tilt},
+                uv_min, {uv_max.x, uv_min.y}, uv_max,
+                {uv_min.x, uv_max.y}, IM_COL32(tint, tint, tint, 255));
+            ImGui::Dummy({block_size, block_size});
             return;
         }
     }
 
     // Keep startup usable when a development tree has not staged its visual
-    // assets yet; packaged builds always carry DKR-R8.bmp beside the runtime.
+    // assets yet; packaged builds always carry both coin faces beside the runtime.
     ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
     PushHeadingFont();
     ImGui::TextUnformatted("DKR-R");
@@ -1684,70 +3074,483 @@ void BrandBlock(float available_width, float maximum_size = 230.0F) {
     PopHeadingFont(true);
 }
 
-bool SidebarButton(const char* label, int page, float width = -1.0F) {
-    if (g_overlay_page == page) {
+struct SidebarLayout {
+    float padding = 24.0F;
+    float logo_size = 190.0F;
+    float button_height = 46.0F;
+    float brand_gap = 18.0F;
+    float action_section_gap = 16.0F;
+    float action_gap = 8.0F;
+    float item_spacing_y = 8.0F;
+};
+
+SidebarLayout CalculateSidebarLayout(float panel_height, float panel_width) {
+    SidebarLayout result{};
+    const bool compact = panel_height < 840.0F;
+    result.padding = std::clamp(panel_height * 0.020F, 10.0F,
+                                compact ? 16.0F : 24.0F);
+    result.item_spacing_y = compact ? 4.0F : 8.0F;
+    result.brand_gap = compact ? 10.0F : 18.0F;
+    result.action_section_gap = compact ? 10.0F : 16.0F;
+    result.action_gap = compact ? 4.0F : 8.0F;
+
+    constexpr float kMinimumLogoSize = 64.0F;
+    constexpr float kMinimumButtonHeight = 26.0F;
+    constexpr float kButtonCount = 10.0F;
+    constexpr float kItemSpacingCount = 13.0F;
+    const float desired_logo = std::min(
+        compact ? 112.0F : 218.0F,
+        std::max(panel_width - result.padding * 2.0F, kMinimumLogoSize));
+    const float desired_button = compact ? 40.0F : 46.0F;
+    const float fixed_height = result.padding * 2.0F + result.brand_gap +
+        result.action_section_gap + result.action_gap +
+        result.item_spacing_y * kItemSpacingCount;
+    const float content_budget = std::max(panel_height - fixed_height, 1.0F);
+
+    result.logo_size = std::min(
+        desired_logo,
+        std::max(kMinimumLogoSize,
+                 content_budget - kButtonCount * kMinimumButtonHeight));
+    result.button_height = std::min(
+        desired_button,
+        std::max(kMinimumButtonHeight,
+                 (content_budget - result.logo_size) / kButtonCount));
+
+    // If an unusually short window forces both controls to their minimum,
+    // give the buttons priority and use the remaining height for the logo.
+    const float used_height = result.logo_size +
+        result.button_height * kButtonCount;
+    if (used_height > content_budget) {
+        result.logo_size = std::max(
+            1.0F, content_budget - result.button_height * kButtonCount);
+    }
+    return result;
+}
+
+bool SidebarButton(const char* label, int page, int& sidebar_selection,
+                   float width = -1.0F, float height = 46.0F) {
+    if (sidebar_selection == page) {
         ImGui::PushStyleColor(ImGuiCol_Button, page == 0 ? kAccent : kRaceRed);
     }
-    const bool pressed = ImGui::Button(label, {width, 46.0F});
-    if (g_overlay_page == page) {
+    const bool pressed = ImGui::Button(label, {width, height});
+    if (sidebar_selection == page) {
         ImGui::PopStyleColor();
     }
     if (pressed) {
         g_overlay_page = page;
+        sidebar_selection = page;
+        g_overlay_sidebar_selection.store(page, std::memory_order_release);
     }
     return pressed;
 }
 
 bool LauncherSidebarButton(const char* label, int target_page, int& page,
-                           bool focus_selected, float width) {
-    if (page == target_page) {
+                           int& sidebar_selection, float width,
+                           float height = 46.0F) {
+    if (sidebar_selection == target_page) {
         ImGui::PushStyleColor(ImGuiCol_Button,
                               target_page == 0 ? kAccent : kRaceRed);
     }
-    if (focus_selected && page == target_page) {
-        ImGui::SetKeyboardFocusHere();
-    }
-    const bool pressed = ImGui::Button(label, {width, 46.0F});
-    if (page == target_page) {
+    const bool pressed = ImGui::Button(label, {width, height});
+    if (sidebar_selection == target_page) {
         ImGui::PopStyleColor();
     }
     if (pressed) {
         page = target_page;
+        sidebar_selection = target_page;
     }
     return pressed;
 }
 
-void DrawSidebarNote(float width) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.075F, 0.165F, 0.20F, 0.94F});
-    BeginPaddedChild("sidebar-note", {width, 154.0F}, true,
-                     ImGuiWindowFlags_NoScrollbar, {18.0F, 16.0F});
-    ImGui::PushTextWrapPos(width - 18.0F);
-    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
-    ImGui::TextUnformatted("NOTE");
-    ImGui::PopStyleColor();
-    ImGui::TextWrapped("Bring your own legally obtained Game Pak. It stays on this PC and is never uploaded.");
+const char* SupportPresentationName() {
+    return dkr::runtime::enhancements::presentation_profile() ==
+                   dkr::runtime::enhancements::PresentationProfile::Modern
+               ? "Modern"
+               : "Accurate";
+}
+
+const char* SupportGraphicsApiName(GraphicsApi api) {
+    if (api == GraphicsApi::D3D12) return "Direct3D 12";
+    if (api == GraphicsApi::Vulkan) return "Vulkan";
+#if defined(__APPLE__)
+    if (api != GraphicsApi::Auto) return "Metal";
+#endif
+    return "Automatic";
+}
+
+std::size_t EnabledTexturePackCount() {
+    static std::uint64_t cached_generation = 0U;
+    static std::size_t cached_count = 0U;
+    const std::uint64_t current_generation =
+        dkr::runtime::texture_packs::generation();
+    if (current_generation != cached_generation) {
+        const auto packs = dkr::runtime::texture_packs::snapshot(true);
+        cached_count = static_cast<std::size_t>(std::count_if(
+            packs.begin(), packs.end(),
+            [](const dkr::runtime::texture_packs::PackInfo& pack) {
+                return pack.enabled;
+            }));
+        cached_generation = current_generation;
+    }
+    return cached_count;
+}
+
+void PollSupportSystemSummary() {
+    if (!g_support_summary_requested) {
+        g_support_summary_requested = true;
+        g_support_summary_future = std::async(
+            std::launch::async,
+            [] { return dkr::runtime::support::collect_system_summary(); });
+    }
+    if (g_support_summary || !g_support_summary_future.valid() ||
+        g_support_summary_future.wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready) {
+        return;
+    }
+    try {
+        g_support_summary = g_support_summary_future.get();
+    } catch (...) {
+        g_support_action_status =
+            "System details could not be collected. Settings can still be exported.";
+    }
+}
+
+std::string BuildSupportReport() {
+    const GraphicsConfig config = ultramodern::renderer::get_graphics_config();
+    const bool modern = dkr::runtime::enhancements::presentation_profile() ==
+                        dkr::runtime::enhancements::PresentationProfile::Modern;
+    std::ostringstream report;
+    report << "DKR-R Support Summary\n"
+           << "=====================\n"
+           << "Release: " << DKR_RELEASE_VERSION << '\n'
+           << "Presentation style: " << SupportPresentationName() << '\n'
+           << "Window mode: "
+           << (static_cast<int>(config.wm_option) == 1 ? "Fullscreen"
+                                                       : "Windowed")
+           << '\n'
+           << "Aspect ratio: "
+           << (static_cast<int>(config.ar_option) == 0 ? "Original 4:3"
+                                                       : "Fit to window")
+           << '\n'
+           << "Graphics API: " << SupportGraphicsApiName(config.api_option)
+           << '\n'
+           << "Presentation target: ";
+    if (!modern) {
+        report << "Original 30 FPS\n";
+    } else if (config.rr_option == RefreshRate::Manual) {
+        report << std::clamp(config.rr_manual_value, 30, 500) << " FPS\n";
+    } else {
+        report << "Match display\n";
+    }
+    report << "HUD size: "
+           << std::lround(dkr::runtime::hud::global_scale() * 100.0F) << "%\n"
+           << "Enabled texture packs: " << EnabledTexturePackCount() << '\n'
+           << "Online synchronization: "
+           << (static_cast<dkr::runtime::netplay::SynchronizationMode>(
+                   g_online_synchronization) ==
+                       dkr::runtime::netplay::SynchronizationMode::Lockstep
+                   ? "Lockstep"
+                   : "Rollback")
+           << '\n'
+           << "Diagnostic logging: "
+           << (dkr::runtime::support::diagnostic_logging_enabled() ? "On"
+                                                                   : "Off")
+           << '\n'
+           << "Crash dumps: "
+           << (dkr::runtime::support::crash_dumps_enabled() ? "On" : "Off")
+           << "\n\nSystem\n------\n";
+    if (g_support_summary) {
+        report << "Operating system: " << g_support_summary->operating_system
+               << '\n'
+               << "CPU: " << g_support_summary->cpu << '\n'
+               << "Memory: " << g_support_summary->memory << '\n'
+               << "GPU: " << g_support_summary->gpu << '\n'
+               << "Boot drive type: " << g_support_summary->boot_drive << '\n'
+               << "DKR-R drive type: "
+               << g_support_summary->application_drive << '\n';
+    } else {
+        report << "System details are still being collected.\n";
+    }
+    report << "\nPrivacy\n-------\n"
+           << "This report intentionally excludes Game Pak paths, save data, "
+              "usernames, device identifiers, friend codes and lobby codes.\n";
+    return report.str();
+}
+
+void DrawSupportSummary(float width) {
+    PollSupportSystemSummary();
+    ImGui::SeparatorText("Support summary");
+    ImGui::TextDisabled(
+        "Privacy-safe settings and system details for troubleshooting.");
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
+    const float support_card_height = width >= 420.0F ? 430.0F : 520.0F;
+    BeginPaddedChild("support-summary-card", {width, support_card_height}, true,
+                     ImGuiWindowFlags_NoScrollbar, {20.0F, 18.0F});
+    ImGui::PushTextWrapPos(std::max(width - 24.0F, 1.0F));
+    ImGui::Text("Release: %s", DKR_RELEASE_VERSION);
+    ImGui::Text("Presentation: %s", SupportPresentationName());
+    const GraphicsConfig config = ultramodern::renderer::get_graphics_config();
+    ImGui::Text("Graphics API: %s", SupportGraphicsApiName(config.api_option));
+    ImGui::Text("HUD size: %.0f%%",
+                dkr::runtime::hud::global_scale() * 100.0F);
+    ImGui::Text("Enabled texture packs: %zu", EnabledTexturePackCount());
+    ImGui::Text("Online synchronization: %s",
+                static_cast<dkr::runtime::netplay::SynchronizationMode>(
+                    g_online_synchronization) ==
+                        dkr::runtime::netplay::SynchronizationMode::Lockstep
+                    ? "Lockstep"
+                    : "Rollback");
+    ImGui::Dummy({0.0F, 8.0F});
+    if (g_support_summary) {
+        ImGui::TextWrapped("OS: %s", g_support_summary->operating_system.c_str());
+        ImGui::TextWrapped("CPU: %s", g_support_summary->cpu.c_str());
+        ImGui::TextWrapped("Memory: %s", g_support_summary->memory.c_str());
+        ImGui::TextWrapped("GPU: %s", g_support_summary->gpu.c_str());
+        ImGui::Text("Storage: boot %s; DKR-R %s",
+                    g_support_summary->boot_drive.c_str(),
+                    g_support_summary->application_drive.c_str());
+    } else {
+        ImGui::TextDisabled("Collecting system details...");
+    }
+    ImGui::Dummy({0.0F, 8.0F});
+    bool logging = dkr::runtime::support::diagnostic_logging_enabled();
+    if (ImGui::Checkbox("Diagnostic logging", &logging)) {
+        dkr::runtime::support::set_diagnostic_logging_enabled(logging);
+        g_support_action_status = logging
+            ? "Diagnostic logging will be enabled at the next launch."
+            : "Diagnostic logging will be disabled at the next launch.";
+    }
+    bool dumps = dkr::runtime::support::crash_dumps_enabled();
+    if (ImGui::Checkbox("Create crash dumps", &dumps)) {
+        dkr::runtime::support::set_crash_dumps_enabled(dumps);
+        g_support_action_status = dumps
+            ? "Crash dumps are enabled."
+            : "Crash dumps are disabled.";
+    }
+    const float available_button_width = ImGui::GetContentRegionAvail().x;
+    const float button_gap = ImGui::GetStyle().ItemSpacing.x;
+    const bool use_two_columns = available_button_width >= 420.0F;
+    const float utility_button_width = use_two_columns
+        ? (available_button_width - button_gap) * 0.5F
+        : available_button_width;
+    if (ImGui::Button("EXPORT SUPPORT SUMMARY",
+                      {available_button_width, 42.0F})) {
+        std::filesystem::path output;
+        std::string error;
+        if (dkr::runtime::support::export_report(BuildSupportReport(), output,
+                                                 error)) {
+            g_support_action_status =
+                "Support summary exported to the DKR-R support-reports folder.";
+        } else {
+            g_support_action_status = error;
+        }
+    }
+    if (ImGui::Button("OPEN LOGS", {utility_button_width, 42.0F})) {
+        dkr::runtime::support::open_directory(
+            dkr::runtime::support::log_directory(), g_support_action_status);
+    }
+    if (use_two_columns) ImGui::SameLine();
+    if (ImGui::Button("OPEN CRASH DUMPS", {utility_button_width, 42.0F})) {
+        dkr::runtime::support::open_directory(
+            dkr::runtime::support::crash_dump_directory(),
+            g_support_action_status);
+    }
+    if (ImGui::Button("OPEN SUPPORT REPORTS",
+                      {available_button_width, 42.0F})) {
+        dkr::runtime::support::open_directory(
+            dkr::runtime::support::support_report_directory(),
+            g_support_action_status);
+    }
+    if (!g_support_action_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", g_support_action_status.c_str());
+        ImGui::PopStyleColor();
+    }
     ImGui::PopTextWrapPos();
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
 
+void DrawPatchNotesModal() {
+    if (g_patch_notes_requested) {
+        ImGui::OpenPopup("DKR-R Patch Notes");
+        g_patch_notes_requested = false;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float available_width = std::max(240.0F, viewport->WorkSize.x - 24.0F);
+    const float available_height = std::max(240.0F, viewport->WorkSize.y - 24.0F);
+    const float minimum_width = std::min(620.0F, available_width);
+    const float maximum_width = std::min(1040.0F, available_width);
+    const float minimum_height = std::min(500.0F, available_height);
+    const float maximum_height = std::min(820.0F, available_height);
+    const ImVec2 modal_size{
+        std::clamp(viewport->WorkSize.x * 0.72F, minimum_width, maximum_width),
+        std::clamp(viewport->WorkSize.y * 0.78F, minimum_height,
+                   maximum_height)};
+    ImGui::SetNextWindowSize(modal_size, ImGuiCond_Appearing);
+    if (!BeginPaddedModal("DKR-R Patch Notes")) return;
+    PushHeadingFont(true);
+    ImGui::TextUnformatted("WHAT'S NEW SINCE 1.0.0");
+    PopHeadingFont(true);
+    ImGui::TextDisabled("Current development and Online Beta changes");
+    ImGui::Separator();
+    const float footer_height = 58.0F;
+    ImGui::BeginChild("patch-notes-scroll", {0.0F, -footer_height}, false,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    const auto section = [](const char* heading, const char* body) {
+        ImGui::SeparatorText(heading);
+        ImGui::TextWrapped("%s", body);
+        ImGui::Dummy({0.0F, 8.0F});
+    };
+    section("GAME PAK COMPATIBILITY",
+            "Unified support for US v1.0, US Rev A / v1.1 and byte-swapped "
+            "supported images through one launcher and one runtime. Revision "
+            "selection no longer opens a second application instance.");
+    section("DKR-R ONLINE",
+            "Added secure five-character Quick Join, host approval, Online "
+            "Profiles, friends, friend invites, Open Lobbies, presence and "
+            "notifications. Added Lockstep and Rollback synchronization, "
+            "host-authoritative race state, recovery barriers, connection and "
+            "controller overlays, synchronized saves and cross-platform build "
+            "compatibility checks. Water, hovercraft height, racer orientation, "
+            "moving actors, RNG and CPU racers now follow authoritative state. "
+            "Network catch-up and bounded recovery keep unstable connections "
+            "responsive without accumulating permanent frame debt.");
+    section("MODERN PRESENTATION",
+            "Added high-refresh interpolation without changing game speed, "
+            "widescreen and ultrawide presentation, revised skyboxes and water, "
+            "split-screen viewport handling, adjustable FOV, view distance, "
+            "scenery controls, maximum vehicle detail and HUD sizing. "
+            "Stabilized wheels, propellers, steering wheels, shadows, billboards, "
+            "doors, trails, animated water and post-race cameras.");
+    section("GRAPHICS AND TEXTURES",
+            "Added RT64 and Rice texture-pack import, live pack selection, CRT "
+            "overlays, anisotropic filtering, downsampling, anti-aliasing, "
+            "high-precision framebuffer controls and a configurable performance "
+            "overlay. Corrected texture-edge sampling and high-resolution UI "
+            "tile seams.");
+    section("CONTROLS",
+            "Added independent Player 1-4 controller assignment, primary and "
+            "secondary bindings, per-vehicle inversion, per-player gyro, quick "
+            "race restart, texture-pack and fullscreen shortcuts, background "
+            "input, live stick/gyro previews and broader modern/N64 controller "
+            "database support.");
+    section("SAVES AND GAMEPLAY",
+            "Added automatic EEPROM validation and repair, virtual Controller "
+            "Paks alongside rumble, save backup/import/export, an Adventure Save "
+            "Builder, course progress, unlockables and Magic Code management. "
+            "Added independent music, vehicle, effects, ambience and EQ controls, "
+            "plus optional music for three- and four-player races.");
+    section("LAUNCHER AND STABILITY",
+            "Redesigned the controller-first launcher and in-game overlay, added "
+            "animated DKR-R branding, friends and controller-friendly text entry, "
+            "restart/exit/fullscreen handling, support diagnostics and clearer "
+            "online errors. Fixed transition crashes, intro-loop crashes, race-end "
+            "vertex explosions, audio pops, black screens and Linux/Steam Deck "
+            "startup and layout problems.");
+    ImGui::EndChild();
+    ImGui::Separator();
+    const float close_width = std::min(220.0F, ImGui::GetContentRegionAvail().x);
+    if (ImGui::Button("CLOSE PATCH NOTES", {close_width, 44.0F})) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void DrawAboutDkrR(float width) {
+    constexpr std::string_view kAdventureDescription =
+        "Wizpig has invaded DKR-R. Race across land, water and sky, collect "
+        "Golden Balloons and help Diddy and his friends send the intergalactic "
+        "pig wizard packing.";
+    constexpr std::string_view kRuntimeDescription =
+        "DKR-R runs the original game logic through a native PC runtime. "
+        "Accurate preserves the original presentation; Modern adds carefully "
+        "isolated PC quality-of-life options.";
+    constexpr std::string_view kTamperWarning =
+        "If you did not download DKR-R from ThatGuyMcd's GitHub repository, "
+        "this build may have been modified or tampered with.";
+    constexpr std::string_view kOfficialSource =
+        "Official source: github.com/ThatGuyMcd/DKR-R";
+    constexpr std::string_view kPootermanCredit =
+        "DKR-R's application icon was created by POOTERMAN.";
+    struct CoreTechnologyCredit {
+        std::string_view name;
+        const char* repository;
+    };
+    constexpr std::array<CoreTechnologyCredit, 7> kCoreTechnologies{{
+        {"N64Recomp", "https://github.com/N64Recomp/N64Recomp"},
+        {"N64ModernRuntime",
+         "https://github.com/N64Recomp/N64ModernRuntime"},
+        {"RT64", "https://github.com/rt64/rt64"},
+        {"Monocypher", "https://github.com/LoupVaillant/Monocypher"},
+        {"Mbed TLS", "https://github.com/Mbed-TLS/mbedtls"},
+        {"GekkoNet", "https://github.com/HeatXD/GekkoNet"},
+        {"Diddy Kong Racing Decomp",
+         "https://github.com/DavidSM64/Diddy-Kong-Racing"},
+    }};
+    constexpr std::string_view kCoreTechnologyThanks =
+        "Thanks to all developers and contributors.";
+    constexpr std::string_view kHdrTexturePackCredit =
+        "A community project re-imagining Diddy Kong Racing in crisp HD while "
+        "remaining faithful to the original art direction. Project lead: "
+        "sr.gu. Thank you to every artist, tester and contributor involved.";
+    constexpr ImVec2 kAboutPadding{22.0F, 20.0F};
+
     DrawPageHeading("ABOUT DKR-R");
     ImGui::TextDisabled("Diddy Kong Racing - Recompiled");
     ImGui::Dummy({0.0F, 14.0F});
+    const float about_card_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    const float about_inner_width = std::max(
+        about_card_width - kAboutPadding.x * 2.0F, 1.0F);
+    const bool stack_about_actions = about_inner_width < 560.0F;
+    const float about_action_height = stack_about_actions
+        ? 46.0F * 2.0F + ImGui::GetStyle().ItemSpacing.y
+        : 46.0F;
+    const float about_card_height = PaddedCardHeight(
+        {WrappedTextHeight(kAdventureDescription, about_inner_width), 10.0F,
+         WrappedTextHeight(kRuntimeDescription, about_inner_width), 14.0F,
+         ImGui::GetTextLineHeight(),
+         WrappedTextHeight(kTamperWarning, about_inner_width),
+         WrappedTextHeight(kOfficialSource, about_inner_width), 12.0F,
+         about_action_height},
+        kAboutPadding);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
-    BeginPaddedChild("about-dkr-r-card", {width, 360.0F}, true,
-                     ImGuiWindowFlags_NoScrollbar, {22.0F, 20.0F});
-    ImGui::PushTextWrapPos(width - 20.0F);
-    ImGui::TextWrapped("Wizpig has invaded DKR-R. Race across land, water and sky, collect Golden Balloons and help Diddy and his friends send the intergalactic pig wizard packing.");
+    BeginPaddedChild("about-dkr-r-card",
+                     {about_card_width, about_card_height}, true,
+                     ImGuiWindowFlags_NoScrollbar, kAboutPadding);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                           ImGui::GetContentRegionAvail().x);
+    ImGui::TextWrapped("%.*s", static_cast<int>(kAdventureDescription.size()),
+                       kAdventureDescription.data());
     ImGui::Dummy({0.0F, 10.0F});
-    ImGui::TextWrapped("DKR-R runs the original game logic through a native PC runtime. Accurate preserves the original presentation; Modern adds carefully isolated PC quality-of-life options.");
+    ImGui::TextWrapped("%.*s", static_cast<int>(kRuntimeDescription.size()),
+                       kRuntimeDescription.data());
     ImGui::Dummy({0.0F, 14.0F});
     ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
     ImGui::TextWrapped("CREATED BY THATGUYMCD");
     ImGui::PopStyleColor();
-    ImGui::TextWrapped("If you did not download DKR-R from ThatGuyMcd's GitHub repository, this build may have been modified or tampered with.");
-    ImGui::TextDisabled("Official source: github.com/ThatGuyMcd/DKR-R");
+    ImGui::TextWrapped("%.*s", static_cast<int>(kTamperWarning.size()),
+                       kTamperWarning.data());
+    DrawDisabledWrapped(kOfficialSource);
+    ImGui::Dummy({0.0F, 12.0F});
+    const float about_action_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float about_action_region = ImGui::GetContentRegionAvail().x;
+    const float about_action_width = stack_about_actions
+        ? about_action_region
+        : std::max((about_action_region - about_action_gap) * 0.5F, 1.0F);
+    if (ImGui::Button("VISIT GITHUB PAGE",
+                      {about_action_width, 46.0F})) {
+        SDL_OpenURL("https://github.com/ThatGuyMcd/DKR-R");
+    }
+    if (!stack_about_actions) ImGui::SameLine(0.0F, about_action_gap);
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    if (ImGui::Button("VIEW PATCH NOTES",
+                      {about_action_width, 46.0F})) {
+        g_patch_notes_requested = true;
+    }
+    ImGui::PopStyleColor();
     ImGui::PopTextWrapPos();
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -1759,6 +3562,100 @@ void DrawAboutDkrR(float width) {
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     ImGui::TextWrapped("No copyrighted game data is distributed. A legally obtained supported Diddy Kong Racing Game Pak is required.");
     ImGui::PopStyleColor();
+    ImGui::Dummy({0.0F, 16.0F});
+    ImGui::SeparatorText("Credits");
+    constexpr ImVec2 kCreditsPadding{22.0F, 18.0F};
+    const float credits_card_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    const float credits_inner_width = std::max(
+        credits_card_width - kCreditsPadding.x * 2.0F, 1.0F);
+    constexpr float kCoreRepositoryButtonHeight = 42.0F;
+    const bool stack_core_technology_rows = credits_inner_width < 520.0F;
+    const float core_row_spacing = ImGui::GetStyle().ItemSpacing.y;
+    const float core_technology_rows_height = stack_core_technology_rows
+        ? static_cast<float>(kCoreTechnologies.size()) *
+              (ImGui::GetTextLineHeight() + core_row_spacing +
+               kCoreRepositoryButtonHeight) +
+              static_cast<float>(kCoreTechnologies.size() - 1U) *
+                  core_row_spacing
+        : static_cast<float>(kCoreTechnologies.size()) *
+              kCoreRepositoryButtonHeight +
+              static_cast<float>(kCoreTechnologies.size() - 1U) *
+                  core_row_spacing;
+    const float credits_card_height = PaddedCardHeight(
+        {ImGui::GetTextLineHeight(),
+         WrappedTextHeight(kPootermanCredit, credits_inner_width), 42.0F, 8.0F,
+         ImGui::GetTextLineHeight(),
+         core_technology_rows_height,
+         WrappedTextHeight(kCoreTechnologyThanks, credits_inner_width), 8.0F,
+         ImGui::GetTextLineHeight(),
+         WrappedTextHeight(kHdrTexturePackCredit, credits_inner_width), 42.0F},
+        kCreditsPadding);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
+    BeginPaddedChild("about-dkr-r-credits",
+                     {credits_card_width, credits_card_height}, true,
+                     ImGuiWindowFlags_NoScrollbar, kCreditsPadding);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
+                           ImGui::GetContentRegionAvail().x);
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+    ImGui::TextUnformatted("POOTERMAN - DKR-R ICON");
+    ImGui::PopStyleColor();
+    ImGui::TextWrapped("%.*s", static_cast<int>(kPootermanCredit.size()),
+                       kPootermanCredit.data());
+    if (ImGui::Button("VISIT POOTERMAN ON DEVIANTART",
+                        {ImGui::GetContentRegionAvail().x, 42.0F})) {
+        SDL_OpenURL("https://www.deviantart.com/pooterman");
+    }
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+    ImGui::TextUnformatted("CORE TECHNOLOGY AND RESEARCH");
+    ImGui::PopStyleColor();
+    const float core_repository_button_width = stack_core_technology_rows
+        ? ImGui::GetContentRegionAvail().x
+        : std::min(190.0F, ImGui::GetContentRegionAvail().x * 0.36F);
+    for (const auto& technology : kCoreTechnologies) {
+        ImGui::PushID(technology.repository);
+        const float row_start_x = ImGui::GetCursorPosX();
+        const float row_available_width = ImGui::GetContentRegionAvail().x;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(technology.name.data(),
+                               technology.name.data() + technology.name.size());
+        if (stack_core_technology_rows) {
+            if (ImGui::Button("VISIT GITHUB",
+                              {core_repository_button_width,
+                               kCoreRepositoryButtonHeight})) {
+                SDL_OpenURL(technology.repository);
+            }
+        } else {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(
+                row_start_x + row_available_width -
+                core_repository_button_width);
+            if (ImGui::Button("VISIT GITHUB",
+                              {core_repository_button_width,
+                               kCoreRepositoryButtonHeight})) {
+                SDL_OpenURL(technology.repository);
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::TextWrapped("%.*s",
+                       static_cast<int>(kCoreTechnologyThanks.size()),
+                       kCoreTechnologyThanks.data());
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+    ImGui::TextUnformatted("DKR-R HDR TEXTURE PACK PROJECT");
+    ImGui::PopStyleColor();
+    ImGui::TextWrapped("%.*s", static_cast<int>(kHdrTexturePackCredit.size()),
+                       kHdrTexturePackCredit.data());
+    if (ImGui::Button("JOIN THE DKR-R HDR DISCORD",
+                      {ImGui::GetContentRegionAvail().x, 42.0F})) {
+        SDL_OpenURL("https://discord.gg/AMWfXdBjNP");
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    DrawPatchNotesModal();
 }
 
 void DrawComingSoonPage(const char* heading, const char* card_id,
@@ -1789,6 +3686,2556 @@ void DrawComingSoonPage(const char* heading, const char* card_id,
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
+
+dkr::runtime::netplay::CompatibilityManifest BuildNetplayManifest(
+    const dkr::runtime::rom::Identity& identity) {
+    using namespace dkr::runtime::netplay;
+    CompatibilityManifest manifest{};
+    // Network compatibility comes from the repository VERSION and network ABI,
+    // not a platform-specific package/RC label. The human-facing launcher can
+    // still display DKR_RELEASE_VERSION independently.
+    manifest.release_version = canonical_network_release(
+        DKR_NETWORK_RELEASE_VERSION);
+    manifest.build_fingerprint = canonical_network_build_fingerprint(
+        DKR_NETWORK_RELEASE_VERSION);
+    manifest.revision = identity.revision == dkr::runtime::rom::Revision::UsV80
+        ? Revision::UsV80 : Revision::UsV77;
+    manifest.canonical_rom_hash = identity.canonical_xxh3;
+    // CMake derives this digest directly from the checked Patch Pipeline
+    // policy used for this revision. Admission therefore fails before launch
+    // whenever authored hook or instruction policy differs between builds.
+    manifest.patch_policy_hash = stable_hash(DKR_PATCH_POLICY_SHA256);
+    manifest.magic_codes_hash = dkr::runtime::magic_codes::selected_mask();
+    manifest.gameplay_settings_hash = stable_hash(
+        std::to_string(manifest.magic_codes_hash) + ":retail-simulation-30");
+    std::vector<std::uint8_t> canonical_save;
+    std::string save_error;
+    if (dkr::runtime::saves::canonical_adventure_bytes(
+            canonical_save, save_error)) {
+        manifest.session_save_hash = stable_hash(std::string_view(
+            reinterpret_cast<const char*>(canonical_save.data()),
+            canonical_save.size()));
+    }
+    manifest.simulation_rate = 30U;
+#if defined(_M_X64) || defined(__x86_64__)
+    manifest.architecture = "x86_64";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+    manifest.architecture = "arm64";
+#else
+    manifest.architecture = "unknown";
+#endif
+    manifest.floating_point_mode = "strict-ieee754-v1";
+    return manifest;
+}
+
+const char* OnlineStateName(dkr::runtime::netplay::ConnectionState state) {
+    using dkr::runtime::netplay::ConnectionState;
+    switch (state) {
+    case ConnectionState::Hosting: return "HOSTING";
+    case ConnectionState::Connecting: return "CONNECTING";
+    case ConnectionState::AwaitingApproval: return "WAITING FOR HOST APPROVAL";
+    case ConnectionState::Lobby: return "IN LOBBY";
+    case ConnectionState::Loading: return "LOADING";
+    case ConnectionState::Running: return "RACING ONLINE";
+    case ConnectionState::Failed: return "CONNECTION FAILED";
+    default: return "OFFLINE";
+    }
+}
+
+const char* OnlineRouteName(dkr::runtime::netplay::Route route) {
+    using dkr::runtime::netplay::Route;
+    switch (route) {
+    case Route::Lan: return "LAN";
+    case Route::Direct: return "DIRECT";
+    case Route::Relay: return "RELAY";
+    default: return "MEASURING";
+    }
+}
+
+const char* OnlineMethodName(dkr::runtime::netplay::ConnectionMethod method) {
+    (void)method;
+    return "QUICK JOIN";
+}
+
+std::string NormalizeOnlineInvite(std::string_view invite) {
+    std::string unquoted;
+    unquoted.reserve(invite.size());
+    for (const char character : invite) {
+        if (!std::isspace(static_cast<unsigned char>(character))) {
+            unquoted.push_back(character);
+        }
+    }
+    if (unquoted.size() >= 2U &&
+        ((unquoted.front() == '"' && unquoted.back() == '"') ||
+         (unquoted.front() == '\'' && unquoted.back() == '\''))) {
+        unquoted = unquoted.substr(1U, unquoted.size() - 2U);
+    }
+
+    std::string normalized;
+    normalized.reserve(unquoted.size());
+    for (const char character : unquoted) {
+        if (character == '-') continue;
+        normalized.push_back(static_cast<char>(std::toupper(
+            static_cast<unsigned char>(character))));
+    }
+    return normalized;
+}
+
+std::string OnlineInviteLobbyToken(std::string_view invite) {
+    const std::string normalized = NormalizeOnlineInvite(invite);
+    return dkr::runtime::netplay::valid_quick_join_code(normalized)
+        ? normalized : std::string{};
+}
+
+bool SetOnlineInvite(std::string_view invite) {
+    const std::string normalized = NormalizeOnlineInvite(invite);
+    if (normalized.empty() || normalized.size() >= sizeof(g_online_invite) ||
+        !dkr::runtime::netplay::valid_quick_join_code(normalized)) {
+        g_online_invite[0] = '\0';
+        return false;
+    }
+    const std::size_t length = normalized.size();
+    std::memcpy(g_online_invite, normalized.data(), length);
+    g_online_invite[length] = '\0';
+    return true;
+}
+
+void RequestOnlineCodeKeyboard() {
+    constexpr std::string_view kCodeAlphabet =
+        "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const std::string normalized = NormalizeOnlineInvite(g_online_invite);
+    std::size_t length = 0U;
+    for (const char character : normalized) {
+        if (length >= sizeof(g_online_code_entry) - 1U) break;
+        if (kCodeAlphabet.find(character) != std::string_view::npos) {
+            g_online_code_entry[length++] = character;
+        }
+    }
+    g_online_code_entry[length] = '\0';
+    g_online_code_keyboard_pending = true;
+}
+
+int FilterOnlineCodeCharacter(ImGuiInputTextCallbackData* data) {
+    constexpr std::string_view kCodeAlphabet =
+        "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    if (data == nullptr || data->EventChar > 0x7FU) return 1;
+    const char character = static_cast<char>(std::toupper(
+        static_cast<unsigned char>(data->EventChar)));
+    if (kCodeAlphabet.find(character) == std::string_view::npos) return 1;
+    data->EventChar = static_cast<ImWchar>(character);
+    return 0;
+}
+
+void AppendOnlineCodeCharacter(char character) {
+    const std::size_t length = std::strlen(g_online_code_entry);
+    if (length >= sizeof(g_online_code_entry) - 1U) return;
+    g_online_code_entry[length] = character;
+    g_online_code_entry[length + 1U] = '\0';
+}
+
+void BackspaceOnlineCodeCharacter() {
+    const std::size_t length = std::strlen(g_online_code_entry);
+    if (length > 0U) g_online_code_entry[length - 1U] = '\0';
+}
+
+bool CopyOnlineInviteToClipboard(std::string_view invite) {
+    const std::string normalized = NormalizeOnlineInvite(invite);
+    if (normalized.empty() || SDL_SetClipboardText(normalized.c_str()) != 0) {
+        g_online_action_status = std::string("The Quick Join code was not copied: ") +
+            SDL_GetError();
+        return false;
+    }
+    char* clipboard = SDL_GetClipboardText();
+    const std::string copied = clipboard != nullptr
+        ? NormalizeOnlineInvite(clipboard) : std::string{};
+    if (clipboard != nullptr) SDL_free(clipboard);
+    if (copied != normalized) {
+        g_online_action_status =
+            "The system clipboard did not retain the Quick Join code. Nothing was shared; copy it again.";
+        return false;
+    }
+    g_online_action_status = "Quick Join code copied and verified for lobby " +
+        OnlineInviteLobbyToken(normalized) + ".";
+    return true;
+}
+
+bool PasteOnlineInviteFromClipboard() {
+    char* clipboard = SDL_GetClipboardText();
+    const std::string pasted = clipboard != nullptr
+        ? NormalizeOnlineInvite(clipboard) : std::string{};
+    if (clipboard != nullptr) SDL_free(clipboard);
+    if (!SetOnlineInvite(pasted)) {
+        g_online_action_status =
+            "The clipboard does not contain a valid five-character Quick Join code.";
+        return false;
+    }
+    g_online_action_status = "Quick Join code " +
+        OnlineInviteLobbyToken(g_online_invite) +
+        " verified. Request host approval when ready.";
+    return true;
+}
+
+bool CreateOnlineLobby() {
+    using namespace dkr::runtime::netplay;
+    Rules rules{};
+    rules.host_control = static_cast<HostControlPolicy>(g_online_host_control);
+    rules.maximum_players = static_cast<std::uint8_t>(g_online_maximum_players);
+    rules.synchronization = static_cast<SynchronizationMode>(
+        g_online_synchronization);
+    rules.rollback_window = rules.synchronization == SynchronizationMode::Rollback
+        ? static_cast<std::uint8_t>(g_online_rollback_window)
+        : 0U;
+    rules.automatic_input_delay = g_online_automatic_delay;
+    rules.manual_input_delay = static_cast<std::uint8_t>(g_online_manual_delay);
+    rules.record_replay = g_online_record_replay;
+    std::string error;
+    std::vector<std::uint8_t> online_save;
+    const auto save_mode = static_cast<
+        dkr::runtime::saves::OnlineSaveSeedMode>(g_online_save_seed_mode);
+    if (!dkr::runtime::saves::prepare_host_online_adventure(
+            save_mode, online_save, error)) {
+        g_online_action_status = error;
+        return false;
+    }
+    session().configure_session_save(
+        std::move(online_save),
+        dkr::runtime::saves::install_synchronized_online_adventure);
+    if (!session().host(0U, {}, g_online_room_name,
+                        ConnectionMethod::QuickJoin, g_online_player_name,
+                        rules, error)) {
+        g_online_action_status = error;
+        return false;
+    }
+    return true;
+}
+
+float OnlineControlWidth(float preferred_width) {
+    return std::max(
+        std::min(preferred_width, ImGui::GetContentRegionAvail().x), 1.0F);
+}
+
+bool OnlineCombo(const char* label, const char* id, int* value,
+                 const char* items, float preferred_width) {
+    ImGui::TextWrapped("%s", label);
+    ImGui::SetNextItemWidth(OnlineControlWidth(preferred_width));
+    return ControlCombo(id, value, items);
+}
+
+bool OnlineSliderInt(const char* label, const char* id, int* value,
+                     int minimum, int maximum, float preferred_width,
+                     const char* format = "%d",
+                     ImGuiSliderFlags flags = 0) {
+    ImGui::TextWrapped("%s", label);
+    ImGui::SetNextItemWidth(OnlineControlWidth(preferred_width));
+    return ImGui::SliderInt(id, value, minimum, maximum, format, flags);
+}
+
+void DrawOnlineOverlaySettings(float width) {
+    ImGui::SeparatorText("ONLINE OVERLAYS");
+    ImGui::TextWrapped(
+        "These presentation-only controls remain available in the launcher "
+        "and while a game is running. They never change synchronization or "
+        "the shared simulation.");
+    ImGui::Dummy({0.0F, 8.0F});
+    const float setting_width = std::min(width, 520.0F);
+    if (ImGui::Checkbox("Show networking overlay",
+                        &g_network_overlay_enabled)) {
+        SaveSettings();
+    }
+    if (g_network_overlay_enabled) {
+        if (OnlineCombo("Network overlay position",
+                        "##online-network-overlay-position",
+                        &g_network_overlay_position,
+                        "Top left\0Top right\0Bottom left\0Bottom right\0",
+                        setting_width)) {
+            SaveSettings();
+        }
+        if (OnlineCombo("Network overlay detail",
+                        "##online-network-overlay-detail",
+                        &g_network_overlay_detail,
+                        "Compact\0Standard\0Detailed\0", setting_width)) {
+            SaveSettings();
+        }
+        if (ImGui::Checkbox("Network details on one row",
+                            &g_network_overlay_single_row)) {
+            SaveSettings();
+        }
+    }
+    if (ImGui::Checkbox("Show controller input overlay",
+                        &g_controller_input_overlay_enabled)) {
+        SaveSettings();
+    }
+    if (g_controller_input_overlay_enabled) {
+        if (OnlineCombo("Controller overlay position",
+                        "##online-controller-overlay-position",
+                        &g_controller_input_overlay_position,
+                        "Top left\0Top right\0Bottom left\0Bottom right\0",
+                        setting_width)) {
+            SaveSettings();
+        }
+        ImGui::TextDisabled(
+            "Shows the local sample and Player 1's committed input lanes so you can verify exactly what the host received.");
+    }
+}
+
+void DrawOnlineInputProfile(float width, bool editable) {
+    if (editable) {
+        if (OnlineCombo("Local controls", "##online-local-controls",
+                        &g_online_input_profile,
+                        "Player 1 profile\0Player 2 profile\0"
+                        "Player 3 profile\0Player 4 profile\0",
+                        std::min(width, 520.0F))) {
+            g_online_input_profile = std::clamp(g_online_input_profile, 0, 3);
+            dkr::runtime::platform::set_online_input_profile(
+                static_cast<std::size_t>(g_online_input_profile));
+            SaveSettings();
+        }
+    } else {
+        ImGui::TextDisabled("Using Player %d controls. Change this in Online Profile.",
+                            g_online_input_profile + 1);
+    }
+
+    const auto controller =
+        dkr::runtime::platform::player_controller_status(
+            static_cast<std::size_t>(g_online_input_profile));
+    if (controller.connected) {
+        ImGui::TextColored(kAccent, "Ready: %s", controller.name.c_str());
+    } else if (dkr::runtime::input::keyboard_player() ==
+               g_online_input_profile) {
+        ImGui::TextColored(kAccent, "Ready: Keyboard");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextWrapped(
+            "This profile needs a controller or keyboard assignment in "
+            "CONTROLS before it can ready up.");
+        ImGui::PopStyleColor();
+    }
+}
+
+struct TextEntrySpec {
+    char* value = nullptr;
+    std::size_t capacity = 0U;
+    const char* heading = "ENTER TEXT";
+    const char* hint = "TEXT";
+    const char* accept = "SAVE";
+    bool allow_empty = false;
+};
+
+TextEntrySpec GetTextEntrySpec(TextEntryTarget target) {
+    switch (target) {
+    case TextEntryTarget::RacerName:
+        return {g_online_player_name, sizeof(g_online_player_name),
+                "ENTER RACER NAME", "RACER NAME", "USE RACER NAME", false};
+    case TextEntryTarget::LobbyName:
+        return {g_online_room_name, sizeof(g_online_room_name),
+                "ENTER LOBBY NAME", "LOBBY NAME", "USE LOBBY NAME", false};
+    case TextEntryTarget::OnlineProfileName:
+        return {g_online_profile_name, sizeof(g_online_profile_name),
+                "ENTER DISPLAY NAME", "DISPLAY NAME", "USE DISPLAY NAME", false};
+    case TextEntryTarget::FriendNickname:
+        return {g_friend_nickname, sizeof(g_friend_nickname),
+                "SET FRIEND NICKNAME", "FRIEND NICKNAME", "SAVE NICKNAME", true};
+    case TextEntryTarget::TexturePackSearch:
+        return {g_texture_pack_search, sizeof(g_texture_pack_search),
+                "SEARCH TEXTURE PACKS", "TEXTURE PACK NAME", "APPLY SEARCH", true};
+    case TextEntryTarget::None:
+        break;
+    }
+    return {};
+}
+
+void RequestTextEntryKeyboard(TextEntryTarget target) {
+    const TextEntrySpec spec = GetTextEntrySpec(target);
+    if (spec.value == nullptr || spec.capacity == 0U) return;
+    const std::size_t length = std::min(
+        std::strlen(spec.value), sizeof(g_text_entry_edit) - 1U);
+    std::memcpy(g_text_entry_edit, spec.value, length);
+    g_text_entry_edit[length] = '\0';
+    g_text_entry_target = target;
+    g_text_entry_keyboard_pending = true;
+}
+
+void DrawTextEntryButton(const char* label, TextEntryTarget target,
+                         float width) {
+    const TextEntrySpec spec = GetTextEntrySpec(target);
+    if (spec.value == nullptr) return;
+    ImGui::TextUnformatted(label);
+    ImGui::PushID(label);
+    const char* visible = spec.value[0] != '\0'
+        ? spec.value : "SELECT TO ENTER TEXT";
+    {
+        const ControlFontScope scope;
+        if (ImGui::Button(visible,
+                          {std::min(width, ImGui::GetContentRegionAvail().x),
+                           ImGui::GetFrameHeight()})) {
+            RequestTextEntryKeyboard(target);
+        }
+    }
+    ImGui::PopID();
+}
+
+void CommitTextEntry() {
+    const TextEntryTarget target = g_text_entry_target;
+    const TextEntrySpec spec = GetTextEntrySpec(target);
+    if (spec.value == nullptr || spec.capacity == 0U) return;
+    const std::size_t length = std::min(
+        std::strlen(g_text_entry_edit), spec.capacity - 1U);
+    std::memcpy(spec.value, g_text_entry_edit, length);
+    spec.value[length] = '\0';
+
+    if (target == TextEntryTarget::FriendNickname) {
+        std::string error;
+        if (!dkr::runtime::netplay::friend_service().set_friend_nickname(
+                g_friend_action_identity, g_friend_nickname, error)) {
+            g_online_action_status = error;
+        } else {
+            g_online_action_status = "Friend nickname saved.";
+        }
+    } else if (target == TextEntryTarget::RacerName ||
+               target == TextEntryTarget::LobbyName) {
+        SaveSettings();
+    }
+}
+
+void DrawTextEntryKeyboard() {
+    constexpr const char* kPopupName = "ENTER DKR-R TEXT";
+    constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.\'";
+    constexpr int kColumns = 8;
+
+    if (g_text_entry_keyboard_pending) {
+        ImGui::OpenPopup(kPopupName);
+        g_text_entry_keyboard_pending = false;
+    }
+    if (g_text_entry_target == TextEntryTarget::None &&
+        !ImGui::IsPopupOpen(kPopupName)) {
+        return;
+    }
+
+    const TextEntrySpec spec = GetTextEntrySpec(g_text_entry_target);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const bool compact = display.y < 700.0F;
+    ImGui::SetNextWindowSize(
+        {std::min(760.0F, std::max(display.x - 32.0F, 1.0F)),
+         std::min(690.0F, std::max(display.y - 32.0F, 1.0F))},
+        ImGuiCond_Appearing);
+    if (!BeginPaddedModal(kPopupName,
+                          ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+
+    PushHeadingFont();
+    ImGui::TextUnformatted(spec.heading);
+    PopHeadingFont();
+    ImGui::TextWrapped(
+        "Use the D-pad and A button to enter text. Every letter and number "
+        "is available; spaces and common name characters are included too.");
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::SetNextItemWidth(-1.0F);
+    {
+        const ControlFontScope scope;
+        ImGui::InputTextWithHint("##general-text-entry", spec.hint,
+                                 g_text_entry_edit,
+                                 sizeof(g_text_entry_edit));
+    }
+    ImGui::Dummy({0.0F, 8.0F});
+
+    const float spacing = 8.0F;
+    const float key_width = std::max(
+        (ImGui::GetContentRegionAvail().x -
+         spacing * static_cast<float>(kColumns - 1)) /
+            static_cast<float>(kColumns),
+        1.0F);
+    const float key_height = compact ? 34.0F : 42.0F;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, spacing});
+    for (std::size_t index = 0U; index < kAlphabet.size(); ++index) {
+        char key_label[2]{kAlphabet[index], '\0'};
+        if (ImGui::Button(key_label, {key_width, key_height})) {
+            const std::size_t length = std::strlen(g_text_entry_edit);
+            if (length < sizeof(g_text_entry_edit) - 1U) {
+                g_text_entry_edit[length] = kAlphabet[index];
+                g_text_entry_edit[length + 1U] = '\0';
+            }
+        }
+        if (index == 0U && ImGui::IsWindowAppearing()) {
+            ImGui::SetItemDefaultFocus();
+        }
+        if ((index + 1U) % static_cast<std::size_t>(kColumns) != 0U) {
+            ImGui::SameLine();
+        }
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::Dummy({0.0F, 8.0F});
+    const float action_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float action_region_width = ImGui::GetContentRegionAvail().x;
+    const float edit_action_width = std::max(
+        (action_region_width - action_gap * 2.0F) / 3.0F, 1.0F);
+    const float finish_action_width = std::max(
+        (action_region_width - action_gap) * 0.5F, 1.0F);
+    const float action_height = compact ? 38.0F : 44.0F;
+    if (ImGui::Button("SPACE", {edit_action_width, action_height})) {
+        const std::size_t length = std::strlen(g_text_entry_edit);
+        if (length < sizeof(g_text_entry_edit) - 1U) {
+            g_text_entry_edit[length] = ' ';
+            g_text_entry_edit[length + 1U] = '\0';
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("BACKSPACE", {edit_action_width, action_height})) {
+        const std::size_t length = std::strlen(g_text_entry_edit);
+        if (length > 0U) g_text_entry_edit[length - 1U] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("CLEAR", {edit_action_width, action_height})) {
+        g_text_entry_edit[0] = '\0';
+    }
+    ImGui::Dummy({0.0F, 4.0F});
+    if (ImGui::Button("CANCEL", {finish_action_width, action_height})) {
+        g_text_entry_target = TextEntryTarget::None;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    const bool can_accept = spec.allow_empty || g_text_entry_edit[0] != '\0';
+    ImGui::BeginDisabled(!can_accept);
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    if (ImGui::Button(spec.accept, {finish_action_width, action_height})) {
+        CommitTextEntry();
+        g_text_entry_target = TextEntryTarget::None;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
+void DrawOnlineLocalRacer(float width) {
+    ImGui::SeparatorText("YOUR RACER");
+    DrawTextEntryButton("Racer name", TextEntryTarget::RacerName,
+                        std::min(width, 520.0F));
+    DrawOnlineInputProfile(width, false);
+}
+
+void DrawOnlineRaceRules(float width) {
+    using namespace dkr::runtime::netplay;
+    ImGui::SeparatorText("HOST SETTINGS");
+    ImGui::TextWrapped(
+        "These settings are fixed when Player 1 creates the lobby. The "
+        "recommended defaults suit most connections.");
+    ImGui::Dummy({0.0F, 8.0F});
+
+    bool changed = false;
+    changed |= OnlineCombo(
+        "Menu ownership", "##online-menu-ownership", &g_online_host_control,
+        "HOST GUIDES MENUS UNTIL CHARACTER SELECT\0"
+        "HOST CONTROLS SHARED MENUS\0EVERY ASSIGNED PORT\0",
+        std::min(width, 620.0F));
+    ImGui::TextUnformatted("Maximum racers");
+    ImGui::TextColored(kAccent, "2 RACERS - BETA 8");
+    ImGui::TextWrapped(
+        "Three- and four-racer lobbies are temporarily unavailable while "
+        "their synchronization paths are being qualified.");
+    changed |= OnlineCombo(
+        "Synchronization", "##online-synchronization",
+        &g_online_synchronization,
+        "ROLLBACK - RECOMMENDED\0LOCKSTEP - LOW LATENCY ONLY\0",
+        std::min(width, 620.0F));
+
+    const bool rollback_mode =
+        static_cast<SynchronizationMode>(g_online_synchronization) ==
+        SynchronizationMode::Rollback;
+    if (rollback_mode) {
+        ImGui::TextDisabled(
+            "Rollback keeps Quick Join smoother when inputs arrive late.");
+        changed |= OnlineSliderInt(
+            "Rollback window (frames)", "##online-rollback-window",
+            &g_online_rollback_window, 2, 20, 240.0F);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextWrapped(
+            "Lockstep exposes connection variation as stalls. Use it only "
+            "between racers with a very stable, low-latency route.");
+        ImGui::PopStyleColor();
+    }
+    changed |= ImGui::Checkbox(
+        "Automatic input delay", &g_online_automatic_delay);
+    ImGui::BeginDisabled(g_online_automatic_delay);
+    changed |= OnlineSliderInt(
+        "Input delay (frames)", "##online-input-delay",
+        &g_online_manual_delay, 0, 9, 240.0F);
+    ImGui::EndDisabled();
+    changed |= ImGui::Checkbox(
+        "Record deterministic replay", &g_online_record_replay);
+    if (changed) SaveSettings();
+}
+
+ImVec2 OnlineActionButtonSize(const char* label, float minimum_width,
+                              float minimum_height) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 text_size = ImGui::CalcTextSize(label);
+    const float desired_width = std::max(
+        minimum_width,
+        std::ceil(text_size.x + style.FramePadding.x * 2.0F + 24.0F));
+    return {
+        OnlineControlWidth(desired_width),
+        std::max(minimum_height,
+                 std::ceil(text_size.y + style.FramePadding.y * 2.0F + 8.0F))};
+}
+
+bool OnlineButtonsFitOnOneLine(const ImVec2& first, const ImVec2& second) {
+    return first.x + ImGui::GetStyle().ItemSpacing.x + second.x <=
+        ImGui::GetContentRegionAvail().x;
+}
+
+void DrawOnlineCodeKeyboard() {
+    constexpr const char* kPopupName = "ENTER QUICK JOIN CODE";
+    constexpr std::string_view kCodeAlphabet =
+        "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    constexpr int kColumns = 8;
+
+    if (g_online_code_keyboard_pending) {
+        ImGui::OpenPopup(kPopupName);
+        g_online_code_keyboard_pending = false;
+    }
+
+    const ImVec2 display_size = ImGui::GetIO().DisplaySize;
+    const bool compact_keyboard = display_size.y < 700.0F;
+    ImGui::SetNextWindowSize(
+        {std::min(700.0F, std::max(display_size.x - 32.0F, 1.0F)),
+         std::min(640.0F, std::max(display_size.y - 32.0F, 1.0F))},
+        ImGuiCond_Appearing);
+    if (!BeginPaddedModal(
+            kPopupName,
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        if (!ImGui::IsPopupOpen(kPopupName)) {
+            g_online_code_keyboard_visible.store(false,
+                                                  std::memory_order_release);
+        }
+        return;
+    }
+
+    g_online_code_keyboard_visible.store(true, std::memory_order_release);
+    if (g_online_code_keyboard_cancel_requested.exchange(
+            false, std::memory_order_acq_rel)) {
+        ImGui::CloseCurrentPopup();
+        g_online_code_keyboard_visible.store(false,
+                                              std::memory_order_release);
+        ImGui::EndPopup();
+        return;
+    }
+
+    PushHeadingFont();
+    ImGui::TextUnformatted("ENTER QUICK JOIN CODE");
+    PopHeadingFont();
+    ImGui::TextWrapped(
+        "Use the D-pad to choose each character and press A to enter it. "
+        "Quick Join avoids I, O, 1 and 0 so codes are easy to read.");
+    ImGui::Dummy({0.0F, 8.0F});
+
+    ImGui::SetNextItemWidth(-1.0F);
+    {
+        const ControlFontScope scope;
+        ImGui::InputTextWithHint(
+            "##quick-join-code-entry", "FIVE CHARACTERS",
+            g_online_code_entry, sizeof(g_online_code_entry),
+            ImGuiInputTextFlags_CharsUppercase |
+                ImGuiInputTextFlags_CallbackCharFilter,
+            FilterOnlineCodeCharacter);
+    }
+    ImGui::Dummy({0.0F, 8.0F});
+
+    const float spacing = 8.0F;
+    const float keyboard_width = ImGui::GetContentRegionAvail().x;
+    const float key_width = std::max(
+        (keyboard_width - spacing * static_cast<float>(kColumns - 1)) /
+            static_cast<float>(kColumns),
+        1.0F);
+    const float key_height = compact_keyboard ? 34.0F : 44.0F;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, spacing});
+    bool first_key = true;
+    for (std::size_t index = 0U; index < kCodeAlphabet.size(); ++index) {
+        char label[2]{kCodeAlphabet[index], '\0'};
+        if (ImGui::Button(label, {key_width, key_height})) {
+            AppendOnlineCodeCharacter(kCodeAlphabet[index]);
+        }
+        if (first_key && ImGui::IsWindowAppearing()) {
+            ImGui::SetItemDefaultFocus();
+            first_key = false;
+        }
+        if ((index + 1U) % static_cast<std::size_t>(kColumns) != 0U) {
+            ImGui::SameLine();
+        }
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::Dummy({0.0F, 8.0F});
+    constexpr const char* backspace_label = "BACKSPACE";
+    constexpr const char* clear_label = "CLEAR";
+    constexpr const char* cancel_label = "CANCEL";
+    constexpr const char* accept_label = "USE CODE";
+    const float action_spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float action_width = std::max(
+        (ImGui::GetContentRegionAvail().x - action_spacing * 3.0F) * 0.25F,
+        1.0F);
+    const float action_height = compact_keyboard ? 38.0F : 44.0F;
+    if (ImGui::Button(backspace_label, {action_width, action_height})) {
+        BackspaceOnlineCodeCharacter();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(clear_label, {action_width, action_height})) {
+        g_online_code_entry[0] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(cancel_label, {action_width, action_height})) {
+        ImGui::CloseCurrentPopup();
+        g_online_code_keyboard_visible.store(false,
+                                              std::memory_order_release);
+    }
+    ImGui::SameLine();
+    const bool complete = dkr::runtime::netplay::valid_quick_join_code(
+        g_online_code_entry);
+    ImGui::BeginDisabled(!complete);
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    if (ImGui::Button(accept_label, {action_width, action_height})) {
+        if (SetOnlineInvite(g_online_code_entry)) {
+            g_online_action_status = "Quick Join code " +
+                OnlineInviteLobbyToken(g_online_invite) +
+                " entered. Request host approval when ready.";
+        }
+        ImGui::CloseCurrentPopup();
+        g_online_code_keyboard_visible.store(false,
+                                              std::memory_order_release);
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
+void DrawOnlineHostSetup(float width, bool rom_ready) {
+    using namespace dkr::runtime::netplay;
+    DrawOnlineLocalRacer(width);
+    ImGui::Dummy({0.0F, 14.0F});
+
+    ImGui::SeparatorText("CREATE A LOBBY");
+    ImGui::TextWrapped(
+        "Player 1 creates a private room, then shares its five-character "
+        "code with friends.");
+    DrawTextEntryButton("Lobby name", TextEntryTarget::LobbyName,
+                        std::min(width, 520.0F));
+    ImGui::Dummy({0.0F, 8.0F});
+    const bool previous_online_save =
+        dkr::runtime::saves::previous_online_adventure_info().valid;
+    if (OnlineCombo(
+            "Online Adventure save", "##online-save-seed-mode",
+            &g_online_save_seed_mode,
+            "Copy my single-player save\0Start with a fresh save\0Continue with previous session\0\0",
+            std::min(width, 520.0F))) {
+        SaveSettings();
+    }
+    const char* online_save_description = nullptr;
+    switch (static_cast<dkr::runtime::saves::OnlineSaveSeedMode>(
+        g_online_save_seed_mode)) {
+    case dkr::runtime::saves::OnlineSaveSeedMode::CopySinglePlayer:
+        online_save_description =
+            "Copies your current progress byte-for-byte into the online-only save. Your single-player file is never modified.";
+        break;
+    case dkr::runtime::saves::OnlineSaveSeedMode::Fresh:
+        online_save_description =
+            "Starts this online session with a new checksum-valid blank Adventure save.";
+        break;
+    case dkr::runtime::saves::OnlineSaveSeedMode::ContinuePreviousSession:
+        online_save_description = previous_online_save
+            ? "Continues the last host-owned online Adventure save."
+            : "No previous host-owned online session save is available yet.";
+        break;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    ImGui::TextWrapped("%s", online_save_description != nullptr
+        ? online_save_description : "Choose an online Adventure save.");
+    ImGui::PopStyleColor();
+    const bool continue_unavailable =
+        g_online_save_seed_mode == static_cast<int>(
+            dkr::runtime::saves::OnlineSaveSeedMode::ContinuePreviousSession) &&
+        !previous_online_save;
+    ImGui::BeginDisabled(!rom_ready || continue_unavailable);
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    constexpr const char* create_label = "CREATE QUICK JOIN LOBBY";
+    if (ImGui::Button(create_label,
+                      OnlineActionButtonSize(create_label, 420.0F, 48.0F))) {
+        CreateOnlineLobby();
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+}
+
+void DrawOnlineJoinSetup(float width, bool rom_ready) {
+    using namespace dkr::runtime::netplay;
+    DrawOnlineLocalRacer(width);
+    ImGui::Dummy({0.0F, 14.0F});
+    ImGui::SeparatorText("JOIN A FRIEND");
+    ImGui::TextWrapped(
+        "Enter the current code from Player 1. The host must approve every "
+        "join request.");
+    {
+        const ControlFontScope scope;
+        const char* code_text = g_online_invite[0] != '\0'
+            ? g_online_invite : "PRESS A TO ENTER CODE";
+        const float code_width = std::min(width, 360.0F);
+        ImGui::PushID("quick-join-code-entry");
+        if (ImGui::Button(code_text, {code_width, ImGui::GetFrameHeight()})) {
+            RequestOnlineCodeKeyboard();
+        }
+        ImGui::PopID();
+    }
+    ImGui::TextDisabled(
+        "Select the code box with a mouse or controller to open the on-screen keyboard.");
+    constexpr const char* paste_label = "PASTE CODE";
+    constexpr const char* request_label = "REQUEST TO JOIN";
+    const ImVec2 paste_size =
+        OnlineActionButtonSize(paste_label, 180.0F, 42.0F);
+    const ImVec2 request_size =
+        OnlineActionButtonSize(request_label, 210.0F, 42.0F);
+    const bool actions_share_line =
+        OnlineButtonsFitOnOneLine(paste_size, request_size);
+    if (ImGui::Button(paste_label, paste_size)) {
+        PasteOnlineInviteFromClipboard();
+    }
+    if (actions_share_line) ImGui::SameLine();
+    ImGui::BeginDisabled(!rom_ready || g_online_invite[0] == '\0');
+    if (ImGui::Button(request_label, request_size)) {
+        std::string error;
+        const std::string verified_invite =
+            NormalizeOnlineInvite(g_online_invite);
+        if (!SetOnlineInvite(verified_invite)) {
+            g_online_action_status =
+                "Enter the current five-character Quick Join code from Player 1.";
+        } else if (!session().join(verified_invite, g_online_player_name,
+                                   error)) {
+            g_online_action_status = error;
+        }
+    }
+    ImGui::EndDisabled();
+    DrawOnlineCodeKeyboard();
+}
+
+void DrawOnlineConnectionStatus(
+        const dkr::runtime::netplay::SessionView& view) {
+    using namespace dkr::runtime::netplay;
+    ImGui::SeparatorText("CONNECTION STATUS");
+    ImGui::TextWrapped("%s", view.status.c_str());
+    ImGui::TextDisabled(
+        "Encrypted Quick Join peer connection. Host is always Player 1.");
+
+    if (view.state == ConnectionState::Hosting ||
+        view.state == ConnectionState::Connecting ||
+        view.state == ConnectionState::AwaitingApproval) {
+        ImGui::Dummy({0.0F, 8.0F});
+        ImGui::SeparatorText("ADMISSION");
+        ImGui::TextDisabled(
+            "Sent %llu - received %llu - recognized %llu - accepted %llu.",
+            static_cast<unsigned long long>(view.packets_sent),
+            static_cast<unsigned long long>(view.packets_received),
+            static_cast<unsigned long long>(view.join_packets_recognized),
+            static_cast<unsigned long long>(view.join_packets_accepted));
+        ImGui::TextDisabled(
+            "Stale %llu - authentication rejected %llu - compatibility rejected %llu - queued %zu.",
+            static_cast<unsigned long long>(view.join_packets_stale),
+            static_cast<unsigned long long>(view.join_packets_auth_rejected),
+            static_cast<unsigned long long>(view.join_packets_manifest_rejected),
+            view.admission_packets_queued);
+    }
+
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::SeparatorText("SYNCHRONIZATION");
+    ImGui::TextDisabled("Mode: %s.",
+        view.room.rules.synchronization == SynchronizationMode::Rollback
+            ? "ROLLBACK" : "LOCKSTEP");
+    ImGui::TextDisabled("Effective input delay: %u frame%s.",
+        view.input_delay_frames, view.input_delay_frames == 1U ? "" : "s");
+    if (view.state == ConnectionState::Running) {
+        if (view.room.rules.synchronization ==
+            SynchronizationMode::Rollback) {
+            const auto rollback = rollback_metrics();
+            ImGui::TextDisabled(
+                "Rollback: frame %u - %u correction%s - %u replayed frame%s - largest %u frame%s.",
+                rollback.simulation_frame,
+                rollback.rollback_count,
+                rollback.rollback_count == 1U ? "" : "s",
+                rollback.replayed_frames,
+                rollback.replayed_frames == 1U ? "" : "s",
+                rollback.largest_rollback,
+                rollback.largest_rollback == 1U ? "" : "s");
+            ImGui::TextDisabled(
+                "Prediction lead: %.1f frame%s (window %u).",
+                rollback.frames_ahead,
+                rollback.frames_ahead == 1.0F ? "" : "s",
+                view.room.rules.rollback_window);
+        }
+        ImGui::TextDisabled(
+            "Network: %u ms RTT - %u ms jitter - %.1f%% recent loss - %u input stall%s.",
+            view.network_rtt_ms, view.network_jitter_ms,
+            view.network_loss_percent, view.input_stalls,
+            view.input_stalls == 1U ? "" : "s");
+        if (view.input_stalls > 0U) {
+            ImGui::TextDisabled("Longest input wait: %u ms.",
+                                view.longest_input_stall_ms);
+        }
+        if (view.recovering) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+            ImGui::TextWrapped(
+                "Connection variation detected. DKR-R is preparing a "
+                "synchronized recovery point; keep racing.");
+            ImGui::PopStyleColor();
+        }
+    }
+    if (view.rollback_certified) {
+        ImGui::TextDisabled(
+            "Determinism guard verified (%u synchronized correction%s).",
+            view.authoritative_corrections,
+            view.authoritative_corrections == 1U ? "" : "s");
+    } else if (view.state == ConnectionState::Running) {
+        ImGui::TextDisabled("Waiting for Player 1 authority validation...");
+    }
+    if (view.last_verified_frame > 0U) {
+        ImGui::TextDisabled(
+            "Determinism verified through simulation frame %u.",
+            view.last_verified_frame);
+    }
+}
+
+void CopyFriendCodeToClipboard(std::string_view code) {
+    const std::string normalized =
+        dkr::runtime::netplay::normalize_friend_code(code);
+    const std::string clipboard_text(code);
+    if (normalized.empty() || SDL_SetClipboardText(clipboard_text.c_str()) != 0) {
+        g_online_action_status = "The Friend Code could not be copied.";
+        return;
+    }
+    g_online_action_status = "Friend Code copied. Share it only with racers you trust.";
+}
+
+void PasteFriendCodeFromClipboard() {
+    char* clipboard = SDL_GetClipboardText();
+    if (clipboard == nullptr) {
+        g_online_action_status = "The clipboard does not contain a Friend Code.";
+        return;
+    }
+    const std::string normalized =
+        dkr::runtime::netplay::normalize_friend_code(clipboard);
+    SDL_free(clipboard);
+    if (normalized.empty() || normalized.size() >= sizeof(g_friend_code_entry)) {
+        g_online_action_status = "The clipboard does not contain a valid Friend Code.";
+        return;
+    }
+    if (normalized.size() == 8U) {
+        const std::string formatted = "DKR-" + normalized;
+        std::memcpy(g_friend_code_entry, formatted.data(), formatted.size());
+        g_friend_code_entry[formatted.size()] = '\0';
+    } else {
+        // Legacy codes remain pasteable even though new codes use the short
+        // controller-friendly format.
+        std::memcpy(g_friend_code_entry, normalized.data(), normalized.size());
+        g_friend_code_entry[normalized.size()] = '\0';
+    }
+}
+
+void DrawFriendCodeKeyboard() {
+    constexpr const char* kPopupName = "ADD A DKR-R FRIEND";
+    constexpr std::string_view kAlphabet =
+        "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    constexpr int kColumns = 8;
+    if (g_friend_code_keyboard_pending) {
+        if (g_friend_code_entry[0] == '\0') {
+            std::memcpy(g_friend_code_entry, "DKR-", 5U);
+        }
+        ImGui::OpenPopup(kPopupName);
+        g_friend_code_keyboard_pending = false;
+    }
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(
+        {std::min(760.0F, std::max(display.x - 32.0F, 1.0F)),
+         std::min(690.0F, std::max(display.y - 32.0F, 1.0F))},
+        ImGuiCond_Appearing);
+    if (!BeginPaddedModal(kPopupName,
+                          ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+    PushHeadingFont();
+    ImGui::TextUnformatted("ADD A DKR-R FRIEND");
+    PopHeadingFont();
+    ImGui::TextWrapped(
+        "Paste the secure Friend Code, or enter its eight characters with "
+        "the controller. DKR-R supplies the DKR- prefix automatically. "
+        "The request is delivered when both racers are online.");
+    ImGui::SetNextItemWidth(-1.0F);
+    {
+        const ControlFontScope scope;
+        ImGui::InputText("##friend-code", g_friend_code_entry,
+                         sizeof(g_friend_code_entry),
+                         ImGuiInputTextFlags_CharsUppercase);
+    }
+    const float spacing = 8.0F;
+    const float key_width = std::max(
+        (ImGui::GetContentRegionAvail().x - spacing * (kColumns - 1)) /
+            static_cast<float>(kColumns),
+        1.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, spacing});
+    for (std::size_t index = 0U; index < kAlphabet.size(); ++index) {
+        char label[2]{kAlphabet[index], '\0'};
+        if (ImGui::Button(label, {key_width, 42.0F})) {
+            const std::size_t length = std::strlen(g_friend_code_entry);
+            const bool short_entry = std::string_view(g_friend_code_entry)
+                                         .starts_with("DKR-");
+            if (length + 1U < sizeof(g_friend_code_entry) &&
+                (!short_entry || length < 12U)) {
+                g_friend_code_entry[length] = kAlphabet[index];
+                g_friend_code_entry[length + 1U] = '\0';
+            }
+        }
+        if (index == 0U && ImGui::IsWindowAppearing()) {
+            ImGui::SetItemDefaultFocus();
+        }
+        if ((index + 1U) % kColumns != 0U) ImGui::SameLine();
+    }
+    ImGui::PopStyleVar();
+    ImGui::Dummy({0.0F, 6.0F});
+    const float action_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float action_width = std::max(
+        (ImGui::GetContentRegionAvail().x - action_gap * 3.0F) * 0.25F,
+        1.0F);
+    if (ImGui::Button("PASTE", {action_width, 42.0F})) {
+        PasteFriendCodeFromClipboard();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("BACKSPACE", {action_width, 42.0F})) {
+        const std::size_t length = std::strlen(g_friend_code_entry);
+        const std::size_t minimum =
+            std::string_view(g_friend_code_entry).starts_with("DKR-") ? 4U : 0U;
+        if (length > minimum) g_friend_code_entry[length - 1U] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("CANCEL", {action_width, 42.0F})) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    const bool valid = dkr::runtime::netplay::valid_friend_code(
+        g_friend_code_entry);
+    ImGui::BeginDisabled(!valid);
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    if (ImGui::Button("SEND REQUEST", {action_width, 42.0F})) {
+        std::string error;
+        if (dkr::runtime::netplay::friend_service().submit_friend_code(
+                g_friend_code_entry, error)) {
+            g_friend_code_entry[0] = '\0';
+            g_online_action_status =
+                "Friend request queued. It will arrive when that racer is online.";
+            ImGui::CloseCurrentPopup();
+        } else {
+            g_online_action_status = error;
+        }
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    ImGui::EndPopup();
+}
+
+void RequestFriendSearchKeyboard() {
+    std::memcpy(g_friend_search_edit, g_friend_search,
+                sizeof(g_friend_search_edit));
+    g_friend_search_edit[sizeof(g_friend_search_edit) - 1U] = '\0';
+    g_friend_search_keyboard_pending = true;
+}
+
+void AppendFriendSearchCharacter(char character) {
+    const std::size_t length = std::strlen(g_friend_search_edit);
+    if (length >= sizeof(g_friend_search_edit) - 1U) return;
+    g_friend_search_edit[length] = character;
+    g_friend_search_edit[length + 1U] = '\0';
+}
+
+void DrawFriendSearchKeyboard() {
+    constexpr const char* kPopupName = "SEARCH DKR-R FRIENDS";
+    constexpr std::string_view kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.'";
+    constexpr int kColumns = 8;
+
+    if (g_friend_search_keyboard_pending) {
+        ImGui::OpenPopup(kPopupName);
+        g_friend_search_keyboard_pending = false;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const bool compact = display.y < 700.0F;
+    ImGui::SetNextWindowSize(
+        {std::min(760.0F, std::max(display.x - 32.0F, 1.0F)),
+         std::min(690.0F, std::max(display.y - 32.0F, 1.0F))},
+        ImGuiCond_Appearing);
+    if (!BeginPaddedModal(kPopupName,
+                          ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+
+    PushHeadingFont();
+    ImGui::TextUnformatted("SEARCH DKR-R FRIENDS");
+    PopHeadingFont();
+    ImGui::TextWrapped(
+        "Use the D-pad and A button to enter a racer's name or nickname. "
+        "Every letter and number is available; spaces and common name "
+        "characters are included too.");
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::SetNextItemWidth(-1.0F);
+    {
+        const ControlFontScope scope;
+        ImGui::InputTextWithHint("##friend-search-edit", "FRIEND NAME",
+                                 g_friend_search_edit,
+                                 sizeof(g_friend_search_edit));
+    }
+    ImGui::Dummy({0.0F, 8.0F});
+
+    const float spacing = 8.0F;
+    const float key_width = std::max(
+        (ImGui::GetContentRegionAvail().x -
+         spacing * static_cast<float>(kColumns - 1)) /
+            static_cast<float>(kColumns),
+        1.0F);
+    const float key_height = compact ? 34.0F : 42.0F;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {spacing, spacing});
+    for (std::size_t index = 0U; index < kAlphabet.size(); ++index) {
+        char label[2]{kAlphabet[index], '\0'};
+        if (ImGui::Button(label, {key_width, key_height})) {
+            AppendFriendSearchCharacter(kAlphabet[index]);
+        }
+        if (index == 0U && ImGui::IsWindowAppearing()) {
+            ImGui::SetItemDefaultFocus();
+        }
+        if ((index + 1U) % static_cast<std::size_t>(kColumns) != 0U) {
+            ImGui::SameLine();
+        }
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::Dummy({0.0F, 8.0F});
+    constexpr const char* space_label = "SPACE";
+    constexpr const char* backspace_label = "BACKSPACE";
+    constexpr const char* clear_label = "CLEAR";
+    constexpr const char* cancel_label = "CANCEL";
+    constexpr const char* search_label = "SEARCH";
+    const float action_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float action_width = std::max(
+        (ImGui::GetContentRegionAvail().x - action_gap * 4.0F) * 0.20F,
+        1.0F);
+    const float action_height = compact ? 38.0F : 44.0F;
+    if (ImGui::Button(space_label, {action_width, action_height})) {
+        AppendFriendSearchCharacter(' ');
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(backspace_label, {action_width, action_height})) {
+        const std::size_t length = std::strlen(g_friend_search_edit);
+        if (length > 0U) g_friend_search_edit[length - 1U] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(clear_label, {action_width, action_height})) {
+        g_friend_search_edit[0] = '\0';
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(cancel_label, {action_width, action_height})) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+    if (ImGui::Button(search_label, {action_width, action_height})) {
+        std::memcpy(g_friend_search, g_friend_search_edit,
+                    sizeof(g_friend_search));
+        g_friend_search[sizeof(g_friend_search) - 1U] = '\0';
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndPopup();
+}
+
+void DrawFriendInvitations(float width);
+
+void DrawOnlineProfile(float width) {
+    using namespace dkr::runtime::netplay;
+    FriendService& service = friend_service();
+    ImGui::SeparatorText("ONLINE PROFILE");
+    ImGui::TextWrapped(
+        "Your display name and private identity stay on this device and are "
+        "retained between DKR-R updates.");
+    DrawTextEntryButton("Display name", TextEntryTarget::OnlineProfileName,
+                        std::min(width, 520.0F));
+    constexpr const char* save_label = "SAVE ONLINE PROFILE";
+    if (ImGui::Button(save_label,
+                      OnlineActionButtonSize(save_label, 260.0F, 44.0F))) {
+        std::string error;
+        if (service.set_display_name(g_online_profile_name, error)) {
+            std::memcpy(g_online_player_name, g_online_profile_name,
+                        sizeof(g_online_player_name));
+            g_online_player_name[sizeof(g_online_player_name) - 1U] = '\0';
+            SaveSettings();
+            g_online_action_status = "Online Profile saved.";
+        } else {
+            g_online_action_status = error;
+        }
+    }
+    ImGui::Dummy({0.0F, 12.0F});
+    ImGui::SeparatorText("PRIVACY");
+    bool appear_offline = service.appear_offline();
+    if (ImGui::Checkbox("Appear offline", &appear_offline)) {
+        std::string error;
+        if (service.set_appear_offline(appear_offline, error)) {
+            g_online_action_status = appear_offline
+                ? "You now appear offline. Your hosted lobby is hidden from friends."
+                : "You now appear online to friends.";
+        } else {
+            g_online_action_status = error;
+        }
+    }
+    ImGui::TextDisabled(
+        "Appearing offline hides your status and hosted lobby. Manual Quick Join still works.");
+    bool allow_lobby_invites = service.allow_lobby_invites();
+    if (ImGui::Checkbox("Allow friend lobby invites", &allow_lobby_invites)) {
+        std::string error;
+        if (service.set_allow_lobby_invites(allow_lobby_invites, error)) {
+            g_online_action_status = allow_lobby_invites
+                ? "Friend lobby invitations are enabled."
+                : "Friend lobby invitations are disabled.";
+        } else {
+            g_online_action_status = error;
+        }
+    }
+    ImGui::TextDisabled(
+        "When disabled, incoming one-click lobby invitations are declined. Quick Join remains available.");
+    ImGui::Dummy({0.0F, 12.0F});
+    ImGui::SeparatorText("DEVICE IDENTITY");
+    ImGui::TextDisabled("%s", service.identity_label().c_str());
+    ImGui::TextWrapped(
+        "This short label helps distinguish duplicate names. DKR-R never "
+        "shows controller serial numbers, operating-system paths or hardware IDs.");
+    ImGui::TextColored(service.presence_available() ? kAccent : kWarm, "%s",
+                       service.status().c_str());
+    ImGui::Dummy({0.0F, 14.0F});
+    ImGui::SeparatorText("LOCAL CONTROLS");
+    ImGui::TextWrapped(
+        "Choose which local controller profile is sent when you host or join an online race.");
+    DrawOnlineInputProfile(width, true);
+    ImGui::Dummy({0.0F, 14.0F});
+    ImGui::SeparatorText("FRIEND NOTIFICATIONS");
+    if (ImGui::Checkbox("Tell me when a friend comes online",
+                        &g_friend_online_notifications)) {
+        SaveSettings();
+    }
+    if (OnlineCombo("Online alert position", "##online-alert-position",
+                    &g_friend_online_notification_position,
+                    "TOP LEFT\0TOP RIGHT\0BOTTOM LEFT\0BOTTOM RIGHT\0",
+                    std::min(width, 420.0F))) {
+        g_friend_online_notification_position = std::clamp(
+            g_friend_online_notification_position, 0, 3);
+        SaveSettings();
+    }
+    ImGui::TextDisabled(
+        "Friend presence alerts respect the option above. Lobby invitations "
+        "always use this corner so an invitation cannot be missed.");
+    ImGui::Dummy({0.0F, 10.0F});
+    if (ImGui::Button("READ THE ONLINE MP GUIDE",
+                      {std::min(width, 340.0F), 44.0F})) {
+        g_online_guide_reopen_requested = true;
+    }
+    ImGui::Dummy({0.0F, 14.0F});
+    DrawFriendInvitations(width);
+}
+
+void DrawFriendInvitations(float width) {
+    using namespace dkr::runtime::netplay;
+    FriendService& service = friend_service();
+    ImGui::SeparatorText("SHARE A FRIEND CODE");
+    ImGui::TextWrapped(
+        "Friend Codes establish a trusted connection. They do not bypass "
+        "the host approval prompt used when joining a lobby.");
+    OnlineCombo("Code lifetime", "##online-friend-code-lifetime",
+                &g_friend_invite_lifetime,
+                "PERMANENT\0ONE USE\0TIMED\0", std::min(width, 420.0F));
+    if (g_friend_invite_lifetime == 2) {
+        OnlineSliderInt("Active minutes", "##online-friend-code-minutes",
+                        &g_friend_invite_minutes, 1, 60 * 24 * 30, 260.0F,
+                        "%d", ImGuiSliderFlags_AlwaysClamp);
+    }
+    constexpr const char* generate_label = "GENERATE FRIEND CODE";
+    if (ImGui::Button(generate_label,
+                      OnlineActionButtonSize(generate_label, 260.0F, 44.0F))) {
+        FriendInviteView invite{};
+        std::string error;
+        const FriendInviteLifetime lifetime =
+            static_cast<FriendInviteLifetime>(
+                std::clamp(g_friend_invite_lifetime, 0, 2));
+        if (service.create_invite(lifetime,
+                                  std::chrono::minutes(g_friend_invite_minutes),
+                                  invite, error)) {
+            CopyFriendCodeToClipboard(invite.code);
+        } else {
+            g_online_action_status = error;
+        }
+    }
+    for (const FriendInviteView& invite : service.invitations()) {
+        ImGui::PushID(static_cast<int>(invite.invite_id & 0x7FFFFFFFU));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              {0.045F, 0.18F, 0.25F, 0.96F});
+        BeginPaddedChild("friend-invite", {width, 150.0F}, true,
+                         ImGuiWindowFlags_NoScrollbar, {16.0F, 14.0F});
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
+        ImGui::TextWrapped("%s", invite.code.c_str());
+        ImGui::PopTextWrapPos();
+        const char* lifetime = invite.lifetime == FriendInviteLifetime::Permanent
+            ? "PERMANENT" : invite.lifetime == FriendInviteLifetime::SingleUse
+                ? "ONE USE" : "TIMED";
+        ImGui::TextDisabled("%s", lifetime);
+        if (ImGui::Button("COPY", {120.0F, 36.0F})) {
+            CopyFriendCodeToClipboard(invite.code);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("REVOKE", {130.0F, 36.0F})) {
+            std::string error;
+            if (!service.revoke_invite(invite.invite_id, error)) {
+                g_online_action_status = error;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+}
+
+std::string FriendDisplayLabel(const dkr::runtime::netplay::FriendView& racer) {
+    return racer.nickname.empty() ? racer.display_name : racer.nickname;
+}
+
+std::string LowerAscii(std::string_view text) {
+    std::string result(text);
+    std::transform(result.begin(), result.end(), result.begin(), [](char value) {
+        return static_cast<char>(std::tolower(
+            static_cast<unsigned char>(value)));
+    });
+    return result;
+}
+
+const char* FriendLobbyInviteStatusLabel(
+    dkr::runtime::netplay::FriendLobbyInviteStatus status) {
+    using dkr::runtime::netplay::FriendLobbyInviteStatus;
+    switch (status) {
+        case FriendLobbyInviteStatus::Sent: return "SENT";
+        case FriendLobbyInviteStatus::Delivered: return "DELIVERED";
+        case FriendLobbyInviteStatus::Accepted: return "ACCEPTED";
+        case FriendLobbyInviteStatus::Declined: return "DECLINED";
+        case FriendLobbyInviteStatus::Expired: return "EXPIRED";
+        case FriendLobbyInviteStatus::Cancelled: return "CANCELLED";
+    }
+    return "UNKNOWN";
+}
+
+dkr::runtime::netplay::FriendLobbyAdvertisement FriendLobbyFromSession(
+    const dkr::runtime::netplay::SessionView& view) {
+    using namespace dkr::runtime::netplay;
+    FriendLobbyAdvertisement advertisement{};
+    advertisement.hosting = session().active() && view.host &&
+        (view.state == ConnectionState::Hosting ||
+         view.state == ConnectionState::Lobby) &&
+        !view.lobby_locked && valid_quick_join_code(view.invite);
+    advertisement.quick_join_code = advertisement.hosting
+        ? view.invite : std::string{};
+    advertisement.maximum_players = view.room.rules.maximum_players;
+    advertisement.synchronization =
+        view.room.rules.synchronization == SynchronizationMode::Rollback
+            ? "Rollback" : "Lockstep";
+    advertisement.compatibility = DKR_NETWORK_RELEASE_VERSION;
+    for (const Player& player : view.room.players) {
+        if (player.occupied) ++advertisement.players;
+    }
+    return advertisement;
+}
+
+void DrawFriends(float width) {
+    using namespace dkr::runtime::netplay;
+    FriendService& service = friend_service();
+    const auto requests = service.pending_requests();
+    const bool have_incoming = std::any_of(
+        requests.begin(), requests.end(),
+        [](const FriendRequestView& request) { return request.incoming; });
+    if (have_incoming) {
+        ImGui::Dummy({0.0F, 14.0F});
+        ImGui::SeparatorText("FRIEND REQUESTS");
+        for (const FriendRequestView& request : requests) {
+            if (!request.incoming) continue;
+            ImGui::PushID(static_cast<int>(request.request_id & 0x7FFFFFFFU));
+            ImGui::Text("%s", request.display_name.c_str());
+            if (ImGui::Button("ACCEPT", {130.0F, 38.0F})) {
+                std::string error;
+                if (!service.accept_request(request.request_id, error))
+                    g_online_action_status = error;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("DECLINE", {130.0F, 38.0F})) {
+                std::string error;
+                if (!service.reject_request(request.request_id, false, error))
+                    g_online_action_status = error;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("BLOCK", {130.0F, 38.0F})) {
+                std::string error;
+                if (!service.reject_request(request.request_id, true, error))
+                    g_online_action_status = error;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::SeparatorText("FRIENDS");
+    const float friends_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    constexpr const char* add_label = "ADD FRIEND";
+    if (ImGui::Button(add_label, {friends_width, 44.0F})) {
+        if (g_friend_code_entry[0] == '\0') {
+            std::memcpy(g_friend_code_entry, "DKR-", 5U);
+        }
+        g_friend_code_keyboard_pending = true;
+    }
+    DrawFriendCodeKeyboard();
+    ImGui::Dummy({0.0F, 6.0F});
+    const int toolbar_columns = friends_width >= 720.0F ? 3 : 1;
+    if (ImGui::BeginTable("friends-toolbar", toolbar_columns,
+                          ImGuiTableFlags_SizingStretchSame,
+                          {friends_width, 0.0F})) {
+        ImGui::TableNextColumn();
+        {
+            const ControlFontScope scope;
+            const char* search_text = g_friend_search[0] != '\0'
+                ? g_friend_search : "SEARCH FRIENDS...";
+            if (ImGui::Button(search_text,
+                              {-1.0F, ImGui::GetFrameHeight()})) {
+                RequestFriendSearchKeyboard();
+            }
+        }
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1.0F);
+        ControlCombo("##friend-filter", &g_friend_filter,
+                     "ALL FRIENDS\0ONLINE\0OFFLINE\0BLOCKED\0");
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1.0F);
+        ControlCombo("##friend-sort", &g_friend_sort,
+                     "ONLINE FIRST\0NAME A-Z\0NAME Z-A\0RECENTLY SEEN\0");
+        ImGui::EndTable();
+    }
+    DrawFriendSearchKeyboard();
+
+    std::vector<FriendView> racers = service.friends(true);
+    const std::string query = LowerAscii(g_friend_search);
+    racers.erase(std::remove_if(racers.begin(), racers.end(),
+        [&](const FriendView& racer) {
+            const bool filter_match = g_friend_filter == 0 ||
+                (g_friend_filter == 1 && racer.online && !racer.blocked) ||
+                (g_friend_filter == 2 && !racer.online && !racer.blocked) ||
+                (g_friend_filter == 3 && racer.blocked);
+            if (!filter_match) return true;
+            if (query.empty()) return false;
+            const std::string searchable = LowerAscii(
+                FriendDisplayLabel(racer) + " " + racer.display_name + " " +
+                racer.identity);
+            return searchable.find(query) == std::string::npos;
+        }), racers.end());
+    const auto name_less = [](const FriendView& left, const FriendView& right) {
+        return LowerAscii(FriendDisplayLabel(left)) <
+               LowerAscii(FriendDisplayLabel(right));
+    };
+    if (g_friend_sort == 1) {
+        std::stable_sort(racers.begin(), racers.end(), name_less);
+    } else if (g_friend_sort == 2) {
+        std::stable_sort(racers.begin(), racers.end(),
+            [&](const FriendView& left, const FriendView& right) {
+                return name_less(right, left);
+            });
+    } else if (g_friend_sort == 3) {
+        std::stable_sort(racers.begin(), racers.end(),
+            [](const FriendView& left, const FriendView& right) {
+                return left.last_seen_unix > right.last_seen_unix;
+            });
+    } else {
+        std::stable_sort(racers.begin(), racers.end(),
+            [&](const FriendView& left, const FriendView& right) {
+                if (left.blocked != right.blocked) return !left.blocked;
+                if (left.online != right.online) return left.online;
+                return name_less(left, right);
+            });
+    }
+
+    if (racers.empty()) {
+        ImGui::TextDisabled(query.empty()
+            ? "No friends match this filter."
+            : "No friends match that search.");
+    }
+    const int card_columns = friends_width >= 840.0F
+        ? 3 : friends_width >= 560.0F ? 2 : 1;
+    if (!racers.empty() &&
+        ImGui::BeginTable("friend-card-grid", card_columns,
+                          ImGuiTableFlags_SizingStretchSame,
+                          {friends_width, 0.0F})) {
+        for (const FriendView& racer : racers) {
+            ImGui::TableNextColumn();
+            ImGui::PushID(racer.identity.c_str());
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                  {0.045F, 0.18F, 0.25F, 0.96F});
+            constexpr ImVec2 kFriendCardPadding{16.0F, 16.0F};
+            const float friend_card_width = std::max(
+                ImGui::GetContentRegionAvail().x, 1.0F);
+            const float friend_card_inner_width = std::max(
+                friend_card_width - kFriendCardPadding.x * 2.0F, 1.0F);
+            const std::string label = FriendDisplayLabel(racer);
+            const std::string secondary = !racer.nickname.empty()
+                ? "Racer: " + racer.display_name : racer.identity;
+            const float friend_card_height = std::max(
+                248.0F,
+                PaddedCardHeight(
+                    {WrappedTextHeight(label, friend_card_inner_width),
+                     WrappedTextHeight(secondary, friend_card_inner_width),
+                     ImGui::GetTextLineHeight(), 36.0F, 36.0F},
+                    kFriendCardPadding));
+            if (BeginPaddedChild("friend-card",
+                    {0.0F, friend_card_height}, true,
+                    ImGuiWindowFlags_NoScrollbar |
+                        ImGuiWindowFlags_NoScrollWithMouse,
+                    kFriendCardPadding)) {
+                ImGui::TextWrapped("%s", label.c_str());
+                DrawDisabledWrapped(secondary);
+                if (racer.blocked) {
+                    ImGui::TextColored(kRaceRed, "BLOCKED");
+                } else {
+                    ImGui::TextColored(racer.online ? kAccent : kMuted,
+                                       "%s", racer.online ? "ONLINE" : "OFFLINE");
+                }
+                if (ImGui::Button("SET NICKNAME", {-1.0F, 36.0F})) {
+                    g_friend_action_identity = racer.identity;
+                    const std::size_t length = std::min(
+                        racer.nickname.size(), sizeof(g_friend_nickname) - 1U);
+                    std::memcpy(g_friend_nickname, racer.nickname.data(), length);
+                    g_friend_nickname[length] = '\0';
+                    RequestTextEntryKeyboard(TextEntryTarget::FriendNickname);
+                }
+                if (racer.blocked) {
+                    if (ImGui::Button("UNBLOCK", {-1.0F, 36.0F})) {
+                        std::string error;
+                        if (!service.unblock_friend(racer.identity, error))
+                            g_online_action_status = error;
+                    }
+                } else {
+                    const float action_gap = ImGui::GetStyle().ItemSpacing.x;
+                    const float action_width = std::max(
+                        (ImGui::GetContentRegionAvail().x - action_gap) * 0.5F,
+                        1.0F);
+                    if (ImGui::Button("REMOVE", {action_width, 36.0F})) {
+                        g_friend_action_identity = racer.identity;
+                        g_friend_remove_pending = true;
+                    }
+                    ImGui::SameLine(0.0F, action_gap);
+                    if (ImGui::Button("BLOCK", {action_width, 36.0F})) {
+                        g_friend_action_identity = racer.identity;
+                        g_friend_block_pending = true;
+                    }
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (g_friend_remove_pending) {
+        ImGui::OpenPopup("Remove DKR-R friend?");
+        g_friend_remove_pending = false;
+    }
+    if (g_friend_block_pending) {
+        ImGui::OpenPopup("Block DKR-R racer?");
+        g_friend_block_pending = false;
+    }
+    if (BeginPaddedModal("Remove DKR-R friend?",
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Remove this racer? They must exchange another Friend Code to return.");
+        if (ImGui::Button("CANCEL", {130.0F, 40.0F}))
+            ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("REMOVE", {140.0F, 40.0F})) {
+            std::string error;
+            if (!service.remove_friend(g_friend_action_identity, error))
+                g_online_action_status = error;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (BeginPaddedModal("Block DKR-R racer?",
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Block this racer? Their presence and hosted lobbies will be hidden.");
+        if (ImGui::Button("CANCEL", {130.0F, 40.0F}))
+            ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+        if (ImGui::Button("BLOCK", {140.0F, 40.0F})) {
+            std::string error;
+            if (!service.block_friend(g_friend_action_identity, error))
+                g_online_action_status = error;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleColor();
+        ImGui::EndPopup();
+    }
+}
+
+void DrawOpenFriendLobbies(float width, bool launcher, bool rom_ready,
+                           bool session_active) {
+    using namespace dkr::runtime::netplay;
+    ImGui::SeparatorText("OPEN LOBBIES");
+    ImGui::TextWrapped(
+        "Invitations appear first. Other lobbies hosted by online friends "
+        "remain available as ordinary join requests.");
+    const auto incoming = friend_service().incoming_lobby_invites();
+    for (const FriendLobbyInviteView& invite : incoming) {
+        if (invite.status == FriendLobbyInviteStatus::Expired ||
+            invite.status == FriendLobbyInviteStatus::Cancelled) continue;
+        ImGui::PushID(static_cast<int>(invite.invite_id & 0x7FFFFFFFU));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              {0.12F, 0.12F, 0.025F, 0.98F});
+        constexpr ImVec2 kLobbyCardPadding{16.0F, 14.0F};
+        const float invite_card_width = std::max(
+            std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+        const float invite_inner_width = std::max(
+            invite_card_width - kLobbyCardPadding.x * 2.0F, 1.0F);
+        const std::string invite_heading =
+            "INVITED BY " + invite.friend_display_name;
+        std::ostringstream invite_summary_stream;
+        invite_summary_stream << invite.lobby_code << "  -  "
+                              << invite.players << " / "
+                              << invite.maximum_players << " racers  -  "
+                              << invite.synchronization;
+        const std::string invite_summary = invite_summary_stream.str();
+        const bool compatible =
+            invite.compatibility == DKR_NETWORK_RELEASE_VERSION;
+        constexpr std::string_view kIncompatibleInvite =
+            "This invitation was created by a different DKR-R network build.";
+        const bool delivered =
+            invite.status == FriendLobbyInviteStatus::Delivered;
+        const float invite_action_gap = ImGui::GetStyle().ItemSpacing.x;
+        const bool stack_invite_actions = invite_inner_width < 370.0F;
+        const float invite_action_height = delivered
+            ? (stack_invite_actions
+                   ? 40.0F * 2.0F + ImGui::GetStyle().ItemSpacing.y
+                   : 40.0F)
+            : ImGui::GetTextLineHeight();
+        const float invite_card_height = std::max(
+            154.0F,
+            PaddedCardHeight(
+                {WrappedTextHeight(invite_heading, invite_inner_width),
+                 WrappedTextHeight(invite_summary, invite_inner_width),
+                 compatible ? 0.0F
+                            : WrappedTextHeight(kIncompatibleInvite,
+                                                invite_inner_width),
+                 invite_action_height},
+                kLobbyCardPadding));
+        BeginPaddedChild("friend-lobby-invitation",
+                         {invite_card_width, invite_card_height}, true,
+                         ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoScrollWithMouse,
+                         kLobbyCardPadding);
+        DrawColoredWrapped(kWarm, invite_heading);
+        DrawDisabledWrapped(invite_summary);
+        if (!compatible) {
+            DrawColoredWrapped(kRaceRed, kIncompatibleInvite);
+        }
+        if (delivered) {
+            std::string error;
+            const float invite_action_region =
+                ImGui::GetContentRegionAvail().x;
+            const float accept_width = stack_invite_actions
+                ? invite_action_region
+                : std::max((invite_action_region - invite_action_gap) * 0.60F,
+                           1.0F);
+            const float decline_width = stack_invite_actions
+                ? invite_action_region
+                : std::max(invite_action_region - invite_action_gap -
+                               accept_width,
+                           1.0F);
+            ImGui::BeginDisabled(!launcher || !rom_ready || session_active ||
+                                 !compatible);
+            if (ImGui::Button("ACCEPT AND JOIN", {accept_width, 40.0F})) {
+                if (session().join_friend_invite(
+                        invite.lobby_code, g_online_player_name,
+                        invite.admission, error)) {
+                    FriendLobbyInviteView accepted{};
+                    if (!friend_service().respond_lobby_invite(
+                            invite.invite_id, true, accepted, error)) {
+                        g_online_action_status = error;
+                    }
+                } else {
+                    g_online_action_status = error;
+                }
+            }
+            ImGui::EndDisabled();
+            if (!stack_invite_actions) {
+                ImGui::SameLine(0.0F, invite_action_gap);
+            }
+            if (ImGui::Button("DECLINE", {decline_width, 40.0F})) {
+                FriendLobbyInviteView declined{};
+                if (!friend_service().respond_lobby_invite(
+                        invite.invite_id, false, declined, error)) {
+                    g_online_action_status = error;
+                }
+            }
+        } else {
+            DrawDisabledWrapped(FriendLobbyInviteStatusLabel(invite.status));
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+    const auto racers = friend_service().friends();
+    std::size_t visible = 0U;
+    for (const FriendView& racer : racers) {
+        if (!racer.online || !racer.hosting || racer.lobby_code.empty()) continue;
+        ++visible;
+        ImGui::PushID(racer.identity.c_str());
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              {0.045F, 0.18F, 0.25F, 0.96F});
+        constexpr ImVec2 kOpenLobbyPadding{16.0F, 14.0F};
+        const float open_lobby_width = std::max(
+            std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+        const float open_lobby_inner_width = std::max(
+            open_lobby_width - kOpenLobbyPadding.x * 2.0F, 1.0F);
+        const std::string racer_label = FriendDisplayLabel(racer);
+        std::ostringstream lobby_summary_stream;
+        if (racer.ping_ms > 0U) {
+            lobby_summary_stream << racer.players << " / "
+                                 << racer.maximum_players << " racers  -  "
+                                 << racer.ping_ms << " ms";
+        } else {
+            lobby_summary_stream << racer.players << " / "
+                                 << racer.maximum_players << " racers";
+        }
+        const std::string lobby_summary = lobby_summary_stream.str();
+        const float open_lobby_height = std::max(
+            132.0F,
+            PaddedCardHeight(
+                {WrappedTextHeight(racer_label, open_lobby_inner_width),
+                 WrappedTextHeight(lobby_summary, open_lobby_inner_width),
+                 40.0F},
+                kOpenLobbyPadding));
+        BeginPaddedChild("open-friend-lobby",
+                         {open_lobby_width, open_lobby_height}, true,
+                         ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoScrollWithMouse,
+                         kOpenLobbyPadding);
+        ImGui::TextWrapped("%s", racer_label.c_str());
+        DrawDisabledWrapped(lobby_summary);
+        ImGui::BeginDisabled(!launcher || !rom_ready || session_active);
+        if (ImGui::Button("REQUEST TO JOIN", {-1.0F, 40.0F})) {
+            std::string error;
+            if (!session().join(racer.lobby_code, g_online_player_name, error))
+                g_online_action_status = error;
+        }
+        ImGui::EndDisabled();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+    if (visible == 0U) {
+        ImGui::TextDisabled(
+            "No friends are hosting an open DKR-R lobby right now.");
+    }
+    if (!launcher) {
+        ImGui::TextDisabled(
+            "Return to the launcher before joining another lobby.");
+    }
+}
+
+void DrawHostFriendInvites(float width,
+                           const dkr::runtime::netplay::SessionView& view) {
+    using namespace dkr::runtime::netplay;
+    FriendService& service = friend_service();
+    DirectSession& online = session();
+    const FriendLobbyAdvertisement lobby = FriendLobbyFromSession(view);
+    ImGui::SeparatorText("INVITE FRIENDS");
+    ImGui::TextWrapped(
+        "Invite an online friend directly to this lobby. Their invitation is "
+        "encrypted, expires after five minutes, and grants one admission to "
+        "this exact Quick Join code.");
+
+    std::map<std::string, FriendLobbyInviteView> latest;
+    for (const FriendLobbyInviteView& invite :
+         service.outgoing_lobby_invites()) {
+        if (!latest.contains(invite.friend_identity))
+            latest[invite.friend_identity] = invite;
+    }
+    const auto friends = service.friends();
+    std::size_t visible = 0U;
+    for (const FriendView& racer : friends) {
+        if (!racer.online || racer.blocked) continue;
+        ++visible;
+        ImGui::PushID(racer.identity.c_str());
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              {0.045F, 0.18F, 0.25F, 0.96F});
+        const auto existing = latest.find(racer.identity);
+        const bool pending = existing != latest.end() &&
+            (existing->second.status == FriendLobbyInviteStatus::Sent ||
+             existing->second.status == FriendLobbyInviteStatus::Delivered);
+        constexpr ImVec2 kHostInvitePadding{16.0F, 14.0F};
+        const float host_invite_width = std::max(
+            std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+        const float host_invite_inner_width = std::max(
+            host_invite_width - kHostInvitePadding.x * 2.0F, 1.0F);
+        const std::string racer_label = FriendDisplayLabel(racer);
+        const std::string online_summary =
+            "ONLINE  -  " + std::to_string(racer.ping_ms) + " ms";
+        const std::string invitation_summary = existing != latest.end()
+            ? std::string("INVITATION ") +
+                  FriendLobbyInviteStatusLabel(existing->second.status)
+            : std::string{};
+        const float host_invite_height = std::max(
+            132.0F,
+            PaddedCardHeight(
+                {WrappedTextHeight(racer_label, host_invite_inner_width),
+                 WrappedTextHeight(online_summary, host_invite_inner_width),
+                 WrappedTextHeight(invitation_summary,
+                                   host_invite_inner_width),
+                 38.0F},
+                kHostInvitePadding));
+        BeginPaddedChild("host-friend-invite",
+                         {host_invite_width, host_invite_height}, true,
+                         ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoScrollWithMouse,
+                         kHostInvitePadding);
+        ImGui::TextWrapped("%s", racer_label.c_str());
+        DrawDisabledWrapped(online_summary);
+        if (existing != latest.end()) {
+            DrawDisabledWrapped(invitation_summary);
+        }
+        std::string error;
+        if (pending) {
+            if (ImGui::Button("CANCEL INVITE", {-1.0F, 38.0F})) {
+                online.revoke_friend_admission(existing->second.admission);
+                if (!service.cancel_lobby_invite(
+                        existing->second.invite_id, error)) {
+                    g_online_action_status = error;
+                }
+            }
+        } else {
+            ImGui::BeginDisabled(!lobby.hosting ||
+                                 lobby.players >= lobby.maximum_players);
+            if (ImGui::Button("INVITE TO LOBBY", {-1.0F, 38.0F})) {
+                secure::Key admission{};
+                if (!online.create_friend_admission(
+                        admission, std::chrono::minutes(5), error)) {
+                    g_online_action_status = error;
+                } else {
+                    FriendLobbyInviteView sent{};
+                    if (!service.send_lobby_invite(
+                            racer.identity, lobby, admission, sent, error)) {
+                        online.revoke_friend_admission(admission);
+                        g_online_action_status = error;
+                    } else {
+                        g_online_action_status = "Invitation sent to " +
+                            FriendDisplayLabel(racer) + ".";
+                    }
+                }
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+    if (visible == 0U) {
+        ImGui::TextDisabled(
+            "No friends are online on their secure presence channel right now.");
+    }
+    if (!lobby.hosting) {
+        ImGui::TextColored(kWarm,
+            "Unlock the lobby and keep at least one racer slot open to invite friends.");
+    }
+}
+
+void UpdateFriendPresenceNotification() {
+    const auto racers = dkr::runtime::netplay::friend_service().friends();
+    std::map<std::string, bool> current;
+    for (const auto& racer : racers) {
+        current[racer.identity] = racer.online;
+        const auto previous = g_friend_presence_snapshot.find(racer.identity);
+        if (g_friend_presence_seeded && previous != g_friend_presence_snapshot.end() &&
+            !previous->second && racer.online && g_friend_online_notifications) {
+            g_online_notifications.push(
+                dkr::runtime::ui_notifications::Kind::FriendOnline,
+                "FRIEND ONLINE",
+                FriendDisplayLabel(racer) + " is online and ready to race.",
+                std::chrono::steady_clock::now());
+        }
+    }
+    g_friend_presence_snapshot = std::move(current);
+    g_friend_presence_seeded = true;
+}
+
+void PumpFriendPresence() {
+    // Presence has its own worker and does not need to be rebuilt at display
+    // refresh rate. A 100 ms frontend cadence keeps notifications responsive
+    // while avoiding lock/copy work on every launcher or overlay frame.
+    static auto next_pump = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_pump) return;
+    next_pump = now + std::chrono::milliseconds{100};
+
+    using namespace dkr::runtime::netplay;
+    const SessionView view = session().view();
+    const FriendLobbyAdvertisement advertisement =
+        FriendLobbyFromSession(view);
+    friend_service().pump(advertisement);
+    UpdateFriendPresenceNotification();
+    for (const FriendLobbyInviteView& invite :
+         friend_service().incoming_lobby_invites()) {
+        if (invite.status != FriendLobbyInviteStatus::Delivered ||
+            !g_seen_friend_lobby_invites.insert(invite.invite_id).second) {
+            continue;
+        }
+        g_online_notifications.push(
+            dkr::runtime::ui_notifications::Kind::LobbyInvite,
+            "LOBBY INVITE",
+            invite.friend_display_name +
+                " invited you to race. Open DKR-R ONLINE - OPEN LOBBIES to accept.",
+            std::chrono::steady_clock::now());
+    }
+}
+
+void PumpDirectSessionIfDue() {
+    // DirectSession's network worker already services the transport on its own
+    // bounded wait. This call is only a low-latency wake hint, so issuing it at
+    // frame rate merely causes needless mutex traffic while the launcher idles.
+    static auto next_pump = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_pump) return;
+    next_pump = now + std::chrono::milliseconds{50};
+    dkr::runtime::netplay::session().pump();
+}
+
+void DrawOnlineGuideModal() {
+    constexpr const char* kPopupName = "WELCOME TO DKR-R ONLINE";
+    const bool first_visit =
+        g_online_guide_acknowledged_version < kOnlineGuideVersion &&
+        !g_online_guide_opened_this_run;
+    if (first_visit || g_online_guide_reopen_requested) {
+        g_online_guide_opened_this_run = true;
+        g_online_guide_reopen_requested = false;
+        g_online_guide_do_not_show_again = true;
+        ImGui::OpenPopup(kPopupName);
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(
+        {std::min(900.0F, std::max(display.x - 48.0F, 1.0F)),
+         std::min(690.0F, std::max(display.y - 48.0F, 1.0F))},
+        ImGuiCond_Always);
+    if (!BeginPaddedModal(kPopupName,
+                          ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoSavedSettings,
+                          {28.0F, 24.0F})) {
+        return;
+    }
+
+    // The guide is longer than some supported viewports. Only its explanatory
+    // copy may scroll; the acknowledgement controls below must remain pinned
+    // and reachable so opening Online MP can never softlock the launcher.
+    constexpr float kGuideActionHeight = 48.0F;
+    const float footer_height = ImGui::GetFrameHeight() +
+        kGuideActionHeight + (ImGui::GetStyle().ItemSpacing.y * 3.0F) + 2.0F;
+    const float guide_height = std::max(
+        1.0F, ImGui::GetContentRegionAvail().y - footer_height);
+    ImGui::BeginChild("##online-guide-scroll", {0.0F, guide_height}, false,
+                      ImGuiWindowFlags_None);
+
+    DrawPageHeading("DKR-R ONLINE IS HERE!");
+    ImGui::TextWrapped(
+        "Thank you for downloading and choosing DKR-R. You can now race "
+        "with friends across DKR-R Online.");
+    ImGui::Dummy({0.0F, 8.0F});
+
+    const int guide_columns =
+        ImGui::GetContentRegionAvail().x >= 700.0F ? 2 : 1;
+    if (ImGui::BeginTable("online-guide-columns", guide_columns,
+                          ImGuiTableFlags_SizingStretchSame |
+                              ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextUnformatted("GETTING ON THE GRID");
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped(
+            "HOST creates a private five-character Quick Join code. Share it "
+            "with racers you trust, approve their request, then mark everyone "
+            "ready before Player 1 starts the game.");
+        ImGui::Dummy({0.0F, 6.0F});
+        ImGui::TextWrapped(
+            "QUICK JOIN lets a friend enter that code. OPEN LOBBIES lists "
+            "available lobbies hosted by racers already on your Friends list.");
+        ImGui::Dummy({0.0F, 6.0F});
+        ImGui::TextWrapped(
+            "FRIENDS uses short Friend Codes. Add trusted racers once, then "
+            "see their presence, lobby invitations and open lobbies in DKR-R.");
+
+        ImGui::TableNextColumn();
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextUnformatted("HOST SETTINGS");
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped(
+            "Choose the racer limit, host menu control and synchronization "
+            "mode. Rollback is recommended for internet play; Lockstep suits "
+            "very stable, low-latency connections. Automatic input delay is "
+            "the safest default.");
+        ImGui::Dummy({0.0F, 6.0F});
+        ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
+        ImGui::TextWrapped(
+            "ONLINE BETA: these features are experimental. Crashes or other "
+            "issues may occur. Please report them to ThatGuyMcd on GitHub or "
+            "Discord with the details needed to reproduce them.");
+        ImGui::PopStyleColor();
+        ImGui::Dummy({0.0F, 6.0F});
+        ImGui::TextWrapped(
+            "Minimum connection: 50 Mbps download and 5 Mbps upload. Unstable "
+            "Wi-Fi, high ping and distance between Player 1 and clients can add "
+            "input delay. DKR-R continuously works to keep that delay low.");
+        ImGui::EndTable();
+    }
+
+    ImGui::Dummy({0.0F, 10.0F});
+    ImGui::TextWrapped(
+        "Thank you, and have fun playing DKR-R Online!\nThatGuyMcd");
+    ImGui::EndChild();
+    ImGui::Separator();
+    ImGui::Checkbox("Do not show this guide again",
+                    &g_online_guide_do_not_show_again);
+    ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+    if (ImGui::Button(
+            "LET'S GO!",
+            {std::max(ImGui::GetContentRegionAvail().x, 1.0F),
+             kGuideActionHeight})) {
+        g_online_guide_acknowledged_version =
+            g_online_guide_do_not_show_again ? kOnlineGuideVersion : 0;
+        SaveSettings();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndPopup();
+}
+
+bool BeginOnlineSectionLayout(const char* id, const char* const* labels,
+                              std::size_t count, int& selected, float width) {
+    if (count == 0U) return false;
+    selected = std::clamp(selected, 0, static_cast<int>(count - 1U));
+    const float available_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    const bool vertical_rail = available_width >= 620.0F;
+    const int button_columns = vertical_rail ? 1 : 2;
+    bool outer_table_open = false;
+    if (vertical_rail) {
+        outer_table_open = ImGui::BeginTable(
+            id, 2, ImGuiTableFlags_SizingStretchProp |
+                       ImGuiTableFlags_BordersInnerV,
+            {available_width, 0.0F});
+        if (!outer_table_open) return false;
+        ImGui::TableSetupColumn("navigation", ImGuiTableColumnFlags_WidthFixed,
+                                205.0F);
+        ImGui::TableSetupColumn("content", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+    } else if (!ImGui::BeginTable(
+                   id, button_columns, ImGuiTableFlags_SizingStretchSame,
+                   {available_width, 0.0F})) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!vertical_rail) ImGui::TableNextColumn();
+        const bool is_selected = selected == static_cast<int>(index);
+        if (is_selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, kWarm);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBackground);
+        }
+        ImGui::PushID(static_cast<int>(index));
+        if (ImGui::Button(labels[index],
+                          {ImGui::GetContentRegionAvail().x, 43.0F})) {
+            selected = static_cast<int>(index);
+        }
+        ImGui::PopID();
+        if (is_selected) ImGui::PopStyleColor(2);
+    }
+
+    if (vertical_rail) {
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Indent(8.0F);
+        const std::string content_id = std::string("##") + id + "-content";
+        constexpr float kOnlinePageFooterReserve = 72.0F;
+        const float content_height =
+            std::max(ImGui::GetContentRegionAvail().y -
+                         kOnlinePageFooterReserve,
+                     1.0F);
+        // Borderless children ignore style.WindowPadding unless this child
+        // flag is explicit. Keep the Online viewport inset by exactly 10 px
+        // on every edge, including at the bottom of its scroll range.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0F, 10.0F});
+        ImGui::BeginChild(
+            content_id.c_str(), {0.0F, content_height},
+            ImGuiChildFlags_AlwaysUseWindowPadding,
+            ImGuiWindowFlags_NavFlattened);
+        ImGui::PopStyleVar();
+        // Text wrapping is window-local in ImGui. The page-level wrap position
+        // does not apply to this nested scrolling pane, so establish a boundary
+        // at the pane's own work area for every text style, including disabled
+        // status text and dynamic lobby/profile values.
+        ImGui::PushTextWrapPos(0.0F);
+        ImGui::PushItemWidth(-1.0F);
+    } else {
+        ImGui::EndTable();
+        ImGui::Dummy({0.0F, 8.0F});
+    }
+    return outer_table_open;
+}
+
+void EndOnlineSectionLayout(bool table_open) {
+    if (!table_open) return;
+    ImGui::PopItemWidth();
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+    ImGui::Unindent(8.0F);
+    ImGui::EndTable();
+}
+
+
+void DrawOnlinePage(float width, bool launcher, bool rom_ready) {
+    using namespace dkr::runtime::netplay;
+    DrawPageHeading("DKR-R ONLINE");
+    ImGui::TextDisabled(
+        "Secure player-hosted racing for two players in Beta 10.");
+    ImGui::Dummy({0.0F, 12.0F});
+    DrawOnlineGuideModal();
+
+    DirectSession& online = session();
+    PumpDirectSessionIfDue();
+    const SessionView view = online.view();
+
+    if (!online.active()) {
+        if (view.state == ConnectionState::Failed) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
+            ImGui::TextWrapped("%s", view.status.c_str());
+            ImGui::PopStyleColor();
+            constexpr const char* clear_error_label =
+                "CLEAR CONNECTION ERROR";
+            if (ImGui::Button(
+                    clear_error_label,
+                    OnlineActionButtonSize(clear_error_label, 260.0F, 42.0F))) {
+                online.disconnect();
+            }
+            ImGui::Dummy({0.0F, 12.0F});
+        }
+        if (!rom_ready) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+            ImGui::TextWrapped(
+                "Choose a supported Game Pak on PLAY first. Every racer must use the same revision and gameplay settings; Player 1 supplies a separate online-only Adventure save after approval.");
+            ImGui::PopStyleColor();
+        }
+
+        constexpr std::array<const char*, 7> sections{{
+            "OPEN LOBBIES", "HOST", "HOST SETTINGS", "QUICK JOIN",
+            "ONLINE PROFILE", "FRIENDS", "OVERLAYS",
+        }};
+        const bool online_table_open = BeginOnlineSectionLayout(
+            "online-offline-sections", sections.data(), sections.size(),
+            g_online_offline_section, width);
+        const float online_content_width =
+            std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+        switch (g_online_offline_section) {
+        case 0:
+            DrawOpenFriendLobbies(
+                online_content_width, launcher, rom_ready, false);
+            break;
+        case 1:
+            if (launcher) {
+                DrawOnlineHostSetup(online_content_width, rom_ready);
+            } else {
+                ImGui::SeparatorText("HOST FROM THE LAUNCHER");
+                ImGui::TextWrapped(
+                    "Finish the current game and return to the launcher to create a lobby safely.");
+            }
+            break;
+        case 2:
+            DrawOnlineRaceRules(online_content_width);
+            break;
+        case 3:
+            if (launcher) {
+                DrawOnlineJoinSetup(online_content_width, rom_ready);
+            } else {
+                ImGui::SeparatorText("QUICK JOIN FROM THE LAUNCHER");
+                ImGui::TextWrapped(
+                    "Finish the current game and return to the launcher before joining another racer.");
+            }
+            break;
+        case 4:
+            DrawOnlineProfile(online_content_width);
+            break;
+        case 5:
+            DrawFriends(online_content_width);
+            break;
+        case 6:
+            DrawOnlineOverlaySettings(online_content_width);
+            break;
+        default:
+            break;
+        }
+        if (!g_online_action_status.empty()) {
+            ImGui::Dummy({0.0F, 12.0F});
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+            ImGui::TextWrapped("%s", g_online_action_status.c_str());
+            ImGui::PopStyleColor();
+        }
+        EndOnlineSectionLayout(online_table_open);
+
+        return;
+    }
+
+    constexpr std::array<const char*, 4> host_sections{{
+        "LOBBY", "INVITE FRIENDS", "CONNECTION", "OVERLAYS",
+    }};
+    constexpr std::array<const char*, 3> client_sections{{
+        "LOBBY", "CONNECTION", "OVERLAYS",
+    }};
+    if (view.host && g_open_host_friend_invites) {
+        g_online_active_section = 1;
+        g_open_host_friend_invites = false;
+    }
+    const char* const* active_labels = view.host
+        ? host_sections.data() : client_sections.data();
+    const std::size_t active_count = view.host
+        ? host_sections.size() : client_sections.size();
+    const bool active_table_open = BeginOnlineSectionLayout(
+        "online-active-sections", active_labels, active_count,
+        g_online_active_section, width);
+    const float online_content_width =
+        std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+    const bool show_lobby = g_online_active_section == 0;
+    const bool show_invites = view.host && g_online_active_section == 1;
+    const bool show_connection = g_online_active_section == (view.host ? 2 : 1);
+    const bool show_overlays = g_online_active_section == (view.host ? 3 : 2);
+
+    if (show_lobby) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+    ImGui::Text("%s - %s", OnlineStateName(view.state), OnlineMethodName(view.method));
+    ImGui::PopStyleColor();
+    ImGui::TextWrapped("%s", view.status.c_str());
+    if (view.state == ConnectionState::AwaitingApproval) {
+        ImGui::TextWrapped("The host must approve this device before it receives a player slot or lobby state.");
+    }
+
+    if (view.host && !view.pending_joins.empty()) {
+        ImGui::Dummy({0.0F, 14.0F});
+        ImGui::SeparatorText("JOIN REQUESTS");
+        for (const PendingJoinView& pending : view.pending_joins) {
+            ImGui::PushID(static_cast<int>(pending.request_id & 0x7FFFFFFFU));
+            ImGui::Text("%s", pending.display_name.c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(pending.compatible ? ImVec4{0.12F, 0.88F, 0.42F, 1.0F}
+                                                   : kRaceRed,
+                               "%s", pending.compatibility.c_str());
+            std::string error;
+            constexpr const char* approve_label = "APPROVE";
+            constexpr const char* decline_label = "DECLINE";
+            constexpr const char* block_label = "BLOCK FOR SESSION";
+            const ImVec2 approve_size =
+                OnlineActionButtonSize(approve_label, 130.0F, 38.0F);
+            const ImVec2 decline_size =
+                OnlineActionButtonSize(decline_label, 130.0F, 38.0F);
+            const ImVec2 block_size =
+                OnlineActionButtonSize(block_label, 200.0F, 38.0F);
+            const bool admission_actions_share_line =
+                approve_size.x + decline_size.x + block_size.x +
+                    ImGui::GetStyle().ItemSpacing.x * 2.0F <=
+                ImGui::GetContentRegionAvail().x;
+            ImGui::BeginDisabled(!pending.compatible || view.lobby_locked);
+            if (ImGui::Button(approve_label, approve_size) &&
+                !online.approve_join(pending.request_id, error)) {
+                g_online_action_status = error;
+            }
+            ImGui::EndDisabled();
+            if (admission_actions_share_line) ImGui::SameLine();
+            if (ImGui::Button(decline_label, decline_size) &&
+                !online.reject_join(pending.request_id, false, error)) {
+                g_online_action_status = error;
+            }
+            if (admission_actions_share_line) ImGui::SameLine();
+            if (ImGui::Button(block_label, block_size) &&
+                !online.reject_join(pending.request_id, true, error)) {
+                g_online_action_status = error;
+            }
+            ImGui::PopID();
+            ImGui::Dummy({0.0F, 8.0F});
+        }
+    }
+
+    if (view.host && !view.invite.empty()) {
+        ImGui::Dummy({0.0F, 12.0F});
+        ImGui::SeparatorText("QUICK JOIN CODE");
+        ImGui::TextWrapped("Share this only with racers you trust. Every request still requires host approval.");
+        ImGui::SetWindowFontScale(1.55F);
+        ImGui::TextColored(kWarm, "%s", view.invite.c_str());
+        ImGui::SetWindowFontScale(1.0F);
+        constexpr const char* copy_code_label = "COPY FIVE-CHARACTER CODE";
+        constexpr const char* rekey_code_label = "REKEY CODE";
+        const ImVec2 copy_code_size =
+            OnlineActionButtonSize(copy_code_label, 250.0F, 42.0F);
+        const ImVec2 rekey_code_size =
+            OnlineActionButtonSize(rekey_code_label, 180.0F, 42.0F);
+        const bool code_actions_share_line =
+            OnlineButtonsFitOnOneLine(copy_code_size, rekey_code_size);
+        if (ImGui::Button(copy_code_label, copy_code_size)) {
+            CopyOnlineInviteToClipboard(view.invite);
+        }
+        if (code_actions_share_line) ImGui::SameLine();
+        if (ImGui::Button(rekey_code_label, rekey_code_size)) {
+            std::string error;
+            if (!online.revoke_invitation(error)) g_online_action_status = error;
+        }
+        if (!view.lobby_locked) {
+            ImGui::Dummy({0.0F, 6.0F});
+            if (ImGui::Button("INVITE FRIENDS", {210.0F, 42.0F})) {
+                g_open_host_friend_invites = true;
+                g_online_active_section = 1;
+            }
+        }
+        bool locked = view.lobby_locked;
+        ImGui::BeginDisabled(view.connection_test_active);
+        if (ImGui::Checkbox("Lock lobby to new join requests", &locked)) {
+            std::string error;
+            if (!online.set_lobby_locked(locked, error)) g_online_action_status = error;
+        }
+        ImGui::EndDisabled();
+    }
+
+    ImGui::Dummy({0.0F, 14.0F});
+    ImGui::SeparatorText("STARTING GRID");
+    for (std::size_t slot = 0; slot < view.room.players.size(); ++slot) {
+        const Player& player = view.room.players[slot];
+        ImGui::Text("PLAYER %zu", slot + 1U);
+        ImGui::SameLine(150.0F);
+        ImGui::TextUnformatted(player.occupied ? player.display_name.c_str() : "OPEN");
+        if (player.occupied) {
+            ImGui::SameLine(std::max(online_content_width - 155.0F, 360.0F));
+            ImGui::TextColored(player.ready ? ImVec4{0.12F, 0.88F, 0.42F, 1.0F}
+                                            : kWarm,
+                               "%s", player.loaded ? "LOADED" :
+                               (player.ready ? "READY" : "NOT READY"));
+            ImGui::TextColored(
+                view.online_save_ready[slot]
+                    ? ImVec4{0.12F, 0.88F, 0.42F, 1.0F} : kWarm,
+                "%s", view.online_save_ready[slot]
+                    ? "ONLINE SAVE VERIFIED" : "VERIFYING ONLINE SAVE...");
+            if (!player.host) {
+                ImGui::TextDisabled("%s - %u ms - jitter %u ms - loss %.1f%%",
+                    OnlineRouteName(player.route), player.ping_ms, player.jitter_ms,
+                    player.packet_loss_percent);
+                if (view.host && view.state != ConnectionState::Running &&
+                    view.state != ConnectionState::Loading &&
+                    !view.connection_test_active) {
+                    ImGui::SameLine();
+                    ImGui::PushID(static_cast<int>(slot));
+                    if (ImGui::SmallButton("REMOVE")) {
+                        std::string error;
+                        if (!online.kick_player(static_cast<std::uint8_t>(slot), error)) {
+                            g_online_action_status = error;
+                        }
+                    }
+                    ImGui::PopID();
+                }
+            } else {
+                ImGui::TextDisabled("HOST - PLAYER 1");
+            }
+        }
+        ImGui::Separator();
+    }
+
+    if (view.host && (view.state == ConnectionState::Hosting ||
+                      view.state == ConnectionState::Lobby)) {
+        ImGui::Dummy({0.0F, 8.0F});
+        constexpr const char* test_label = "TEST SESSION CONNECTION";
+        ImGui::BeginDisabled(view.connection_test_active ||
+                             view.launch_stage != LaunchStage::Idle);
+        if (ImGui::Button(test_label, {online_content_width, 46.0F})) {
+            std::string error;
+            if (!online.request_connection_test(error)) {
+                g_online_action_status = error;
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled(
+            "Runs a seven-second pre-flight over the same control, input, authority and replica lanes used in-game.");
+    }
+    if (view.connection_test_active) {
+        const float seconds = static_cast<float>(
+            view.connection_test_remaining_ms) / 1000.0F;
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::Text("TESTING REAL SESSION LOAD... %.1f SECONDS", seconds);
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped(
+            "Keep this window open. Ready, Start and lobby changes are paused until every traffic lane drains.");
+    }
+
+    if ((view.state == ConnectionState::Hosting || view.state == ConnectionState::Lobby) &&
+        view.local_slot < view.room.players.size() &&
+        view.room.players[view.local_slot].occupied) {
+        const Player& local = view.room.players[view.local_slot];
+        const std::size_t local_profile =
+            dkr::runtime::platform::online_input_profile();
+        const auto controller =
+            dkr::runtime::platform::player_controller_status(local_profile);
+        const bool keyboard_available =
+            dkr::runtime::input::keyboard_player() ==
+            static_cast<int>(local_profile);
+        const bool local_input_available =
+            controller.connected || keyboard_available;
+        std::string error;
+        const char* ready_label = local.ready ? "CANCEL READY" : "READY TO RACE";
+        constexpr const char* start_label = "START FOR EVERYONE";
+        const ImVec2 ready_size =
+            OnlineActionButtonSize(ready_label, 240.0F, 48.0F);
+        const ImVec2 start_size =
+            OnlineActionButtonSize(start_label, 270.0F, 48.0F);
+        const bool race_actions_share_line = view.host &&
+            OnlineButtonsFitOnOneLine(ready_size, start_size);
+        ImGui::BeginDisabled(view.connection_test_active ||
+                             !view.local_online_save_ready ||
+                             (!local.ready && !local_input_available));
+        if (ImGui::Button(ready_label, ready_size) &&
+            !online.set_ready(!local.ready, error)) {
+            g_online_action_status = error;
+        }
+        ImGui::EndDisabled();
+        if (!local_input_available) {
+            ImGui::TextColored(
+                kWarm,
+                "Connect a controller or assign the keyboard to Player %zu before readying.",
+                local_profile + 1U);
+        }
+        if (view.host) {
+            bool all_ready = true;
+            bool all_saves_ready = true;
+            std::size_t racers = 0U;
+            for (std::size_t slot = 0U; slot < view.room.players.size(); ++slot) {
+                const Player& player = view.room.players[slot];
+                if (!player.occupied) continue;
+                ++racers;
+                all_ready = all_ready && player.ready;
+                all_saves_ready = all_saves_ready &&
+                                  view.online_save_ready[slot];
+            }
+            if (race_actions_share_line) ImGui::SameLine();
+            ImGui::BeginDisabled(view.connection_test_active ||
+                                 racers < 2U || !all_ready ||
+                                 !all_saves_ready);
+            ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+            if (ImGui::Button(start_label, start_size) &&
+                !online.request_start(error)) {
+                g_online_action_status = error;
+            }
+            ImGui::PopStyleColor();
+            ImGui::EndDisabled();
+        }
+    }
+    ImGui::Dummy({0.0F, 12.0F});
+    ImGui::PushStyleColor(ImGuiCol_Button, {0.45F, 0.09F, 0.10F, 1.0F});
+    constexpr const char* leave_label = "LEAVE ONLINE LOBBY";
+    if (ImGui::Button(
+            leave_label,
+            OnlineActionButtonSize(leave_label, 260.0F, 44.0F))) {
+        online.disconnect("You left the online lobby.");
+    }
+    ImGui::PopStyleColor();
+    if (!g_online_action_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextWrapped("%s", g_online_action_status.c_str());
+        ImGui::PopStyleColor();
+    }
+    static std::uint32_t observed_connection_test_generation = 0U;
+    if (view.connection_test_result_generation != 0U &&
+        view.connection_test_result_generation !=
+            observed_connection_test_generation) {
+        observed_connection_test_generation =
+            view.connection_test_result_generation;
+        ImGui::OpenPopup("SESSION PRE-FLIGHT RESULTS");
+    }
+    if (BeginPaddedModal("SESSION PRE-FLIGHT RESULTS",
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+        std::uint8_t overall = 10U;
+        bool any = false;
+        for (const auto& result : view.connection_test_results) {
+            if (!result.valid) continue;
+            overall = (std::min)(overall, result.score);
+            any = true;
+        }
+        const ImVec4 band = !any || overall <= 4U
+            ? ImVec4{0.95F, 0.18F, 0.12F, 1.0F}
+            : overall <= 7U ? ImVec4{1.0F, 0.58F, 0.08F, 1.0F}
+                            : ImVec4{0.12F, 0.88F, 0.42F, 1.0F};
+        const char* experience = !any || overall <= 4U
+            ? "BAD - EXPECT AN UNSTABLE ONLINE EXPERIENCE"
+            : overall <= 7U ? "AVERAGE - PLAYABLE, BUT HITCHES MAY OCCUR"
+                            : "EXCELLENT - BEST ONLINE EXPERIENCE";
+        ImGui::PushStyleColor(ImGuiCol_Text, band);
+        ImGui::Text("OVERALL CONNECTION: %u / 10", overall);
+        ImGui::TextUnformatted(experience);
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        for (std::size_t slot = 0U; slot < view.room.players.size(); ++slot) {
+            const auto& result = view.connection_test_results[slot];
+            if (!result.valid || !view.room.players[slot].occupied) continue;
+            const ImVec4 racer_band = result.score <= 4U
+                ? ImVec4{0.95F, 0.18F, 0.12F, 1.0F}
+                : result.score <= 7U ? ImVec4{1.0F, 0.58F, 0.08F, 1.0F}
+                                     : ImVec4{0.12F, 0.88F, 0.42F, 1.0F};
+            ImGui::PushStyleColor(ImGuiCol_Text, racer_band);
+            ImGui::Text("PLAYER %zu - %s: %u / 10", slot + 1U,
+                        view.room.players[slot].display_name.c_str(),
+                        result.score);
+            ImGui::PopStyleColor();
+            if (view.room.players[slot].host) {
+                ImGui::TextDisabled("LOCAL HOST");
+            } else {
+                ImGui::TextDisabled(
+                    "P95 %u ms  |  JITTER %u ms  |  LOSS %.1f%%  |  LATE %.1f%%  |  QUEUES %s",
+                    result.p95_rtt_ms, result.jitter_ms,
+                    result.loss_percent, result.late_percent,
+                    result.queues_drained ? "DRAINED" : "BACKED UP");
+            }
+            ImGui::Separator();
+        }
+        ImGui::TextWrapped(
+            "This predicts network and transport stability under representative game traffic. It is not a CPU or GPU benchmark.");
+        if (ImGui::Button("CLOSE", {180.0F, 42.0F})) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    } else if (show_invites) {
+        g_open_host_friend_invites = false;
+        DrawHostFriendInvites(online_content_width, view);
+    } else if (show_connection) {
+        DrawOnlineConnectionStatus(view);
+    } else if (show_overlays) {
+        DrawOnlineOverlaySettings(online_content_width);
+    }
+    EndOnlineSectionLayout(active_table_open);
+}
+
 
 bool DrawGraphicsSettings(bool live) {
     GraphicsConfig config = ultramodern::renderer::get_graphics_config();
@@ -2061,212 +6508,6 @@ bool DrawGraphicsSettings(bool live) {
             }
         }
         ImGui::Spacing();
-        ImGui::SeparatorText("CRT display filter");
-        bool crt_enabled = g_crt_enabled;
-        if (ImGui::Checkbox("Enable CRT overlay", &crt_enabled)) {
-            g_crt_enabled = crt_enabled;
-            SaveSettings();
-            changed = true;
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        ImGui::TextWrapped(
-            "Applied only to the game image. DKR-R's settings and performance "
-            "overlays always remain clear and readable above it.");
-        ImGui::PopStyleColor();
-        if (g_crt_enabled) {
-            ImGui::TextUnformatted("Filter image");
-            ImGui::SetNextItemWidth(setting_width);
-            if (!g_crt_filters.empty() &&
-                ControlCombo("##crt-filter", &g_crt_filter_index,
-                             CrtFilterGetter, &g_crt_filters,
-                             static_cast<int>(g_crt_filters.size()), 10)) {
-                SaveSettings();
-                changed = true;
-            }
-            ImGui::TextUnformatted("Scaling");
-            ImGui::SetNextItemWidth(setting_width);
-            if (ControlCombo("##crt-scaling", &g_crt_scale_mode,
-                             "Stretch to viewport\0Tile at native size\0")) {
-                SaveSettings();
-                changed = true;
-            }
-            int density = static_cast<int>(
-                std::round(std::clamp(g_crt_strength, 0.0F, 1.0F) * 100.0F));
-            ImGui::TextUnformatted("Filter density");
-            ImGui::SetNextItemWidth(setting_width);
-            if (ControlSliderInt("##crt-density", &density, 0, 100, "%d %%")) {
-                g_crt_strength = density / 100.0F;
-                SaveSettings();
-                changed = true;
-            }
-        }
-        if (ImGui::Button("IMPORT CUSTOM CRT FILTER", {setting_width, 42.0F})) {
-            ImportCrtFilterWithDialog();
-            changed = true;
-        }
-        if (!g_crt_status.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-            ImGui::TextWrapped("%s", g_crt_status.c_str());
-            ImGui::PopStyleColor();
-        }
-        ImGui::Spacing();
-        ImGui::SeparatorText("Custom texture packs");
-        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        ImGui::TextWrapped(
-            "Native RT64 and Rice PNG packs can be toggled while racing. Rice "
-            "archives are converted into a managed RT64 cache, including exact "
-            "RGB/alpha reconstruction. Jabo packs are unsupported.");
-        ImGui::PopStyleColor();
-        const float texture_button_gap = ImGui::GetStyle().ItemSpacing.x;
-        const float texture_button_width =
-            std::max(120.0F, (setting_width - texture_button_gap) * 0.5F);
-        if (ImGui::Button("IMPORT TEXTURE PACK",
-                          {texture_button_width, 42.0F})) {
-            ImportTexturePackWithDialog();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("REFRESH PACKS", {texture_button_width, 42.0F})) {
-            dkr::runtime::texture_packs::refresh();
-        }
-        const auto texture_packs = dkr::runtime::texture_packs::snapshot(true);
-        const std::size_t hidden_pack_count = static_cast<std::size_t>(
-            std::count_if(texture_packs.begin(), texture_packs.end(),
-                [](const auto& pack) { return pack.hidden; }));
-        if (hidden_pack_count > 0) {
-            if (ImGui::Checkbox("SHOW HIDDEN PACKS", &g_show_hidden_texture_packs)) {
-                changed = true;
-            }
-        } else {
-            g_show_hidden_texture_packs = false;
-        }
-        const std::size_t shown_pack_count = static_cast<std::size_t>(
-            std::count_if(texture_packs.begin(), texture_packs.end(),
-                [](const auto& pack) {
-                    return !pack.hidden || g_show_hidden_texture_packs;
-                }));
-        if (shown_pack_count == 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-            ImGui::TextWrapped(hidden_pack_count > 0
-                ? "All imported texture packs are hidden. Enable SHOW HIDDEN PACKS to manage them."
-                : "No texture packs imported yet.");
-            ImGui::PopStyleColor();
-        }
-        bool request_remove_modal = false;
-        for (const auto& pack : texture_packs) {
-            if (pack.hidden && !g_show_hidden_texture_packs) continue;
-            ImGui::PushID(pack.id.c_str());
-            const float texture_card_width = available_width;
-            const float detail_width =
-                std::max(100.0F, texture_card_width - 36.0F);
-            const float detail_height = ImGui::CalcTextSize(
-                pack.detail.c_str(), nullptr, false, detail_width).y;
-            const float card_height = 124.0F + detail_height;
-            if (BeginPaddedChild("texture-pack-card",
-                                 {texture_card_width, card_height},
-                                 true, ImGuiWindowFlags_NoScrollbar)) {
-                if (pack.hidden) {
-                    ImGui::TextUnformatted(pack.name.c_str());
-                    ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
-                    ImGui::TextUnformatted("HIDDEN - MANAGED FILES RETAINED");
-                    ImGui::PopStyleColor();
-                } else {
-                    bool enabled = pack.enabled;
-                    ImGui::BeginDisabled(!pack.compatible);
-                    if (ImGui::Checkbox(pack.name.c_str(), &enabled)) {
-                        dkr::runtime::texture_packs::set_enabled(pack.id, enabled);
-                        changed = true;
-                    }
-                    ImGui::EndDisabled();
-                }
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    pack.compatible ? kAccent : kWarm);
-                const std::string format_label =
-                    std::string(dkr::runtime::texture_packs::format_name(pack.format)) +
-                    (pack.format == dkr::runtime::texture_packs::Format::LegacyJabo
-                        ? " - UNSUPPORTED" : "");
-                ImGui::TextUnformatted(format_label.c_str());
-                ImGui::PopStyleColor();
-                ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-                ImGui::TextWrapped("%s", pack.detail.c_str());
-                ImGui::PopStyleColor();
-                const float action_gap = ImGui::GetStyle().ItemSpacing.x;
-                const float action_width = std::max(
-                    (ImGui::GetContentRegionAvail().x - action_gap) * 0.5F, 1.0F);
-                if (pack.hidden) {
-                    if (ImGui::Button("RESTORE TO LIST", {action_width, 42.0F})) {
-                        dkr::runtime::texture_packs::set_hidden(
-                            pack.id, false, g_texture_pack_status);
-                        changed = true;
-                    }
-                    ImGui::SameLine(0.0F, action_gap);
-                    if (ImGui::Button("DELETE PACK...", {action_width, 42.0F})) {
-                        g_texture_pack_remove_id = pack.id;
-                        g_texture_pack_remove_name = pack.name;
-                        request_remove_modal = true;
-                    }
-                } else if (ImGui::Button("REMOVE PACK...",
-                                         {ImGui::GetContentRegionAvail().x, 42.0F})) {
-                    g_texture_pack_remove_id = pack.id;
-                    g_texture_pack_remove_name = pack.name;
-                    request_remove_modal = true;
-                }
-            }
-            ImGui::EndChild();
-            ImGui::PopID();
-        }
-        if (request_remove_modal) {
-            ImGui::OpenPopup("Remove texture pack?");
-        }
-        ImGui::SetNextWindowSizeConstraints({480.0F, 0.0F}, {680.0F, FLT_MAX});
-        if (BeginPaddedModal("Remove texture pack?",
-                             ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextUnformatted("REMOVE TEXTURE PACK?");
-            ImGui::Separator();
-            ImGui::TextWrapped("%s", g_texture_pack_remove_name.c_str());
-            ImGui::Dummy({0.0F, 6.0F});
-            ImGui::TextWrapped(
-                "HIDE FROM LIST keeps DKR-R's managed copy on disk. You can restore it later with SHOW HIDDEN PACKS.");
-            ImGui::Dummy({0.0F, 8.0F});
-            ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
-            ImGui::TextUnformatted("WARNING - PERMANENT DELETION CANNOT BE UNDONE");
-            ImGui::PopStyleColor();
-            ImGui::TextWrapped(
-                "DELETE COMPLETELY permanently removes DKR-R's managed archive or converted texture cache. Your original source archive outside DKR-R is never touched.");
-            ImGui::Dummy({0.0F, 12.0F});
-            if (ImGui::Button("CANCEL", {130.0F, 44.0F})) {
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("HIDE FROM LIST", {190.0F, 44.0F})) {
-                dkr::runtime::texture_packs::set_hidden(
-                    g_texture_pack_remove_id, true, g_texture_pack_status);
-                changed = true;
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Button, {0.45F, 0.09F, 0.10F, 1.0F});
-            if (ImGui::Button("DELETE COMPLETELY", {210.0F, 44.0F})) {
-                dkr::runtime::texture_packs::delete_managed(
-                    g_texture_pack_remove_id, g_texture_pack_status);
-                changed = true;
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::PopStyleColor();
-            ImGui::EndPopup();
-        }
-        if (!g_texture_pack_status.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-            ImGui::TextWrapped("%s", g_texture_pack_status.c_str());
-            ImGui::PopStyleColor();
-        }
-        const std::string texture_status =
-            dkr::runtime::texture_packs::status();
-        if (!texture_status.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-            ImGui::TextWrapped("%s", texture_status.c_str());
-            ImGui::PopStyleColor();
-        }
-        ImGui::Spacing();
         ImGui::SeparatorText("Camera and scenery");
         bool maximum_detail =
             dkr::runtime::enhancements::maximum_detail_requested();
@@ -2308,14 +6549,97 @@ bool DrawGraphicsSettings(bool live) {
         }
         bool keep_hub_scenery =
             dkr::runtime::enhancements::keep_hub_scenery_requested();
-        if (ImGui::Checkbox("Keep all scenery rendered", &keep_hub_scenery)) {
+        if (ImGui::Checkbox("Keep hub scenery rendered", &keep_hub_scenery)) {
             dkr::runtime::enhancements::set_keep_hub_scenery_enabled(
                 keep_hub_scenery);
             SaveSettings();
             changed = true;
         }
+
+        bool keep_track_scenery =
+            dkr::runtime::enhancements::keep_track_scenery_requested();
+        if (ImGui::Checkbox("Keep track and boss scenery rendered",
+                            &keep_track_scenery)) {
+            dkr::runtime::enhancements::set_keep_track_scenery_enabled(
+                keep_track_scenery);
+            SaveSettings();
+            changed = true;
+        }
+
+        bool keep_minigame_scenery =
+            dkr::runtime::enhancements::keep_minigame_scenery_requested();
+        if (ImGui::Checkbox("Keep minigame and battle scenery rendered",
+                            &keep_minigame_scenery)) {
+            dkr::runtime::enhancements::set_keep_minigame_scenery_enabled(
+                keep_minigame_scenery);
+            SaveSettings();
+            changed = true;
+        }
+
+        int scenery_retention = static_cast<int>(
+            dkr::runtime::enhancements::scenery_retention_mode());
+        ImGui::TextUnformatted("Scenery retention");
+        ImGui::SetNextItemWidth(setting_width);
+        if (ControlCombo("##scenery-retention", &scenery_retention,
+                         "Authored\0Current region\0Visible + adjacent\0"
+                         "Full forward view\0")) {
+            dkr::runtime::enhancements::set_scenery_retention_mode(
+                dkr::runtime::enhancements::normalise_scenery_retention_mode(
+                    scenery_retention));
+            SaveSettings();
+            changed = true;
+        }
+
+        int animated_scenery =
+            dkr::runtime::enhancements::animated_scenery_distance_multiplier();
+        ImGui::TextUnformatted("Animated scenery distance");
+        ImGui::SetNextItemWidth(setting_width);
+        if (ControlSliderInt(
+                "##animated-scenery-distance", &animated_scenery,
+                dkr::runtime::enhancements::kMinimumViewDistanceMultiplier,
+                dkr::runtime::enhancements::kMaximumAnimatedSceneryMultiplier,
+                "%dx", ImGuiSliderFlags_AlwaysClamp)) {
+            dkr::runtime::enhancements::
+                set_animated_scenery_distance_multiplier(animated_scenery);
+            SaveSettings();
+            changed = true;
+        }
+
+        int billboard_effect =
+            dkr::runtime::enhancements::billboard_effect_distance_multiplier();
+        ImGui::TextUnformatted("Billboard and effect distance");
+        ImGui::SetNextItemWidth(setting_width);
+        if (ControlSliderInt(
+                "##billboard-effect-distance", &billboard_effect,
+                dkr::runtime::enhancements::kMinimumViewDistanceMultiplier,
+                dkr::runtime::enhancements::kMaximumBillboardEffectMultiplier,
+                "%dx", ImGuiSliderFlags_AlwaysClamp)) {
+            dkr::runtime::enhancements::
+                set_billboard_effect_distance_multiplier(billboard_effect);
+            SaveSettings();
+            changed = true;
+        }
+
+        int water_lava_detail =
+            dkr::runtime::enhancements::water_lava_detail_multiplier();
+        ImGui::TextUnformatted("Water and lava detail distance");
+        ImGui::SetNextItemWidth(setting_width);
+        if (ControlSliderInt(
+                "##water-lava-detail-distance", &water_lava_detail,
+                dkr::runtime::enhancements::kMinimumViewDistanceMultiplier,
+                dkr::runtime::enhancements::kMaximumWaterLavaDetailMultiplier,
+                "%dx", ImGuiSliderFlags_AlwaysClamp)) {
+            dkr::runtime::enhancements::set_water_lava_detail_multiplier(
+                water_lava_detail);
+            SaveSettings();
+            changed = true;
+        }
+
         ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        ImGui::TextWrapped("This can increase CPU and GPU load on handheld systems.");
+        ImGui::TextWrapped(
+            "Only forward-visible regions are retained; objects behind the "
+            "camera still cull. Higher settings can increase CPU and GPU "
+            "load on handheld systems.");
         ImGui::PopStyleColor();
 
         bool extended_culling =
@@ -2340,6 +6664,26 @@ bool DrawGraphicsSettings(bool live) {
         ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
         ImGui::TextWrapped("Expands DKR's original CPU visibility planes to the active viewport and adds a small guard band. Objects directly behind the camera still cull normally.");
         ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::SeparatorText("HUD size");
+        float hud_scale = dkr::runtime::hud::global_scale() * 100.0F;
+        ImGui::TextUnformatted("HUD scale");
+        ImGui::SetNextItemWidth(setting_width);
+        // Keep the shared launcher/overlay control visible but non-interactive
+        // until global HUD scaling is ready to be exposed again.
+        ImGui::BeginDisabled();
+        if (ControlSliderFloat("##hud-global-scale", &hud_scale,
+                               50.0F, 150.0F, "%.0f%%",
+                               ImGuiSliderFlags_AlwaysClamp)) {
+            hud_scale = std::round(hud_scale / 5.0F) * 5.0F;
+            dkr::runtime::hud::set_global_scale(hud_scale / 100.0F);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("Scales every HUD element uniformly while preserving DKR's original layout.");
+        ImGui::PopStyleColor();
     }
     ImGui::Dummy({0.0F, 16.0F});
     ImGui::BeginDisabled(!modern_profile);
@@ -2360,6 +6704,7 @@ bool DrawGraphicsSettings(bool live) {
 void DrawFpsOverlay(RT64::Application&) {
     if (!g_fps_overlay_enabled ||
         !dkr::runtime::enhancements::modern_presentation_enabled()) {
+        g_fps_overlay_extent = {};
         return;
     }
     const auto measured = dkr::runtime::telemetry::metrics();
@@ -2476,10 +6821,726 @@ void DrawFpsOverlay(RT64::Application&) {
             draw->AddText(font, font_size, at, fill, field.c_str());
             ImGui::Dummy({extent.x, extent.y + 2.0F});
         }
+        g_fps_overlay_extent = ImGui::GetWindowSize();
     }
     ImGui::End();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
+}
+
+float OverlayStackOffset(int position, bool include_fps,
+                         bool include_network) {
+    float result = 0.0F;
+    if (include_fps && g_fps_overlay_enabled &&
+        g_fps_overlay_position == position && g_fps_overlay_extent.y > 0.0F) {
+        result += g_fps_overlay_extent.y + 8.0F;
+    }
+    if (include_network && g_network_overlay_enabled &&
+        g_network_overlay_position == position &&
+        g_network_overlay_extent.y > 0.0F) {
+        result += g_network_overlay_extent.y + 8.0F;
+    }
+    return result;
+}
+
+void DrawStatusOverlay(const char* id, std::vector<std::string> fields,
+                       int position, float stack_offset, ImVec4 fill_colour,
+                       ImVec4 outline_colour, ImVec2& extent) {
+    if (fields.empty()) {
+        extent = {};
+        return;
+    }
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    constexpr float margin = 18.0F;
+    ImVec2 at{margin, margin};
+    ImVec2 pivot{0.0F, 0.0F};
+    if (position == 1 || position == 3) {
+        at.x = display.x - margin;
+        pivot.x = 1.0F;
+    }
+    if (position >= 2) {
+        at.y = display.y - margin - stack_offset;
+        pivot.y = 1.0F;
+    } else {
+        at.y += stack_offset;
+    }
+    ImGui::SetNextWindowPos(at, ImGuiCond_Always, pivot);
+    ImGui::SetNextWindowBgAlpha(0.76F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {14.0F, 10.0F});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.025F, 0.08F, 0.12F, 0.86F});
+    ImGui::PushStyleColor(ImGuiCol_Border, kWarm);
+    if (ImGui::Begin(id, nullptr,
+            ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_NoSavedSettings)) {
+        ImFont* font = g_font_fps != nullptr ? g_font_fps : ImGui::GetFont();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImU32 fill = ImGui::ColorConvertFloat4ToU32(fill_colour);
+        const ImU32 outline = ImGui::ColorConvertFloat4ToU32(outline_colour);
+        constexpr float font_size = 20.0F;
+        constexpr float edge = 1.5F;
+        for (const std::string& field : fields) {
+            const ImVec2 cursor = ImGui::GetCursorScreenPos();
+            const ImVec2 text_extent = font->CalcTextSizeA(
+                font_size, FLT_MAX, 0.0F, field.c_str());
+            draw->AddText(font, font_size, {cursor.x - edge, cursor.y},
+                          outline, field.c_str());
+            draw->AddText(font, font_size, {cursor.x + edge, cursor.y},
+                          outline, field.c_str());
+            draw->AddText(font, font_size, {cursor.x, cursor.y - edge},
+                          outline, field.c_str());
+            draw->AddText(font, font_size, {cursor.x, cursor.y + edge},
+                          outline, field.c_str());
+            draw->AddText(font, font_size, cursor, fill, field.c_str());
+            ImGui::Dummy({text_extent.x, text_extent.y + 2.0F});
+        }
+        extent = ImGui::GetWindowSize();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+void DrawNetworkOverlay() {
+    using namespace dkr::runtime::netplay;
+    if (!g_network_overlay_enabled || !session().active()) {
+        g_network_overlay_extent = {};
+        return;
+    }
+    const SessionView view = session().view();
+    std::vector<std::string> fields;
+    char buffer[192]{};
+    std::snprintf(buffer, sizeof(buffer), "ONLINE %s  %u MS",
+        view.room.rules.synchronization == SynchronizationMode::Rollback
+            ? "ROLLBACK" : "LOCKSTEP",
+        view.network_rtt_ms);
+    fields.emplace_back(buffer);
+    if (g_network_overlay_detail >= 1) {
+        std::snprintf(buffer, sizeof(buffer),
+            "JITTER %u MS  LOSS %.1f%%  DELAY %u",
+            view.network_jitter_ms, view.network_loss_percent,
+            view.input_delay_frames);
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer),
+            "AUTH %u R%u  PRED 0X%02X",
+            view.authoritative_input_frame,
+            view.authoritative_input_revision,
+            view.authoritative_predicted_mask);
+        fields.emplace_back(buffer);
+    }
+    if (g_network_overlay_detail >= 2) {
+        const auto rollback = rollback_metrics();
+        std::snprintf(buffer, sizeof(buffer),
+            "ROLLBACKS %u  REPLAYED %u  MAX %u",
+            rollback.rollback_count, rollback.replayed_frames,
+            rollback.largest_rollback);
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer),
+            "CORRECTIONS %u  STALLS %u  QUEUE %zu/%zu",
+            view.input_corrections, view.input_stalls,
+            view.outbound_queue_high_water, view.rollback_queue_high_water);
+        fields.emplace_back(buffer);
+        const auto phase_name = [](FrameDebtPhase phase) {
+            switch (phase) {
+            case FrameDebtPhase::Frontend: return "FRONTEND";
+            case FrameDebtPhase::LoadingBarrier: return "LOADING";
+            case FrameDebtPhase::GameplayStartBarrier: return "START GATE";
+            case FrameDebtPhase::Gameplay: return "GAMEPLAY";
+            case FrameDebtPhase::RecoveryBarrier: return "RECOVERY";
+            case FrameDebtPhase::FinishBarrier: return "FINISH GATE";
+            case FrameDebtPhase::PostRace: return "RESULTS";
+            case FrameDebtPhase::Inactive: break;
+            }
+            return "INACTIVE";
+        };
+        const FrameDebtSample& debt = rollback.frame_debt;
+        if (debt.valid) {
+            std::snprintf(buffer, sizeof(buffer),
+                "FRAME DEBT %u/%u  %s E%u/S%u  PACE %u HZ  SCTP C/A/R/S %zu/%zu/%zu/%zu",
+                debt.debt, rollback.target_frame_debt,
+                phase_name(debt.phase), rollback.input_epoch,
+                rollback.scene_epoch, rollback.pacing_target_hz,
+                view.control_transport_buffered_bytes,
+                view.authority_transport_buffered_bytes,
+                view.realtime_transport_buffered_bytes,
+                view.replica_transport_buffered_bytes);
+        } else if (debt.intentionally_parked) {
+            std::snprintf(buffer, sizeof(buffer),
+                "FRAME DEBT HELD  %s  SCTP C/A/R/S %zu/%zu/%zu/%zu",
+                phase_name(debt.phase), view.control_transport_buffered_bytes,
+                view.authority_transport_buffered_bytes,
+                view.realtime_transport_buffered_bytes,
+                view.replica_transport_buffered_bytes);
+        } else {
+            std::snprintf(buffer, sizeof(buffer),
+                "FRAME DEBT N/A  %s  SCTP C/A/R/S %zu/%zu/%zu/%zu",
+                phase_name(debt.phase), view.control_transport_buffered_bytes,
+                view.authority_transport_buffered_bytes,
+                view.realtime_transport_buffered_bytes,
+                view.replica_transport_buffered_bytes);
+        }
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer),
+            "PEER DEBT %u  RECOVERING %u  HOST HOLDS %llu  PROGRESS %s/%u MS",
+            view.maximum_peer_frame_debt, view.recovering_peer_count,
+            static_cast<unsigned long long>(view.host_backpressure_events),
+            view.peer_progress_known ? "LIVE" : "N/A",
+            view.oldest_peer_progress_age_ms);
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer),
+            "REPAIR TX/RX/BATCH %llu/%llu/%llu  LATE INPUT %llu",
+            static_cast<unsigned long long>(view.commit_repair_requests_sent),
+            static_cast<unsigned long long>(view.commit_repair_requests_received),
+            static_cast<unsigned long long>(view.commit_repair_batches_sent),
+            static_cast<unsigned long long>(view.late_inputs_discarded));
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer), "PACKETS %llu / %llu",
+            static_cast<unsigned long long>(view.packets_sent),
+            static_cast<unsigned long long>(view.packets_received));
+        fields.emplace_back(buffer);
+    }
+    if (g_network_overlay_single_row && fields.size() > 1U) {
+        std::string row = fields.front();
+        for (std::size_t index = 1; index < fields.size(); ++index) {
+            row += "  |  ";
+            row += fields[index];
+        }
+        fields.assign(1U, std::move(row));
+    }
+    DrawStatusOverlay("##dkr-r-network-overlay", std::move(fields),
+        g_network_overlay_position,
+        OverlayStackOffset(g_network_overlay_position, true, false),
+        kCream, kRaceBlue, g_network_overlay_extent);
+}
+
+std::string InputButtonSummary(std::uint16_t buttons) {
+    struct Label { std::uint16_t mask; const char* text; };
+    constexpr std::array<Label, 14> labels{{
+        {0x8000, "A"}, {0x4000, "B"}, {0x2000, "Z"},
+        {0x1000, "START"}, {0x0800, "DU"}, {0x0400, "DD"},
+        {0x0200, "DL"}, {0x0100, "DR"}, {0x0020, "L"},
+        {0x0010, "R"}, {0x0008, "CU"}, {0x0004, "CD"},
+        {0x0002, "CL"}, {0x0001, "CR"}}};
+    std::string result;
+    for (const Label& label : labels) {
+        if ((buttons & label.mask) == 0U) continue;
+        if (!result.empty()) result += '+';
+        result += label.text;
+    }
+    return result.empty() ? "-" : result;
+}
+
+void DrawControllerInputOverlay() {
+    using namespace dkr::runtime::netplay;
+    static ImVec2 extent{};
+    if (!g_controller_input_overlay_enabled || !session().active()) {
+        extent = {};
+        return;
+    }
+    const SessionView view = session().view();
+    if (view.state != ConnectionState::Running ||
+        view.local_slot >= view.room.players.size()) {
+        extent = {};
+        return;
+    }
+    std::vector<std::string> fields;
+    char buffer[224]{};
+    const PackedInput& local = view.local_input_submitted;
+    std::snprintf(buffer, sizeof(buffer),
+        "LOCAL P%u  X%+d Y%+d  %s",
+        static_cast<unsigned>(view.local_slot + 1U),
+        static_cast<int>(local.stick_x), static_cast<int>(local.stick_y),
+        InputButtonSummary(local.buttons).c_str());
+    fields.emplace_back(buffer);
+    if (view.authoritative_inputs_valid) {
+        for (std::size_t slot = 0; slot < view.room.players.size(); ++slot) {
+            if (!view.room.players[slot].occupied) continue;
+            const PackedInput& input = view.authoritative_inputs[slot];
+            std::snprintf(buffer, sizeof(buffer),
+                "HOST P%zu  X%+d Y%+d  %s",
+                slot + 1U, static_cast<int>(input.stick_x),
+                static_cast<int>(input.stick_y),
+                InputButtonSummary(input.buttons).c_str());
+            fields.emplace_back(buffer);
+        }
+    } else {
+        fields.emplace_back("WAITING FOR PLAYER 1 COMMIT");
+    }
+    DrawStatusOverlay("##dkr-r-controller-input-overlay",
+        std::move(fields), g_controller_input_overlay_position,
+        OverlayStackOffset(g_controller_input_overlay_position, true, true),
+        kCream, kAccent, extent);
+}
+
+bool UpdateOnlineErrorNotification() {
+    using dkr::runtime::netplay::ConnectionState;
+    const auto view = dkr::runtime::netplay::session().view();
+    const bool failed = view.state == ConnectionState::Failed &&
+                        !view.status.empty();
+    if (failed && (!g_online_error_was_active ||
+                   view.status != g_last_online_error)) {
+        g_online_error_notification =
+            dkr::runtime::netplay::online_failure_display_message(view.status);
+        g_last_online_error = view.status;
+        g_online_error_started = std::chrono::steady_clock::now();
+        g_online_failure_modal =
+            dkr::runtime::netplay::classify_online_failure(view.status);
+        g_online_failure_modal_message = g_online_error_notification;
+        g_online_failure_modal_requested = true;
+    }
+    g_online_error_was_active = failed;
+    if (!failed) g_last_online_error.clear();
+    if (g_online_error_notification.empty() ||
+        g_online_error_started.time_since_epoch().count() == 0) {
+        return false;
+    }
+    return std::chrono::steady_clock::now() - g_online_error_started <
+           std::chrono::seconds(10);
+}
+
+const char* OnlineFailureRecoveryText(
+    dkr::runtime::netplay::OnlineFailureCode code) {
+    using dkr::runtime::netplay::OnlineFailureCode;
+    switch (code) {
+        case OnlineFailureCode::ProtocolMismatch:
+        case OnlineFailureCode::BuildMismatch:
+        case OnlineFailureCode::PatchPolicyMismatch:
+            return "Install the same DKR-R build on every machine, then restart DKR-R before reconnecting.";
+        case OnlineFailureCode::GamePakMismatch:
+            return "Select the same supported Game Pak revision as player 1, then reconnect to the lobby.";
+        case OnlineFailureCode::GameplaySettingsMismatch:
+            return "Match the host's gameplay-affecting settings, then leave and rejoin the lobby.";
+        case OnlineFailureCode::MagicCodesMismatch:
+            return "Match the host's enabled Magic Codes in MODS / HACKS, then reconnect. The exact differences are listed below.";
+        case OnlineFailureCode::SaveMismatch:
+            return "Reload the synchronized session save. If the warning remains, repair or import the same valid 512-byte DKR EEPROM on both machines.";
+        case OnlineFailureCode::SimulationRateMismatch:
+            return "Use the same presentation preset and simulation rate on every machine, then reconnect.";
+        case OnlineFailureCode::PlatformMismatch:
+            return "This platform combination did not pass deterministic compatibility. Confirm both builds are from the same release package.";
+        case OnlineFailureCode::InvitationExpired:
+        case OnlineFailureCode::InvitationInvalid:
+            return "Ask the host for a fresh Quick Join code and enter it again.";
+        case OnlineFailureCode::HostUnreachable:
+            return "Confirm the host is still running, both racers are online, and DKR-R is allowed through each firewall. Then retry Quick Join.";
+        case OnlineFailureCode::RequestRejected:
+            return "The host declined this request. Ask the host to approve a new join request before retrying.";
+        case OnlineFailureCode::Blocked:
+            return "This racer is blocked by the host. The host must unblock them before another request can be accepted.";
+        case OnlineFailureCode::LobbyFull:
+            return "This two-racer lobby is full. Wait for Player 2's slot to open, then reconnect.";
+        case OnlineFailureCode::LobbyLocked:
+            return "The lobby is already launching or racing. Wait until the host returns to the lobby, then reconnect.";
+        case OnlineFailureCode::BaselineFailure:
+            return "Return every racer to the lobby and let player 1 start the event again. If it repeats, save the diagnostic log before restarting DKR-R.";
+        case OnlineFailureCode::DeterminismFailure:
+            return "The session stopped before divergent gameplay could continue. Return to the lobby, confirm matching settings and Game Paks, then retry.";
+        case OnlineFailureCode::RecoveryFailure:
+        case OnlineFailureCode::FinishBarrierTimeout:
+            return "The connection could not recover safely. Return to the lobby and retry after the connection has stabilized.";
+        case OnlineFailureCode::TransportFailure:
+            return "The network connection was interrupted. Check the connection, then reconnect through Quick Join.";
+        case OnlineFailureCode::None:
+        case OnlineFailureCode::Unknown:
+        default:
+            return "Return to the DKR-R Online tab for the persistent error. Retry after confirming matching builds, Game Paks, settings and a stable connection.";
+    }
+}
+
+void DrawMagicCodeDifferences(
+    const dkr::runtime::netplay::OnlineFailure& failure) {
+    if (!failure.has_magic_code_details) return;
+    const std::uint64_t host_only =
+        failure.expected_magic_codes & ~failure.candidate_magic_codes;
+    const std::uint64_t racer_only =
+        failure.candidate_magic_codes & ~failure.expected_magic_codes;
+    if (host_only == 0U && racer_only == 0U) return;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("MAGIC CODE DIFFERENCES");
+    for (const auto& definition :
+         dkr::runtime::magic_codes::kMagicCodeDefinitions) {
+        const std::uint64_t bit =
+            dkr::runtime::magic_codes::magic_code_bit(
+                definition.internal_index);
+        if ((host_only & bit) != 0U) {
+            ImGui::BulletText("HOST ON / THIS RACER OFF: %s - %s",
+                              definition.phrase, definition.effect);
+        } else if ((racer_only & bit) != 0U) {
+            ImGui::BulletText("HOST OFF / THIS RACER ON: %s - %s",
+                              definition.phrase, definition.effect);
+        }
+    }
+}
+
+void DrawOnlineFailureModal() {
+    constexpr const char* kPopupName = "DKR-R Online needs attention";
+    if (g_online_failure_modal_requested) {
+        ImGui::OpenPopup(kPopupName);
+        g_online_failure_modal_requested = false;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 size{
+        std::clamp(display.x * 0.72F, 500.0F, 880.0F),
+        std::clamp(display.y * 0.68F, 360.0F, 650.0F)};
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    if (!BeginPaddedModal(kPopupName)) {
+        g_online_failure_modal_active = false;
+        return;
+    }
+    g_online_failure_modal_active = true;
+
+    if (g_font_title != nullptr) ImGui::PushFont(g_font_title);
+    ImGui::TextColored(kRaceRed, "ONLINE SESSION HALTED");
+    if (g_font_title != nullptr) ImGui::PopFont();
+    ImGui::Dummy({0.0F, 4.0F});
+
+    const float footer_height = 58.0F;
+    if (BeginPaddedChild("##online-failure-help",
+                         {0.0F, -(footer_height + ImGui::GetStyle().ItemSpacing.y)},
+                         false, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+        ImGui::PushTextWrapPos(0.0F);
+        ImGui::TextWrapped("%s", g_online_failure_modal_message.c_str());
+        ImGui::Dummy({0.0F, 8.0F});
+        ImGui::TextColored(kWarm, "HOW TO RECOVER");
+        ImGui::TextWrapped("%s", OnlineFailureRecoveryText(
+            g_online_failure_modal.code));
+        DrawMagicCodeDifferences(g_online_failure_modal);
+        const auto session_view = dkr::runtime::netplay::session().view();
+        if (session_view.compatibility_sync_offer.has_value()) {
+            ImGui::Separator();
+            ImGui::TextColored(kAccent, "ONE-CLICK HOST SYNC AVAILABLE");
+            ImGui::TextWrapped(
+                "DKR-R can select the host's Game Pak only if that exact supported ROM is already in your library, mirror the host's Magic Codes, verify the resulting manifest, and retry this invitation. No ROM data is transferred.");
+        }
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::EndChild();
+
+    const auto session_view = dkr::runtime::netplay::session().view();
+    if (session_view.compatibility_sync_offer.has_value()) {
+        if (ImGui::Button("SYNC WITH HOST & RETRY", {280.0F, 42.0F})) {
+            g_online_compatibility_sync_requested = true;
+            g_online_failure_modal_active = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+    }
+    const float button_width = 150.0F;
+    if (ImGui::Button("GOT IT", {button_width, 42.0F})) {
+        g_online_failure_modal_active = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void DrawOnlineErrorNotification() {
+    const auto now = std::chrono::steady_clock::now();
+    const float elapsed = std::chrono::duration<float>(
+        now - g_online_error_started).count();
+    if (elapsed < 0.0F || elapsed >= 10.0F ||
+        g_online_error_notification.empty()) {
+        return;
+    }
+
+    // Remain fully legible for eight seconds, then fade smoothly during the
+    // final two. This is a non-modal warning: the persistent error remains in
+    // Online MP, while gameplay/overlay controls stay usable underneath it.
+    const float alpha = elapsed <= 8.0F
+        ? 1.0F : std::clamp((10.0F - elapsed) / 2.0F, 0.0F, 1.0F);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float width = std::clamp(display.x * 0.70F, 340.0F, 900.0F);
+    ImGui::SetNextWindowPos({display.x * 0.5F, display.y - 24.0F},
+                            ImGuiCond_Always, {0.5F, 1.0F});
+    ImGui::SetNextWindowSize({width, 0.0F}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.94F * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {18.0F, 14.0F});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.12F, 0.025F, 0.025F, 0.96F});
+    ImGui::PushStyleColor(ImGuiCol_Border, kRaceRed);
+    if (ImGui::Begin("##dkr-r-online-error-notification", nullptr,
+                     ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        if (g_font_title != nullptr) ImGui::PushFont(g_font_title);
+        ImGui::TextUnformatted("ONLINE SESSION HALTED");
+        if (g_font_title != nullptr) ImGui::PopFont();
+        ImGui::PopStyleColor();
+        ImGui::Dummy({0.0F, 4.0F});
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width - 36.0F);
+        ImGui::TextWrapped("%s", g_online_error_notification.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
+void DrawOnlineStartCountdown() {
+    const auto view = dkr::runtime::netplay::session().view();
+    static std::uint32_t observed_generation = 0U;
+    static std::uint32_t sounded_second = 0U;
+    if (!view.launch_countdown_active ||
+        view.launch_countdown_remaining_ms == 0U) {
+        sounded_second = 0U;
+        return;
+    }
+
+    if (observed_generation != view.launch_countdown_generation) {
+        observed_generation = view.launch_countdown_generation;
+        sounded_second = 0U;
+    }
+    const std::uint32_t second = std::clamp(
+        (view.launch_countdown_remaining_ms + 999U) / 1000U, 1U, 5U);
+    if (second != sounded_second) {
+        sounded_second = second;
+        const auto tone = dkr::runtime::ui_cues::online_launch_tone(second);
+        if (tone) {
+            dkr::runtime::platform::request_ui_tone(
+                tone.frequency_hz, tone.duration_ms);
+        }
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float maximum_width = std::max(280.0F, display.x - 32.0F);
+    const float width = std::min(
+        std::clamp(display.x * 0.58F, 460.0F, 900.0F), maximum_width);
+    ImGui::SetNextWindowPos({display.x * 0.5F, display.y * 0.42F},
+                            ImGuiCond_Always, {0.5F, 0.5F});
+    ImGui::SetNextWindowSize({width, 0.0F}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.94F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0F, 20.0F});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.025F, 0.08F, 0.12F, 0.97F});
+    ImGui::PushStyleColor(ImGuiCol_Border, kAccent);
+    if (ImGui::Begin("##dkr-r-online-start-countdown", nullptr,
+                     ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoSavedSettings)) {
+        const char* heading = "DKR-R ONLINE STARTING IN...";
+        if (g_font_title != nullptr) ImGui::PushFont(g_font_title);
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        const float heading_width = ImGui::CalcTextSize(heading).x;
+        const float heading_available = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(
+            0.0F, (heading_available - heading_width) * 0.5F));
+        ImGui::TextUnformatted(heading);
+        ImGui::PopStyleColor();
+        if (g_font_title != nullptr) ImGui::PopFont();
+        ImGui::Dummy({0.0F, 8.0F});
+        char number[2]{static_cast<char>('0' + second), '\0'};
+        if (g_font_title != nullptr) ImGui::PushFont(g_font_title);
+        ImGui::SetWindowFontScale(3.6F);
+        const float number_width = ImGui::CalcTextSize(number).x;
+        const float number_available = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(
+            0.0F, (number_available - number_width) * 0.5F));
+        ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
+        ImGui::TextUnformatted(number);
+        ImGui::PopStyleColor();
+        ImGui::SetWindowFontScale(1.0F);
+        if (g_font_title != nullptr) ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+const char* OnlineWaitReasonLabel(
+    dkr::runtime::netplay::OnlineWaitReason reason) {
+    using dkr::runtime::netplay::OnlineWaitReason;
+    switch (reason) {
+    case OnlineWaitReason::Loading:
+        return "LOADING THE SAME GAME STATE";
+    case OnlineWaitReason::RaceStart:
+        return "SYNCHRONIZING RACE START";
+    case OnlineWaitReason::Transition:
+        return "SYNCHRONIZING THE NEXT SCREEN";
+    case OnlineWaitReason::RaceFinish:
+        return "SYNCHRONIZING RACE RESULTS";
+    case OnlineWaitReason::Recovery:
+        return "RECOVERING THE SHARED TIMELINE";
+    case OnlineWaitReason::ClientCatchUp:
+        return "A RACER IS CATCHING UP";
+    case OnlineWaitReason::Cutscene:
+        return "SYNCHRONIZING CUTSCENE";
+    case OnlineWaitReason::None:
+    default:
+        return nullptr;
+    }
+}
+
+bool OnlineWaitingActive(
+    const dkr::runtime::netplay::SessionView& view) {
+    const bool launch_wait =
+        view.launch_stage == dkr::runtime::netplay::LaunchStage::Preparing ||
+        view.launch_stage == dkr::runtime::netplay::LaunchStage::Committing ||
+        view.launch_stage == dkr::runtime::netplay::LaunchStage::Releasing ||
+        (view.launch_countdown_active &&
+         view.launch_countdown_remaining_ms == 0U);
+    return launch_wait ||
+        dkr::runtime::netplay::online_wait_reason() !=
+            dkr::runtime::netplay::OnlineWaitReason::None;
+}
+
+void DrawOnlineWaitingNotification(
+    const dkr::runtime::netplay::SessionView& view) {
+    using dkr::runtime::netplay::LaunchStage;
+    const auto runtime_reason = dkr::runtime::netplay::online_wait_reason();
+    const std::uint64_t runtime_generation =
+        dkr::runtime::netplay::online_wait_generation();
+    const char* reason = nullptr;
+    bool launch_wait = true;
+    if (view.launch_countdown_active &&
+        view.launch_countdown_remaining_ms == 0U) {
+        reason = "WAITING FOR PLAYER 1'S SYNCHRONIZED START SIGNAL";
+    } else {
+        switch (view.launch_stage) {
+        case LaunchStage::Preparing:
+            reason = "VALIDATING EVERY RACER'S STARTING GRID";
+            break;
+        case LaunchStage::Committing:
+            reason = "ARMING THE SAME LAUNCH FOR EVERY RACER";
+            break;
+        case LaunchStage::Releasing:
+            reason = "RELEASING THE SYNCHRONIZED START";
+            break;
+        default:
+            launch_wait = false;
+            reason = OnlineWaitReasonLabel(runtime_reason);
+            break;
+        }
+    }
+
+    static auto pending_since = std::chrono::steady_clock::time_point{};
+    static dkr::runtime::netplay::OnlineWaitReason observed_reason =
+        dkr::runtime::netplay::OnlineWaitReason::None;
+    static std::uint64_t observed_generation = 0U;
+    const auto now = std::chrono::steady_clock::now();
+    if (reason == nullptr) {
+        pending_since = {};
+        observed_reason = dkr::runtime::netplay::OnlineWaitReason::None;
+        observed_generation = runtime_generation;
+        return;
+    }
+    if (!launch_wait &&
+        (observed_reason != runtime_reason ||
+         observed_generation != runtime_generation)) {
+        observed_reason = runtime_reason;
+        observed_generation = runtime_generation;
+        pending_since = now;
+    }
+    if (!launch_wait && pending_since.time_since_epoch().count() != 0 &&
+        now - pending_since < std::chrono::milliseconds(300)) {
+        return;
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float width = std::min(
+        std::clamp(display.x * 0.46F, 360.0F, 680.0F),
+        std::max(280.0F, display.x - 32.0F));
+    ImGui::SetNextWindowPos({display.x * 0.5F, display.y - 28.0F},
+                            ImGuiCond_Always, {0.5F, 1.0F});
+    ImGui::SetNextWindowSize({width, 0.0F}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.95F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {18.0F, 14.0F});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.025F, 0.08F, 0.12F, 0.97F});
+    ImGui::PushStyleColor(ImGuiCol_Border, kAccent);
+    if (ImGui::Begin("##dkr-r-online-waiting", nullptr,
+                     ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoSavedSettings)) {
+        const ImVec2 spinner_center{
+            ImGui::GetCursorScreenPos().x + 11.0F,
+            ImGui::GetCursorScreenPos().y + ImGui::GetTextLineHeight() * 0.5F};
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float angle = static_cast<float>(ImGui::GetTime() * 4.5);
+        draw->PathArcTo(spinner_center, 8.0F, angle,
+                        angle + 4.7F, 18);
+        draw->PathStroke(ImGui::ColorConvertFloat4ToU32(kWarm),
+                         false, 3.0F);
+        ImGui::Dummy({24.0F, 1.0F});
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextUnformatted("WAITING FOR RACERS");
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", reason);
+        ImGui::PopStyleColor();
+        ImGui::EndGroup();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+bool OnlineNotificationActive() {
+    return g_online_notifications.current(std::chrono::steady_clock::now()) !=
+           nullptr;
+}
+
+void DrawOnlineNotification() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto* notification = g_online_notifications.current(now);
+    if (notification == nullptr) return;
+    const float alpha =
+        dkr::runtime::ui_notifications::Queue::alpha(*notification, now);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float width = std::clamp(display.x * 0.30F, 300.0F, 460.0F);
+    const int position = std::clamp(g_friend_online_notification_position, 0, 3);
+    const float stack_offset = OverlayStackOffset(position, true, true);
+    constexpr float margin = 18.0F;
+    ImVec2 at{margin, margin + stack_offset};
+    ImVec2 pivot{0.0F, 0.0F};
+    if (position == 1 || position == 3) {
+        at.x = display.x - margin;
+        pivot.x = 1.0F;
+    }
+    if (position >= 2) {
+        at.y = display.y - margin - stack_offset;
+        pivot.y = 1.0F;
+    }
+    ImGui::SetNextWindowPos(at, ImGuiCond_Always, pivot);
+    ImGui::SetNextWindowSize({width, 0.0F}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.94F * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {18.0F, 14.0F});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.025F, 0.12F, 0.12F, 0.96F});
+    ImGui::PushStyleColor(ImGuiCol_Border, kAccent);
+    if (ImGui::Begin("##dkr-r-online-notification", nullptr,
+                     ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        if (g_font_title != nullptr) ImGui::PushFont(g_font_title);
+        ImGui::TextUnformatted(notification->title.c_str());
+        if (g_font_title != nullptr) ImGui::PopFont();
+        ImGui::PopStyleColor();
+        ImGui::Dummy({0.0F, 4.0F});
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width - 36.0F);
+        ImGui::TextWrapped("%s", notification->message.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
 }
 
 void DrawSaveNameEditor(const char* label, std::string& value, float width) {
@@ -2558,67 +7619,685 @@ float ScrollbarSafeControlWidth(float requested_width) {
                     1.0F);
 }
 
+bool DrawDisclosureButton(const char* label, const char* id, bool& expanded,
+                          float width) {
+    const float available_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    const std::string button_label = std::string(label) +
+        (expanded ? "  -  CLOSE" : "  -  OPEN") + "##" + id;
+    if (ImGui::Button(button_label.c_str(), {available_width, 42.0F})) {
+        expanded = !expanded;
+    }
+    return expanded;
+}
+
+void DrawCrtOverlayControls(float width) {
+    const float control_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    bool crt_enabled = g_crt_enabled;
+    if (ImGui::Checkbox("Enable CRT overlay", &crt_enabled)) {
+        g_crt_enabled = crt_enabled;
+        SaveSettings();
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    ImGui::TextWrapped(
+        "Applied only to the game image. DKR-R's settings and performance "
+        "overlays remain clear above it.");
+    ImGui::PopStyleColor();
+    if (g_crt_enabled) {
+        ImGui::TextUnformatted("Filter image");
+        ImGui::SetNextItemWidth(control_width);
+        if (!g_crt_filters.empty() &&
+            ControlCombo("##crt-filter", &g_crt_filter_index,
+                         CrtFilterGetter, &g_crt_filters,
+                         static_cast<int>(g_crt_filters.size()), 10)) {
+            SaveSettings();
+        }
+        ImGui::TextUnformatted("Scaling");
+        ImGui::SetNextItemWidth(control_width);
+        if (ControlCombo("##crt-scaling", &g_crt_scale_mode,
+                         "Stretch to viewport\0Tile at native size\0")) {
+            SaveSettings();
+        }
+        int density = static_cast<int>(
+            std::round(std::clamp(g_crt_strength, 0.0F, 1.0F) * 100.0F));
+        ImGui::TextUnformatted("Filter density");
+        ImGui::SetNextItemWidth(control_width);
+        if (ControlSliderInt("##crt-density", &density, 0, 100, "%d %%")) {
+            g_crt_strength = density / 100.0F;
+            SaveSettings();
+        }
+    }
+    if (ImGui::Button("IMPORT CUSTOM CRT FILTER", {control_width, 42.0F})) {
+        ImportCrtFilterWithDialog();
+    }
+    if (!g_crt_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", g_crt_status.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+void DrawTexturePackRemovalModal() {
+    const float display_width = std::max(ImGui::GetIO().DisplaySize.x, 1.0F);
+    const float minimum_width = std::min(480.0F, display_width - 36.0F);
+    ImGui::SetNextWindowSizeConstraints(
+        {std::max(minimum_width, 280.0F), 0.0F},
+        {std::min(680.0F, display_width - 18.0F), FLT_MAX});
+    if (!BeginPaddedModal("Remove texture pack?",
+                          ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::TextUnformatted("REMOVE TEXTURE PACK?");
+    ImGui::Separator();
+    ImGui::TextWrapped("%s", g_texture_pack_remove_name.c_str());
+    ImGui::Dummy({0.0F, 6.0F});
+    ImGui::TextWrapped(
+        "HIDE FROM LIST keeps DKR-R's managed copy on disk. Choose Hidden "
+        "from the Visibility filter to restore it later.");
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
+    ImGui::TextUnformatted("WARNING - PERMANENT DELETION CANNOT BE UNDONE");
+    ImGui::PopStyleColor();
+    ImGui::TextWrapped(
+        "DELETE COMPLETELY removes DKR-R's managed archive or converted "
+        "texture cache. The original source archive outside DKR-R is never touched.");
+    ImGui::Dummy({0.0F, 12.0F});
+    const float available = std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const bool compact = available < 560.0F;
+    const float action_width = compact ? available :
+        std::max((available - gap * 2.0F) / 3.0F, 1.0F);
+    if (ImGui::Button("CANCEL", {action_width, 44.0F})) {
+        ImGui::CloseCurrentPopup();
+    }
+    if (!compact) ImGui::SameLine();
+    if (ImGui::Button("HIDE FROM LIST", {action_width, 44.0F})) {
+        dkr::runtime::texture_packs::set_hidden(
+            g_texture_pack_remove_id, true, g_texture_pack_status);
+        ImGui::CloseCurrentPopup();
+    }
+    if (!compact) ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, {0.45F, 0.09F, 0.10F, 1.0F});
+    if (ImGui::Button("DELETE COMPLETELY", {action_width, 44.0F})) {
+        dkr::runtime::texture_packs::delete_managed(
+            g_texture_pack_remove_id, g_texture_pack_status);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::EndPopup();
+}
+
+std::string FormatManagedTexturePackSize(std::uintmax_t bytes) {
+    constexpr std::array<const char*, 5> units{{"B", "KB", "MB", "GB", "TB"}};
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0U;
+    while (value >= 1024.0 && unit + 1U < units.size()) {
+        value /= 1024.0;
+        ++unit;
+    }
+    char result[64]{};
+    std::snprintf(result, sizeof(result),
+                  unit == 0U ? "%.0f %s" : "%.1f %s", value, units[unit]);
+    return result;
+}
+
+bool DrawTexturePackManagementModal(
+    const std::vector<dkr::runtime::texture_packs::PackInfo>& packs) {
+    constexpr const char* kPopupName = "Manage texture pack";
+    const float display_width = std::max(ImGui::GetIO().DisplaySize.x, 1.0F);
+    ImGui::SetNextWindowSizeConstraints(
+        {std::min(540.0F, display_width - 36.0F), 0.0F},
+        {std::min(720.0F, display_width - 18.0F), FLT_MAX});
+    if (!BeginPaddedModal(kPopupName, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return false;
+    }
+
+    const auto match = std::find_if(
+        packs.begin(), packs.end(), [](const auto& pack) {
+            return pack.id == g_texture_pack_manage_id;
+        });
+    if (match == packs.end()) {
+        ImGui::TextUnformatted("MANAGE TEXTURE PACK");
+        ImGui::Separator();
+        ImGui::TextWrapped(
+            "This texture pack is no longer present in DKR-R's managed library.");
+        if (ImGui::Button("CLOSE", {150.0F, 42.0F})) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+        return false;
+    }
+
+    const auto& pack = *match;
+    ImGui::TextUnformatted("MANAGE TEXTURE PACK");
+    ImGui::Separator();
+    ImGui::TextWrapped("%s", pack.name.c_str());
+    ImGui::Dummy({0.0F, 5.0F});
+
+    ImGui::PushStyleColor(
+        ImGuiCol_Text,
+        pack.compatible && !pack.hidden ? kAccent : kWarm);
+    ImGui::TextUnformatted(pack.hidden
+        ? "HIDDEN"
+        : (pack.enabled ? "ACTIVE" : "INACTIVE"));
+    ImGui::SameLine();
+    ImGui::TextUnformatted("  -  ");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(pack.compatible ? "COMPATIBLE" : "INCOMPATIBLE");
+    ImGui::PopStyleColor();
+
+    if (ImGui::BeginTable("texture-pack-information", 2,
+                          ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_BordersInnerH)) {
+        const auto detail_row = [](const char* label,
+                                   const std::string& value) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextDisabled("%s", label);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextWrapped("%s", value.c_str());
+        };
+        detail_row("TYPE", dkr::runtime::texture_packs::format_name(pack.format));
+        detail_row("MANAGED SIZE",
+                   FormatManagedTexturePackSize(pack.managed_size_bytes));
+        detail_row("TEXTURES", std::to_string(pack.image_count));
+        detail_row("VISIBILITY", pack.hidden ? "Hidden" : "Visible");
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("MANAGED LOCATION");
+    ImGui::TextWrapped("%s", pack.path.string().c_str());
+    if (!pack.detail.empty()) {
+        ImGui::Dummy({0.0F, 3.0F});
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", pack.detail.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Dummy({0.0F, 8.0F});
+    const float available = std::max(ImGui::GetContentRegionAvail().x, 1.0F);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    // The normal 540px modal has room for a two-column action grid. Only stack
+    // on genuinely narrow viewports; this keeps every option visible within a
+    // 1280x800 Steam Deck window without shrinking the labels.
+    const bool compact = available < 440.0F;
+    const float action_width = compact ? available :
+        std::max((available - gap) * 0.5F, 1.0F);
+
+    ImGui::BeginDisabled(pack.hidden || !pack.compatible);
+    if (ImGui::Button(pack.enabled ? "DEACTIVATE PACK" : "ACTIVATE PACK",
+                      {action_width, 42.0F})) {
+        dkr::runtime::texture_packs::set_enabled(pack.id, !pack.enabled);
+    }
+    ImGui::EndDisabled();
+    if (!compact) ImGui::SameLine();
+    if (ImGui::Button(pack.hidden ? "RESTORE TO LIBRARY" : "HIDE FROM LIBRARY",
+                      {action_width, 42.0F})) {
+        dkr::runtime::texture_packs::set_hidden(
+            pack.id, !pack.hidden, g_texture_pack_status);
+    }
+
+    std::error_code path_error;
+    const std::filesystem::path managed_location =
+        std::filesystem::is_directory(pack.path, path_error)
+            ? pack.path
+            : pack.path.parent_path();
+    if (ImGui::Button("OPEN MANAGED LOCATION", {action_width, 42.0F})) {
+        if (dkr::runtime::support::open_directory(
+                managed_location, g_texture_pack_status)) {
+            g_texture_pack_status = "Opened the managed texture-pack location.";
+        }
+    }
+    if (!compact) ImGui::SameLine();
+    if (ImGui::Button("REFRESH PACK DETAILS", {action_width, 42.0F})) {
+        dkr::runtime::texture_packs::refresh();
+        g_texture_pack_status = "Texture-pack details refreshed.";
+    }
+
+    bool request_removal = false;
+    ImGui::PushStyleColor(ImGuiCol_Button, {0.45F, 0.09F, 0.10F, 1.0F});
+    if (ImGui::Button("REMOVE PACK...", {action_width, 42.0F})) {
+        g_texture_pack_remove_id = pack.id;
+        g_texture_pack_remove_name = pack.name;
+        request_removal = true;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor();
+    if (!compact) ImGui::SameLine();
+    if (ImGui::Button("CLOSE", {action_width, 42.0F})) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+    return request_removal;
+}
+
+void DrawTexturePackControls(float width) {
+    using namespace dkr::runtime;
+    using namespace dkr::runtime::texture_browser;
+    const float available_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+    ImGui::TextWrapped(
+        "Search, arrange and activate managed RT64 and Rice texture packs. "
+        "Technical import details stay out of the library cards.");
+    ImGui::PopStyleColor();
+
+    ImGui::TextUnformatted("Search");
+    ImGui::PushID("texture-pack-search");
+    {
+        const ControlFontScope scope;
+        const char* search_label = g_texture_pack_search[0] != '\0'
+            ? g_texture_pack_search : "SEARCH TEXTURE PACKS...";
+        if (ImGui::Button(search_label,
+                          {available_width, ImGui::GetFrameHeight()})) {
+            RequestTextEntryKeyboard(TextEntryTarget::TexturePackSearch);
+        }
+    }
+    ImGui::PopID();
+
+    const auto draw_filter = [&](const char* title, const char* id, int* value,
+                                 const char* items, float control_width) {
+        ImGui::BeginGroup();
+        ImGui::TextDisabled("%s", title);
+        ImGui::SetNextItemWidth(control_width);
+        ControlCombo(id, value, items);
+        ImGui::EndGroup();
+    };
+    constexpr const char* kSortItems =
+        "Name A-Z\0Name Z-A\0Largest first\0Smallest first\0Newest first\0"
+        "Oldest first\0Type\0";
+    constexpr const char* kStateItems = "All\0Active\0Inactive\0";
+    constexpr const char* kCompatibilityItems =
+        "All\0Compatible\0Incompatible\0";
+    constexpr const char* kTypeItems =
+        "All\0Native RT64\0Rice / RT64 Bridge\0Legacy Rice\0Legacy Jabo\0";
+    constexpr const char* kVisibilityItems = "Visible\0All\0Hidden\0";
+
+    struct FilterControl {
+        const char* title;
+        const char* id;
+        int* value;
+        const char* items;
+    };
+    const std::array<FilterControl, 5> filter_controls{{
+        {"SORT", "##texture-pack-sort", &g_texture_pack_sort, kSortItems},
+        {"STATE", "##texture-pack-state", &g_texture_pack_state_filter,
+         kStateItems},
+        {"COMPATIBILITY", "##texture-pack-compatibility",
+         &g_texture_pack_compatibility_filter, kCompatibilityItems},
+        {"TYPE", "##texture-pack-type", &g_texture_pack_type_filter,
+         kTypeItems},
+        {"VISIBILITY", "##texture-pack-visibility",
+         &g_texture_pack_visibility_filter, kVisibilityItems},
+    }};
+    const auto draw_filter_row = [&](const char* table_id,
+                                     std::size_t first,
+                                     std::size_t count) {
+        if (!ImGui::BeginTable(table_id, static_cast<int>(count),
+                               ImGuiTableFlags_SizingStretchSame,
+                               {available_width, 0.0F})) {
+            return;
+        }
+        // Keep labels and controls in separate physical table rows. This avoids
+        // the larger control font changing the row baseline after column one.
+        ImGui::TableNextRow();
+        for (std::size_t index = first; index < first + count; ++index) {
+            ImGui::TableSetColumnIndex(static_cast<int>(index - first));
+            const FilterControl& control = filter_controls[index];
+            ImGui::TextDisabled("%s", control.title);
+        }
+        ImGui::TableNextRow();
+        for (std::size_t index = first; index < first + count; ++index) {
+            ImGui::TableSetColumnIndex(static_cast<int>(index - first));
+            const FilterControl& control = filter_controls[index];
+            ImGui::SetNextItemWidth(
+                std::max(ImGui::GetContentRegionAvail().x, 1.0F));
+            ControlCombo(control.id, control.value, control.items);
+        }
+        ImGui::EndTable();
+    };
+
+    if (available_width >= 1100.0F) {
+        draw_filter_row("##texture-pack-filter-row-all", 0U, 5U);
+    } else if (available_width >= 700.0F) {
+        draw_filter_row("##texture-pack-filter-row-three", 0U, 3U);
+        draw_filter_row("##texture-pack-filter-row-two", 3U, 2U);
+    } else if (available_width >= 460.0F) {
+        draw_filter_row("##texture-pack-filter-row-pair-one", 0U, 2U);
+        draw_filter_row("##texture-pack-filter-row-pair-two", 2U, 2U);
+        draw_filter_row("##texture-pack-filter-row-one", 4U, 1U);
+    } else {
+        draw_filter("SORT", "##texture-pack-sort", &g_texture_pack_sort,
+                    kSortItems, available_width);
+        draw_filter("STATE", "##texture-pack-state", &g_texture_pack_state_filter,
+                    kStateItems, available_width);
+        draw_filter("COMPATIBILITY", "##texture-pack-compatibility",
+                    &g_texture_pack_compatibility_filter, kCompatibilityItems,
+                    available_width);
+        draw_filter("TYPE", "##texture-pack-type", &g_texture_pack_type_filter,
+                    kTypeItems, available_width);
+        draw_filter("VISIBILITY", "##texture-pack-visibility",
+                    &g_texture_pack_visibility_filter, kVisibilityItems,
+                    available_width);
+    }
+
+    Filters filters{};
+    filters.query = g_texture_pack_search;
+    filters.state = static_cast<StateFilter>(
+        std::clamp(g_texture_pack_state_filter, 0, 2));
+    filters.compatibility = static_cast<CompatibilityFilter>(
+        std::clamp(g_texture_pack_compatibility_filter, 0, 2));
+    filters.visibility = static_cast<VisibilityFilter>(
+        std::clamp(g_texture_pack_visibility_filter, 0, 2));
+    switch (std::clamp(g_texture_pack_type_filter, 0, 4)) {
+    case 1: filters.format = texture_packs::Format::NativeRt64; break;
+    case 2: filters.format = texture_packs::Format::RiceRt64; break;
+    case 3: filters.format = texture_packs::Format::LegacyRice; break;
+    case 4: filters.format = texture_packs::Format::LegacyJabo; break;
+    default: filters.format = texture_packs::Format::Unknown; break;
+    }
+    struct TexturePackBrowserCache {
+        std::uint64_t library_generation = 0U;
+        std::string query;
+        int sort = -1;
+        int state = -1;
+        int compatibility = -1;
+        int type = -1;
+        int visibility = -1;
+        std::vector<texture_packs::PackInfo> all;
+        std::vector<texture_packs::PackInfo> shown;
+    };
+    static TexturePackBrowserCache browser_cache;
+    const std::uint64_t library_generation = texture_packs::generation();
+    const int sort_mode = std::clamp(g_texture_pack_sort, 0, 6);
+    const int state_filter = std::clamp(g_texture_pack_state_filter, 0, 2);
+    const int compatibility_filter =
+        std::clamp(g_texture_pack_compatibility_filter, 0, 2);
+    const int type_filter = std::clamp(g_texture_pack_type_filter, 0, 4);
+    const int visibility_filter =
+        std::clamp(g_texture_pack_visibility_filter, 0, 2);
+    const std::string query = g_texture_pack_search;
+    if (browser_cache.library_generation != library_generation) {
+        browser_cache.all = texture_packs::snapshot(true);
+        browser_cache.library_generation = library_generation;
+        browser_cache.sort = -1;
+    }
+    if (browser_cache.sort != sort_mode ||
+        browser_cache.state != state_filter ||
+        browser_cache.compatibility != compatibility_filter ||
+        browser_cache.type != type_filter ||
+        browser_cache.visibility != visibility_filter ||
+        browser_cache.query != query) {
+        browser_cache.shown = select(
+            browser_cache.all, filters, static_cast<SortMode>(sort_mode));
+        browser_cache.query = query;
+        browser_cache.sort = sort_mode;
+        browser_cache.state = state_filter;
+        browser_cache.compatibility = compatibility_filter;
+        browser_cache.type = type_filter;
+        browser_cache.visibility = visibility_filter;
+    }
+    const auto& all_packs = browser_cache.all;
+    const auto& shown_packs = browser_cache.shown;
+
+    ImGui::Dummy({0.0F, 3.0F});
+    ImGui::TextDisabled("%zu PACK%s SHOWN", shown_packs.size(),
+                        shown_packs.size() == 1U ? "" : "S");
+    const bool texture_import_running = TexturePackImportRunning();
+    const float action_gap = ImGui::GetStyle().ItemSpacing.x;
+    const bool stacked_actions = available_width < 430.0F;
+    const float action_width = stacked_actions ? available_width :
+        std::max((available_width - action_gap) * 0.5F, 1.0F);
+    ImGui::BeginDisabled(texture_import_running);
+    if (ImGui::Button("IMPORT TEXTURE PACK", {action_width, 42.0F})) {
+        ImportTexturePackWithDialog();
+    }
+    if (!stacked_actions) ImGui::SameLine();
+    if (ImGui::Button("REFRESH PACKS", {action_width, 42.0F})) {
+        texture_packs::refresh();
+    }
+    ImGui::EndDisabled();
+
+    bool request_manage_modal = false;
+    if (shown_packs.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped(all_packs.empty()
+            ? "No texture packs have been imported yet."
+            : "No texture packs match the current search and filters.");
+        ImGui::PopStyleColor();
+    } else {
+        const ImGuiStyle& style = ImGui::GetStyle();
+        constexpr ImVec2 kPackCardPadding{12.0F, 10.0F};
+        constexpr float kManageHeight = 36.0F;
+        constexpr float kManageBottomGap = 10.0F;
+        const int columns = responsive_column_count(
+            available_width, style.ItemSpacing.x, 260.0F);
+
+        // Reserve enough vertical space for the longest complete wrapped name
+        // in the current result set. Every card uses that same measurement, so
+        // rows remain uniform without imposing a line cap or ellipsis.
+        const float estimated_cell_width = std::max(
+            (available_width - style.ItemSpacing.x *
+                                   static_cast<float>(columns - 1)) /
+                    static_cast<float>(columns) -
+                style.CellPadding.x * 2.0F,
+            1.0F);
+        const float name_wrap_width = std::max(
+            estimated_cell_width - kPackCardPadding.x * 2.0F -
+                ImGui::GetFrameHeight() - style.ItemSpacing.x - 10.0F,
+            48.0F);
+        float name_region_height = ImGui::GetTextLineHeight();
+        for (const auto& pack : shown_packs) {
+            name_region_height = std::max(
+                name_region_height,
+                ImGui::CalcTextSize(pack.name.c_str(), nullptr, false,
+                                    name_wrap_width).y);
+        }
+        name_region_height += 4.0F;
+        const float pack_card_height = std::max(
+            166.0F,
+            kPackCardPadding.y * 2.0F +
+                std::max(name_region_height, ImGui::GetFrameHeight()) +
+                style.ItemSpacing.y + ImGui::GetTextLineHeight() +
+                style.ItemSpacing.y + kManageHeight + kManageBottomGap);
+
+        if (ImGui::BeginTable("texture-pack-browser-grid", columns,
+                              ImGuiTableFlags_SizingStretchSame,
+                              {available_width, 0.0F})) {
+            for (const auto& pack : shown_packs) {
+                ImGui::TableNextColumn();
+                ImGui::PushID(pack.id.c_str());
+                if (BeginPaddedChild(
+                        "texture-pack-card", {0.0F, pack_card_height}, true,
+                        ImGuiWindowFlags_NoScrollbar |
+                            ImGuiWindowFlags_NoScrollWithMouse,
+                        kPackCardPadding)) {
+                    bool enabled = pack.enabled;
+                    ImGui::BeginDisabled(pack.hidden || !pack.compatible);
+                    if (ImGui::Checkbox("##enabled", &enabled)) {
+                        texture_packs::set_enabled(pack.id, enabled);
+                    }
+                    ImGui::EndDisabled();
+                    if (pack.enabled && ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Active");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::BeginChild(
+                            "pack-name",
+                            {0.0F, name_region_height}, false,
+                            ImGuiWindowFlags_NoScrollbar |
+                                ImGuiWindowFlags_NoScrollWithMouse)) {
+                        ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
+                        ImGui::TextWrapped("%s", pack.name.c_str());
+                        ImGui::PopTextWrapPos();
+                    }
+                    ImGui::EndChild();
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        pack.compatible ? kAccent : kWarm);
+                    std::string type = texture_packs::format_name(pack.format);
+                    ImGui::TextUnformatted(type.c_str());
+                    if (!pack.compatible && ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Incompatible with live activation");
+                    }
+                    ImGui::PopStyleColor();
+
+                    const float manage_y = pack_card_height -
+                        kPackCardPadding.y - kManageBottomGap - kManageHeight;
+                    ImGui::SetCursorPosY(
+                        std::max(ImGui::GetCursorPosY(), manage_y));
+                    if (ImGui::Button("MANAGE...",
+                                      {ImGui::GetContentRegionAvail().x,
+                                       kManageHeight})) {
+                        g_texture_pack_manage_id = pack.id;
+                        request_manage_modal = true;
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    if (request_manage_modal) ImGui::OpenPopup("Manage texture pack");
+    const bool request_remove_modal =
+        DrawTexturePackManagementModal(all_packs);
+    if (request_remove_modal) ImGui::OpenPopup("Remove texture pack?");
+    DrawTexturePackRemovalModal();
+
+    if (!g_texture_pack_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", g_texture_pack_status.c_str());
+        ImGui::PopStyleColor();
+    }
+    const std::string texture_status = texture_packs::status();
+    if (!texture_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("%s", texture_status.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 void DrawMagicCodes(float width) {
     using namespace dkr::runtime::magic_codes;
 
-    const float control_width = ScrollbarSafeControlWidth(width);
     static bool expanded = false;
-    if (ImGui::Button(expanded ? "MAGIC CODES  -  CLOSE"
-                               : "MAGIC CODES  -  OPEN",
-                      {control_width, 42.0F})) {
-        expanded = !expanded;
-    }
-    if (!expanded) {
-        return;
-    }
-    bool diagnostics_heading_drawn = false;
-    for (const auto& definition : kMagicCodeDefinitions) {
-        if (definition.diagnostic && !diagnostics_heading_drawn) {
-            ImGui::SeparatorText("Diagnostics - use with care");
-            diagnostics_heading_drawn = true;
+    const float available_width = std::max(
+        std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+    if (!DrawDisclosureButton("MAGIC CODES", "magic-codes", expanded,
+                              available_width)) return;
+
+    const float item_gap = ImGui::GetStyle().ItemSpacing.x;
+    constexpr float kComfortableMagicCodeColumnWidth = 320.0F;
+    const int columns = std::clamp(static_cast<int>(
+        (available_width + item_gap) /
+        (kComfortableMagicCodeColumnWidth + item_gap)), 1, 3);
+
+    const auto draw_group = [&](bool diagnostics, const char* table_id) {
+        if (!ImGui::BeginTable(table_id, columns,
+                               ImGuiTableFlags_SizingStretchSame,
+                               {available_width, 0.0F})) {
+            return;
         }
-        ImGui::PushID(static_cast<int>(definition.internal_index));
-        bool enabled = magic_code_enabled(selected_mask(),
-                                          definition.internal_index);
-        const std::string label = std::string(definition.phrase) +
-            (definition.one_shot ? " - NEXT LAUNCH" : "");
-        if (ImGui::Checkbox(label.c_str(), &enabled)) {
-            std::string error;
-            if (set_enabled(definition.internal_index, enabled, error)) {
-                SaveSettings();
-                g_save_manager_status = enabled
-                    ? std::string(definition.phrase) +
-                        (definition.one_shot
-                            ? " queued for the next game launch."
-                            : " will be active on launch.")
-                    : std::string(definition.phrase) + " disabled.";
-            } else {
-                g_save_manager_status = error;
+        for (const auto& definition : kMagicCodeDefinitions) {
+            if (definition.diagnostic != diagnostics) continue;
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(definition.internal_index));
+            bool enabled = magic_code_enabled(selected_mask(),
+                                              definition.internal_index);
+            const std::string label = std::string(definition.phrase) +
+                (definition.one_shot ? " - NEXT LAUNCH" : "");
+            if (ImGui::Checkbox(label.c_str(), &enabled)) {
+                std::string error;
+                if (set_enabled(definition.internal_index, enabled, error)) {
+                    SaveSettings();
+                    g_magic_codes_status = enabled
+                        ? std::string(definition.phrase) +
+                            (definition.one_shot
+                                ? " queued for the next game launch."
+                                : " will be active on launch.")
+                        : std::string(definition.phrase) + " disabled.";
+                } else {
+                    g_magic_codes_status = error;
+                }
             }
+            ImGui::Indent(28.0F);
+            ImGui::PushTextWrapPos(
+                ImGui::GetCursorPosX() +
+                std::max(ImGui::GetContentRegionAvail().x, 1.0F));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  diagnostics ? kRaceRed : kMuted);
+            ImGui::TextWrapped("%s", definition.effect);
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
+            ImGui::Unindent(28.0F);
+            ImGui::Dummy({0.0F, 8.0F});
+            ImGui::PopID();
         }
-        ImGui::Indent(28.0F);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() +
-                              std::max(width - 28.0F, 1.0F));
-        if (definition.diagnostic) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        }
-        ImGui::TextWrapped("%s", definition.effect);
-        ImGui::PopStyleColor();
-        ImGui::PopTextWrapPos();
-        ImGui::Unindent(28.0F);
-        ImGui::PopID();
-    }
+        ImGui::EndTable();
+    };
+
+    ImGui::Dummy({0.0F, 8.0F});
+    ImGui::SeparatorText("RACE MODIFIERS");
+    draw_group(false, "magic-code-grid");
+    ImGui::SeparatorText("DIAGNOSTICS - USE WITH CARE");
+    draw_group(true, "magic-code-diagnostics-grid");
 
     ImGui::Dummy({0.0F, 6.0F});
-    if (ImGui::Button("CLEAR ALL MAGIC CODES", {control_width, 42.0F})) {
+    if (ImGui::Button("CLEAR ALL MAGIC CODES", {available_width, 42.0F})) {
         std::string error;
         if (clear_all(error)) {
             SaveSettings();
-            g_save_manager_status = "All launch Magic Codes cleared.";
+            g_magic_codes_status = "All launch Magic Codes cleared.";
         } else {
-            g_save_manager_status = error;
+            g_magic_codes_status = error;
+        }
+    }
+    if (!g_magic_codes_status.empty()) {
+        ImGui::Dummy({0.0F, 8.0F});
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarm);
+        ImGui::TextWrapped("%s", g_magic_codes_status.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+void DrawModsHacks(float width) {
+    DrawPageHeading("MODS / HACKS");
+    ImGui::TextDisabled(
+        "Choose the island rules that DKR-R applies on the next launch.");
+    ImGui::Dummy({0.0F, 16.0F});
+    DrawMagicCodes(width);
+    ImGui::Dummy({0.0F, 10.0F});
+
+    static bool crt_expanded = false;
+    if (DrawDisclosureButton("CRT OVERLAYS", "crt-overlays", crt_expanded,
+                             width)) {
+        ImGui::Dummy({0.0F, 6.0F});
+        if (dkr::runtime::enhancements::modern_presentation_enabled()) {
+            DrawCrtOverlayControls(width);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+            ImGui::TextWrapped(
+                "CRT overlays are available in the Modern presentation profile. "
+                "Accurate mode remains unchanged.");
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::Dummy({0.0F, 10.0F});
+
+    static bool texture_packs_expanded = true;
+    if (DrawDisclosureButton("TEXTURE PACKS", "texture-packs",
+                             texture_packs_expanded, width)) {
+        ImGui::Dummy({0.0F, 6.0F});
+        if (dkr::runtime::enhancements::modern_presentation_enabled()) {
+            DrawTexturePackControls(width);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+            ImGui::TextWrapped(
+                "Texture-pack management is available in the Modern "
+                "presentation profile. Accurate mode remains unchanged.");
+            ImGui::PopStyleColor();
         }
     }
 }
@@ -2670,6 +8349,13 @@ void DrawAdventureBuilder(float width) {
                 AdventureSlot& slot = image.slots[static_cast<std::size_t>(slot_index)];
                 ImGui::PushID(slot_index);
                 const float control_width = ScrollbarSafeControlWidth(width);
+                const float builder_width = std::max(
+                    std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+                const float builder_gap = ImGui::GetStyle().ItemSpacing.x;
+                constexpr float kComfortableBuilderColumnWidth = 320.0F;
+                const int builder_columns = std::clamp(static_cast<int>(
+                    (builder_width + builder_gap) /
+                    (kComfortableBuilderColumnWidth + builder_gap)), 1, 3);
                 DrawSaveNameEditor("Racer initials", slot.name, control_width);
 
                 ImGui::SeparatorText("Golden Balloons");
@@ -2690,62 +8376,144 @@ void DrawAdventureBuilder(float width) {
                 ImGui::ProgressBar(
                     static_cast<float>(slot.balloons[0]) /
                         static_cast<float>(kMaximumTotalBalloons),
-                    {control_width, 0.0F}, total_label);
+                    {builder_width, 0.0F}, total_label);
 
                 constexpr std::array<const char*, kWorldCount> area_names{{
                     "DKR-R", "Dino Domain", "Sherbet Island",
                     "Snowflake Mountain", "Dragon Forest", "Future Fun Land"}};
-                for (std::size_t area = 0; area < kWorldCount; ++area) {
-                    int value = area == 0U ? hub_balloons : slot.balloons[area];
-                    const int maximum = area == 0U
-                        ? kMaximumHubBalloons : kMaximumWorldBalloons;
-                    ImGui::PushID(static_cast<int>(area));
-                    if (DrawLabeledSliderInt(area_names[area], "##balloons",
-                                             &value, 0, maximum, "%d",
-                                             control_width)) {
-                        if (area == 0U) {
-                            hub_balloons = value;
-                        } else {
-                            slot.balloons[area] =
-                                static_cast<std::uint8_t>(value);
+                if (ImGui::BeginTable("balloon-setting-grid", builder_columns,
+                                      ImGuiTableFlags_SizingStretchSame,
+                                      {builder_width, 0.0F})) {
+                    const float slider_row_height = ImGui::GetTextLineHeight() +
+                        ImGui::GetFrameHeight() +
+                        (ImGui::GetStyle().ItemSpacing.y * 2.0F);
+                    const std::size_t column_count =
+                        static_cast<std::size_t>(builder_columns);
+                    for (std::size_t row = 0;
+                         row * column_count < kWorldCount; ++row) {
+                        ImGui::TableNextRow(ImGuiTableRowFlags_None,
+                                            slider_row_height);
+                        float row_screen_y = 0.0F;
+                        for (int column = 0; column < builder_columns; ++column) {
+                            const std::size_t area = row * column_count +
+                                static_cast<std::size_t>(column);
+                            if (area >= kWorldCount) break;
+                            ImGui::TableSetColumnIndex(column);
+                            ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
+                            if (column == 0) {
+                                row_screen_y = cursor_screen.y;
+                                if (builder_columns > 1) {
+                                    cursor_screen.y +=
+                                        ImGui::GetStyle().ItemSpacing.y + 2.0F;
+                                    ImGui::SetCursorScreenPos(cursor_screen);
+                                }
+                            } else {
+                                cursor_screen.y = row_screen_y;
+                                ImGui::SetCursorScreenPos(cursor_screen);
+                            }
+                            int value = area == 0U
+                                ? hub_balloons : slot.balloons[area];
+                            const int maximum = area == 0U
+                                ? kMaximumHubBalloons : kMaximumWorldBalloons;
+                            ImGui::PushID(static_cast<int>(area));
+                            if (DrawLabeledSliderInt(
+                                    area_names[area], "##balloons", &value, 0,
+                                    maximum, "%d", -1.0F)) {
+                                if (area == 0U) {
+                                    hub_balloons = value;
+                                } else {
+                                    slot.balloons[area] =
+                                        static_cast<std::uint8_t>(value);
+                                }
+                                unsigned new_total =
+                                    static_cast<unsigned>(hub_balloons);
+                                for (std::size_t world = 1U;
+                                     world < kWorldCount; ++world) {
+                                    new_total += slot.balloons[world];
+                                }
+                                slot.balloons[0] = static_cast<std::uint8_t>(
+                                    std::min<unsigned>(new_total,
+                                                       kMaximumTotalBalloons));
+                            }
+                            ImGui::PopID();
                         }
-                        unsigned new_total = static_cast<unsigned>(hub_balloons);
-                        for (std::size_t world = 1U; world < kWorldCount; ++world) {
-                            new_total += slot.balloons[world];
-                        }
-                        slot.balloons[0] = static_cast<std::uint8_t>(
-                            std::min<unsigned>(new_total, kMaximumTotalBalloons));
                     }
-                    ImGui::PopID();
+                    ImGui::EndTable();
                 }
 
                 ImGui::SeparatorText("Amulets and keys");
                 int tt_amulet = slot.tt_amulet;
                 int wizpig_amulet = slot.wizpig_amulet;
-                if (DrawLabeledSliderInt("T.T. amulet pieces", "##tt-amulet",
-                                         &tt_amulet, 0, kMaximumAmuletPieces,
-                                         "%d", control_width)) {
-                    slot.tt_amulet = static_cast<std::uint8_t>(tt_amulet);
-                }
-                if (DrawLabeledSliderInt("Wizpig amulet pieces",
-                                         "##wizpig-amulet", &wizpig_amulet,
-                                         0, kMaximumAmuletPieces, "%d", control_width)) {
-                    slot.wizpig_amulet = static_cast<std::uint8_t>(wizpig_amulet);
-                }
                 constexpr std::array<const char*, 4> key_names{{
                     "Dino Domain key", "Snowflake Mountain key",
                     "Sherbet Island key", "Dragon Forest key"}};
                 constexpr std::array<unsigned, 4> key_bits{{1U, 2U, 3U, 4U}};
-                for (std::size_t key = 0; key < key_bits.size(); ++key) {
-                    const auto mask = static_cast<std::uint8_t>(1U << key_bits[key]);
-                    bool value = (slot.keys & mask) != 0U;
-                    const char* key_label = key_names[key];
-                    ImGui::PushID(static_cast<int>(key));
-                    if (DrawWrappedCheckbox(key_label, "##key", &value)) {
-                        if (value) slot.keys |= mask;
-                        else slot.keys &= static_cast<std::uint8_t>(~mask);
+                if (ImGui::BeginTable("amulet-key-setting-grid", builder_columns,
+                                      ImGuiTableFlags_SizingStretchSame,
+                                      {builder_width, 0.0F})) {
+                    constexpr std::size_t kAmuletKeySettingCount = 6U;
+                    const float mixed_row_height = ImGui::GetTextLineHeight() +
+                        ImGui::GetFrameHeight() +
+                        (ImGui::GetStyle().ItemSpacing.y * 2.0F);
+                    const std::size_t column_count =
+                        static_cast<std::size_t>(builder_columns);
+                    for (std::size_t row = 0;
+                         row * column_count < kAmuletKeySettingCount; ++row) {
+                        ImGui::TableNextRow(ImGuiTableRowFlags_None,
+                                            mixed_row_height);
+                        float row_screen_y = 0.0F;
+                        for (int column = 0; column < builder_columns; ++column) {
+                            const std::size_t setting = row * column_count +
+                                static_cast<std::size_t>(column);
+                            if (setting >= kAmuletKeySettingCount) break;
+                            ImGui::TableSetColumnIndex(column);
+                            ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
+                            if (column == 0) {
+                                row_screen_y = cursor_screen.y;
+                                if (builder_columns > 1) {
+                                    cursor_screen.y +=
+                                        ImGui::GetStyle().ItemSpacing.y + 2.0F;
+                                    ImGui::SetCursorScreenPos(cursor_screen);
+                                }
+                            } else {
+                                cursor_screen.y = row_screen_y;
+                                ImGui::SetCursorScreenPos(cursor_screen);
+                            }
+                            if (setting == 0U) {
+                                if (DrawLabeledSliderInt(
+                                        "T.T. amulet pieces", "##tt-amulet",
+                                        &tt_amulet, 0, kMaximumAmuletPieces,
+                                        "%d", -1.0F)) {
+                                    slot.tt_amulet =
+                                        static_cast<std::uint8_t>(tt_amulet);
+                                }
+                                continue;
+                            }
+                            if (setting == 1U) {
+                                if (DrawLabeledSliderInt(
+                                        "Wizpig amulet pieces",
+                                        "##wizpig-amulet", &wizpig_amulet, 0,
+                                        kMaximumAmuletPieces, "%d", -1.0F)) {
+                                    slot.wizpig_amulet =
+                                        static_cast<std::uint8_t>(wizpig_amulet);
+                                }
+                                continue;
+                            }
+                            const std::size_t key = setting - 2U;
+                            const auto mask = static_cast<std::uint8_t>(
+                                1U << key_bits[key]);
+                            bool value = (slot.keys & mask) != 0U;
+                            ImGui::PushID(static_cast<int>(key));
+                            if (DrawWrappedCheckbox(key_names[key], "##key",
+                                                    &value)) {
+                                if (value) slot.keys |= mask;
+                                else slot.keys &=
+                                    static_cast<std::uint8_t>(~mask);
+                            }
+                            ImGui::PopID();
+                        }
                     }
-                    ImGui::PopID();
+                    ImGui::EndTable();
                 }
 
                 static std::array<bool, kAdventureSlotCount>
@@ -2762,15 +8530,54 @@ void DrawAdventureBuilder(float width) {
                     constexpr const char* statuses =
                         "Not started\0Race won\0Silver Coins won\0Complete\0";
                     const auto& names = course_names();
-                    for (std::size_t course = 0; course < kCourseCount; ++course) {
-                        ImGui::PushID(static_cast<int>(course));
-                        int status = slot.course_status[course];
-                        ImGui::TextUnformatted(names[course]);
-                        ImGui::SetNextItemWidth(control_width);
-                        if (ControlCombo("##course-status", &status, statuses)) {
-                            slot.course_status[course] = static_cast<std::uint8_t>(status);
+                    if (ImGui::BeginTable(
+                            "course-progress-setting-grid", builder_columns,
+                            ImGuiTableFlags_SizingStretchSame,
+                            {builder_width, 0.0F})) {
+                        const float course_row_height =
+                            ImGui::GetTextLineHeight() +
+                            ImGui::GetFrameHeight() +
+                            (ImGui::GetStyle().ItemSpacing.y * 2.0F);
+                        const std::size_t column_count =
+                            static_cast<std::size_t>(builder_columns);
+                        for (std::size_t row = 0;
+                             row * column_count < kCourseCount; ++row) {
+                            ImGui::TableNextRow(ImGuiTableRowFlags_None,
+                                                course_row_height);
+                            float row_screen_y = 0.0F;
+                            for (int column = 0; column < builder_columns;
+                                 ++column) {
+                                const std::size_t course = row * column_count +
+                                    static_cast<std::size_t>(column);
+                                if (course >= kCourseCount) break;
+                                ImGui::TableSetColumnIndex(column);
+                                ImVec2 cursor_screen =
+                                    ImGui::GetCursorScreenPos();
+                                if (column == 0) {
+                                    row_screen_y = cursor_screen.y;
+                                    if (builder_columns > 1) {
+                                        cursor_screen.y +=
+                                            ImGui::GetStyle().ItemSpacing.y +
+                                            2.0F;
+                                        ImGui::SetCursorScreenPos(cursor_screen);
+                                    }
+                                } else {
+                                    cursor_screen.y = row_screen_y;
+                                    ImGui::SetCursorScreenPos(cursor_screen);
+                                }
+                                ImGui::PushID(static_cast<int>(course));
+                                int status = slot.course_status[course];
+                                ImGui::TextUnformatted(names[course]);
+                                ImGui::SetNextItemWidth(-1.0F);
+                                if (ControlCombo("##course-status", &status,
+                                                 statuses)) {
+                                    slot.course_status[course] =
+                                        static_cast<std::uint8_t>(status);
+                                }
+                                ImGui::PopID();
+                            }
                         }
-                        ImGui::PopID();
+                        ImGui::EndTable();
                     }
                 }
 
@@ -2800,23 +8607,120 @@ void DrawAdventureBuilder(float width) {
                 "Boulder Canyon", "Greenwood Village", "Windmill Plains",
                 "Haunted Woods", "Spacedust Alley", "Darkmoon Caverns",
                 "Star City", "Spaceport Alpha"}};
-            ImGui::Checkbox("Adventure Two", &image.settings.adventure_two);
-            ImGui::Checkbox("Drumstick", &image.settings.drumstick);
-            ImGui::Checkbox("Subtitles", &image.settings.subtitles);
+            const float unlock_width = std::max(
+                std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
+            const float unlock_gap = ImGui::GetStyle().ItemSpacing.x;
+            constexpr float kComfortableUnlockColumnWidth = 320.0F;
+            const int unlock_columns = std::clamp(static_cast<int>(
+                (unlock_width + unlock_gap) /
+                (kComfortableUnlockColumnWidth + unlock_gap)), 1, 3);
             int language = image.settings.language;
-            ImGui::TextUnformatted("Language");
-            ImGui::SetNextItemWidth(width);
-            if (ControlCombo("##save-language", &language,
-                             "English\0German\0French\0Japanese\0")) {
-                image.settings.language = static_cast<std::uint8_t>(language);
+            if (ImGui::BeginTable("unlock-setting-grid", unlock_columns,
+                                  ImGuiTableFlags_SizingStretchSame,
+                                  {unlock_width, 0.0F})) {
+                constexpr std::size_t kUnlockSettingCount = 4U;
+                const float unlock_row_height = ImGui::GetTextLineHeight() +
+                    ImGui::GetFrameHeight() +
+                    (ImGui::GetStyle().ItemSpacing.y * 2.0F);
+                const std::size_t column_count =
+                    static_cast<std::size_t>(unlock_columns);
+                for (std::size_t row = 0;
+                     row * column_count < kUnlockSettingCount; ++row) {
+                    ImGui::TableNextRow(ImGuiTableRowFlags_None,
+                                        unlock_row_height);
+                    float row_screen_y = 0.0F;
+                    for (int column = 0; column < unlock_columns; ++column) {
+                        const std::size_t setting = row * column_count +
+                            static_cast<std::size_t>(column);
+                        if (setting >= kUnlockSettingCount) break;
+                        ImGui::TableSetColumnIndex(column);
+                        ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
+                        if (column == 0) {
+                            row_screen_y = cursor_screen.y;
+                            if (unlock_columns > 1) {
+                                cursor_screen.y +=
+                                    ImGui::GetStyle().ItemSpacing.y + 2.0F;
+                                ImGui::SetCursorScreenPos(cursor_screen);
+                            }
+                        } else {
+                            cursor_screen.y = row_screen_y;
+                            ImGui::SetCursorScreenPos(cursor_screen);
+                        }
+                        switch (setting) {
+                            case 0U:
+                                DrawWrappedCheckbox(
+                                    "Adventure Two", "##adventure-two",
+                                    &image.settings.adventure_two);
+                                break;
+                            case 1U:
+                                DrawWrappedCheckbox(
+                                    "Drumstick", "##drumstick",
+                                    &image.settings.drumstick);
+                                break;
+                            case 2U:
+                                DrawWrappedCheckbox(
+                                    "Subtitles", "##subtitles",
+                                    &image.settings.subtitles);
+                                break;
+                            case 3U:
+                                ImGui::TextUnformatted("Language");
+                                ImGui::SetNextItemWidth(-1.0F);
+                                if (ControlCombo(
+                                        "##save-language", &language,
+                                        "English\0German\0French\0Japanese\0")) {
+                                    image.settings.language =
+                                        static_cast<std::uint8_t>(language);
+                                }
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                }
+                ImGui::EndTable();
             }
             ImGui::SeparatorText("T.T. time-trial victories");
-            for (std::size_t trial = 0; trial < image.settings.tt_trials.size(); ++trial) {
-                ImGui::PushID(static_cast<int>(trial));
-                ImGui::Checkbox(tt_trial_names[trial], &image.settings.tt_trials[trial]);
-                ImGui::PopID();
+            if (ImGui::BeginTable("tt-victory-setting-grid", unlock_columns,
+                                  ImGuiTableFlags_SizingStretchSame,
+                                  {unlock_width, 0.0F})) {
+                const float trial_row_height = ImGui::GetFrameHeight() +
+                    (ImGui::GetStyle().ItemSpacing.y * 2.0F);
+                const std::size_t column_count =
+                    static_cast<std::size_t>(unlock_columns);
+                for (std::size_t row = 0;
+                     row * column_count < image.settings.tt_trials.size();
+                     ++row) {
+                    ImGui::TableNextRow(ImGuiTableRowFlags_None,
+                                        trial_row_height);
+                    float row_screen_y = 0.0F;
+                    for (int column = 0; column < unlock_columns; ++column) {
+                        const std::size_t trial = row * column_count +
+                            static_cast<std::size_t>(column);
+                        if (trial >= image.settings.tt_trials.size()) break;
+                        ImGui::TableSetColumnIndex(column);
+                        ImVec2 cursor_screen = ImGui::GetCursorScreenPos();
+                        if (column == 0) {
+                            row_screen_y = cursor_screen.y;
+                            if (unlock_columns > 1) {
+                                cursor_screen.y +=
+                                    ImGui::GetStyle().ItemSpacing.y + 2.0F;
+                                ImGui::SetCursorScreenPos(cursor_screen);
+                            }
+                        } else {
+                            cursor_screen.y = row_screen_y;
+                            ImGui::SetCursorScreenPos(cursor_screen);
+                        }
+                        ImGui::PushID(static_cast<int>(trial));
+                        DrawWrappedCheckbox(
+                            tt_trial_names[trial], "##tt-victory",
+                            &image.settings.tt_trials[trial]);
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::EndTable();
             }
-            if (ImGui::Button("UNLOCK ALL RACERS AND MODES", {width, 42.0F})) {
+            if (ImGui::Button("UNLOCK ALL RACERS AND MODES",
+                              {unlock_width, 42.0F})) {
                 image.settings.adventure_two = true;
                 image.settings.drumstick = true;
                 image.settings.tt_trials.fill(true);
@@ -2866,6 +8770,7 @@ void DrawAdventureBuilder(float width) {
         if (ImGui::Button("BACK UP AND APPLY", {220.0F, 42.0F})) {
             std::string error;
             if (commit_adventure(image, error)) {
+                InvalidateSaveManagerViewCache();
                 g_save_manager_status = "Save Builder changes applied. Checksums verified and the previous EEPROM is backed up.";
             } else {
                 g_save_manager_status = error;
@@ -2877,47 +8782,109 @@ void DrawAdventureBuilder(float width) {
 }
 
 void DrawSaveManager(bool live = false) {
-    const auto info = dkr::runtime::saves::adventure_info();
     const float width = std::max(ImGui::GetContentRegionAvail().x - 30.0F, 1.0F);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float text_line_height = ImGui::GetTextLineHeight();
+    const auto wrapped_text_height = [](const std::string& text,
+                                        float wrap_width) {
+        return std::max(
+            ImGui::GetTextLineHeight(),
+            ImGui::CalcTextSize(text.c_str(), nullptr, false,
+                                std::max(wrap_width, 1.0F)).y);
+    };
     ImGui::Dummy({0.0F, 4.0F});
     if (live) {
+        const std::string live_message =
+            "Save import, restore and reset are available before the game starts. "
+            "Close the game and use Save Manager so DKR cannot write to the same "
+            "EEPROM or Controller Pak during a transfer.";
+        const float live_inner_width = std::max(width - 40.0F, 1.0F);
+        const float live_height = 36.0F + text_line_height +
+            wrapped_text_height(live_message, live_inner_width) +
+            style.ItemSpacing.y + 8.0F;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
-        BeginPaddedChild("live-save-manager-lock", {width, 148.0F}, true,
+        BeginPaddedChild("live-save-manager-lock", {width, live_height}, true,
                          ImGuiWindowFlags_NoScrollbar, {20.0F, 18.0F});
         ImGui::PushTextWrapPos(width - 18.0F);
         ImGui::TextUnformatted("PIT LANE SAFETY LOCK");
-        ImGui::TextWrapped("Save import, restore and reset are available before the game starts. Close the game and use Save Manager so DKR cannot write to the same EEPROM or Controller Pak during a transfer.");
+        ImGui::TextWrapped("%s", live_message.c_str());
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
         ImGui::PopStyleColor();
         return;
     }
+    // Save validation and backup enumeration touch several files. Keep one
+    // coherent half-second snapshot while this page is visible instead of
+    // reopening every EEPROM/Pak and rescanning the backup folder each frame.
+    const SaveManagerViewCache& save_view = CachedSaveManagerView();
+    const auto& info = save_view.adventure;
+    std::string adventure_status;
+    if (!info.exists) {
+        adventure_status =
+            "No Adventure save yet. DKR will create one after your first save.";
+    } else if (info.size != dkr::runtime::saves::codec::kImageSize) {
+        adventure_status = "This file is " + std::to_string(info.size) +
+            " bytes; DKR Adventure EEPROMs must be exactly 512 bytes. Import a "
+            "known-good backup before racing.";
+    } else if (!info.valid) {
+        adventure_status =
+            "This 512-byte EEPROM has invalid DKR checksums. DKR-R can preserve "
+            "the original and rebuild only its checksum bytes.";
+    } else {
+        adventure_status = "READY - 512 BYTE EEPROM";
+    }
+    const std::string adventure_path = PathUtf8(info.path);
+    const float adventure_inner_width = std::max(width - 40.0F, 1.0F);
+    const float adventure_height = 36.0F + text_line_height +
+        wrapped_text_height(adventure_status, adventure_inner_width) +
+        wrapped_text_height(adventure_path, adventure_inner_width) +
+        style.ItemSpacing.y * 2.0F + 8.0F;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
-    BeginPaddedChild("adventure-save-card", {width, 206.0F}, true,
+    BeginPaddedChild("adventure-save-card", {width, adventure_height}, true,
                      ImGuiWindowFlags_NoScrollbar, {20.0F, 18.0F});
     ImGui::PushTextWrapPos(width - 18.0F);
     ImGui::TextUnformatted("ADVENTURE PROGRESS");
     if (!info.exists) {
-        ImGui::TextDisabled("No Adventure save yet. DKR will create one after your first save.");
+        ImGui::TextDisabled("%s", adventure_status.c_str());
     } else if (info.size != dkr::runtime::saves::codec::kImageSize) {
         ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
-        ImGui::TextWrapped("This file is %llu bytes; DKR Adventure EEPROMs must be exactly 512 bytes. Import a known-good backup before racing.",
-                           static_cast<unsigned long long>(info.size));
+        ImGui::TextWrapped("%s", adventure_status.c_str());
         ImGui::PopStyleColor();
     } else if (!info.valid) {
         ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
-        ImGui::TextWrapped("This 512-byte EEPROM has invalid DKR checksums. Import a known-good backup before editing it.");
+        ImGui::TextWrapped("%s", adventure_status.c_str());
         ImGui::PopStyleColor();
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
-        ImGui::TextUnformatted("READY - 512 BYTE EEPROM");
+        ImGui::TextUnformatted(adventure_status.c_str());
         ImGui::PopStyleColor();
     }
-    ImGui::TextDisabled("%s", PathUtf8(info.path).c_str());
+    ImGui::TextDisabled("%s", adventure_path.c_str());
     ImGui::PopTextWrapPos();
     ImGui::EndChild();
     ImGui::PopStyleColor();
     ImGui::Dummy({0.0F, 10.0F});
+
+    if (info.exists && info.size == dkr::runtime::saves::codec::kImageSize &&
+        !info.valid) {
+        if (ImGui::Button("BACK UP AND REPAIR CHECKSUMS", {width, 46.0F})) {
+            bool changed = false;
+            std::filesystem::path backup;
+            std::string error;
+            if (dkr::runtime::saves::repair_adventure_checksums(
+                    changed, backup, error)) {
+                InvalidateSaveManagerViewCache();
+                g_save_builder_image.reset();
+                g_save_manager_status = changed
+                    ? "Checksums repaired without changing save data. The exact original is preserved at " +
+                          PathUtf8(backup)
+                    : "The Adventure EEPROM checksums are already valid.";
+            } else {
+                g_save_manager_status = error;
+            }
+        }
+        ImGui::Dummy({0.0F, 10.0F});
+    }
 
     const float gap = ImGui::GetStyle().ItemSpacing.x;
     const bool row = width >= 620.0F;
@@ -2927,6 +8894,7 @@ void DrawSaveManager(bool live = false) {
         std::filesystem::path created;
         std::string error;
         if (dkr::runtime::saves::backup_adventure(created, error)) {
+            InvalidateSaveManagerViewCache();
             g_save_manager_status = "Safety backup parked in T.T.'s garage.";
         } else {
             g_save_manager_status = error;
@@ -2945,9 +8913,6 @@ void DrawSaveManager(bool live = false) {
     ImGui::Dummy({0.0F, 18.0F});
     DrawAdventureBuilder(width);
 
-    ImGui::Dummy({0.0F, 18.0F});
-    DrawMagicCodes(width);
-
     ImGui::Dummy({0.0F, 14.0F});
     ImGui::SeparatorText("Complete garage transfer");
     ImGui::TextWrapped("A single path-free bundle carries the Adventure EEPROM and every present virtual Controller Pak between Windows and Steam Deck.");
@@ -2962,31 +8927,57 @@ void DrawSaveManager(bool live = false) {
 
     ImGui::Dummy({0.0F, 14.0F});
     ImGui::SeparatorText("Virtual Controller Paks");
-    for (int channel = 0; channel < dkr::runtime::saves::kControllerPakCount;
-         ++channel) {
-        const auto pak_info = dkr::runtime::saves::controller_pak_info(channel);
-        ImGui::PushID(channel);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
-        BeginPaddedChild("controller-pak-card", {width, 94.0F}, true,
-                         ImGuiWindowFlags_NoScrollbar, {16.0F, 14.0F});
-        ImGui::Text("CONTROLLER %d", channel + 1);
-        ImGui::SameLine();
-        if (!pak_info.exists) {
-            ImGui::TextDisabled("Not created yet");
-        } else if (pak_info.valid) {
-            ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
-            ImGui::TextUnformatted("PAK READY");
+    const int pak_columns = width >= 620.0F ? 2 : 1;
+    const float pak_column_width = std::max(
+        (width - style.ItemSpacing.x * static_cast<float>(pak_columns - 1)) /
+            static_cast<float>(pak_columns),
+        1.0F);
+    const float pak_inner_width = std::max(pak_column_width - 32.0F, 1.0F);
+    float pak_card_height = 0.0F;
+    for (int channel = 0;
+         channel < dkr::runtime::saves::kControllerPakCount; ++channel) {
+        const auto& pak_info = save_view.controller_paks[
+            static_cast<std::size_t>(channel)];
+        const float path_height = wrapped_text_height(
+            PathUtf8(pak_info.path), pak_inner_width);
+        pak_card_height = std::max(
+            pak_card_height,
+            28.0F + text_line_height * 2.0F + path_height +
+                style.ItemSpacing.y * 2.0F + 8.0F);
+    }
+    if (ImGui::BeginTable("controller-pak-grid", pak_columns,
+                          ImGuiTableFlags_SizingStretchSame,
+                          {width, 0.0F})) {
+        for (int channel = 0;
+             channel < dkr::runtime::saves::kControllerPakCount; ++channel) {
+            const auto& pak_info = save_view.controller_paks[
+                static_cast<std::size_t>(channel)];
+            ImGui::TableNextColumn();
+            ImGui::PushID(channel);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                  {0.045F, 0.18F, 0.25F, 0.96F});
+            BeginPaddedChild("controller-pak-card", {0.0F, pak_card_height}, true,
+                             ImGuiWindowFlags_NoScrollbar, {16.0F, 14.0F});
+            ImGui::Text("CONTROLLER %d", channel + 1);
+            if (!pak_info.exists) {
+                ImGui::TextDisabled("Not created yet");
+            } else if (pak_info.valid) {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+                ImGui::TextUnformatted("PAK READY");
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
+                ImGui::TextUnformatted("RECOVERY NEEDED");
+                ImGui::PopStyleColor();
+            }
+            ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
+            ImGui::TextDisabled("%s", PathUtf8(pak_info.path).c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndChild();
             ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, kRaceRed);
-            ImGui::TextUnformatted("RECOVERY NEEDED");
-            ImGui::PopStyleColor();
+            ImGui::PopID();
         }
-        ImGui::SetCursorPosX(16.0F);
-        ImGui::TextDisabled("%s", PathUtf8(pak_info.path).c_str());
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImGui::PopID();
+        ImGui::EndTable();
     }
 
     if (!g_save_manager_status.empty()) {
@@ -2998,37 +8989,62 @@ void DrawSaveManager(bool live = false) {
 
     ImGui::Dummy({0.0F, 18.0F});
     ImGui::SeparatorText("Recent automatic backups");
-    const auto backups = dkr::runtime::saves::adventure_backups();
+    const auto& backups = save_view.adventure_backups;
     if (backups.empty()) {
         ImGui::TextDisabled("No backups are parked here yet.");
     } else {
         const std::size_t shown = std::min<std::size_t>(backups.size(), 6U);
+        const int backup_columns =
+            width >= 960.0F ? 3 : width >= 620.0F ? 2 : 1;
+        const float backup_column_width = std::max(
+            (width - style.ItemSpacing.x *
+                         static_cast<float>(backup_columns - 1)) /
+                static_cast<float>(backup_columns),
+            1.0F);
+        const float backup_inner_width =
+            std::max(backup_column_width - 32.0F, 1.0F);
+        float backup_card_height = 0.0F;
         for (std::size_t index = 0; index < shown; ++index) {
-            ImGui::PushID(static_cast<int>(index));
-            const std::string filename = PathUtf8(backups[index].filename());
-            const float restore_width = std::min(190.0F, width * 0.33F);
-            if (ImGui::BeginTable("backup-row", 2,
-                    ImGuiTableFlags_SizingStretchProp, {width, 0.0F})) {
-                ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("restore", ImGuiTableColumnFlags_WidthFixed,
-                                        restore_width);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::AlignTextToFramePadding();
+            backup_card_height = std::max(
+                backup_card_height,
+                28.0F + wrapped_text_height(
+                            PathUtf8(backups[index].filename()),
+                            backup_inner_width) +
+                    style.ItemSpacing.y + 38.0F + 8.0F);
+        }
+        if (ImGui::BeginTable("backup-grid", backup_columns,
+                              ImGuiTableFlags_SizingStretchSame,
+                              {width, 0.0F})) {
+            for (std::size_t index = 0; index < shown; ++index) {
+                ImGui::TableNextColumn();
+                ImGui::PushID(static_cast<int>(index));
+                const std::string filename =
+                    PathUtf8(backups[index].filename());
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                                      {0.045F, 0.18F, 0.25F, 0.96F});
+                BeginPaddedChild("backup-card", {0.0F, backup_card_height}, true,
+                                 ImGuiWindowFlags_NoScrollbar,
+                                 {16.0F, 14.0F});
+                ImGui::PushTextWrapPos(ImGui::GetContentRegionMax().x);
                 ImGui::TextWrapped("%s", filename.c_str());
-                ImGui::TableSetColumnIndex(1);
+                ImGui::PopTextWrapPos();
                 if (ImGui::Button("RESTORE", {-1.0F, 38.0F})) {
                     std::string error;
-                    if (dkr::runtime::saves::import_adventure(backups[index], error)) {
+                    if (dkr::runtime::saves::import_adventure(backups[index],
+                                                              error)) {
+                        InvalidateSaveManagerViewCache();
                         g_save_builder_image.reset();
-                        g_save_manager_status = "Backup restored. The replaced save was backed up too.";
+                        g_save_manager_status =
+                            "Backup restored. The replaced save was backed up too.";
                     } else {
                         g_save_manager_status = error;
                     }
                 }
-                ImGui::EndTable();
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+                ImGui::PopID();
             }
-            ImGui::PopID();
+            ImGui::EndTable();
         }
     }
 
@@ -3050,6 +9066,7 @@ void DrawSaveManager(bool live = false) {
         if (ImGui::Button("START FRESH", {150.0F, 40.0F})) {
             std::string error;
             if (dkr::runtime::saves::reset_adventure(error)) {
+                InvalidateSaveManagerViewCache();
                 g_save_builder_image.reset();
                 g_save_manager_status = "Fresh Adventure save created; the previous journey is safe in backups.";
             } else {
@@ -3111,6 +9128,20 @@ void DrawAudioSettings(float width) {
                   dkr::runtime::audio::nature_volume(),
                   dkr::runtime::audio::set_nature_volume);
 
+    if (dkr::runtime::enhancements::modern_options_visible(
+            dkr::runtime::enhancements::presentation_profile())) {
+        bool multiplayer_race_music =
+            dkr::runtime::enhancements::multiplayer_race_music_requested();
+        if (ImGui::Checkbox("Restore race music for 3-4 players",
+                            &multiplayer_race_music)) {
+            dkr::runtime::enhancements::set_multiplayer_race_music_enabled(
+                multiplayer_race_music);
+            SaveSettings();
+        }
+        ImGui::TextDisabled(
+            "Restores the level soundtrack removed by the original 3-4 player hardware mode.");
+    }
+
     ImGui::Spacing();
     ImGui::SeparatorText("Three-band EQ");
     const auto eq_slider = [&](const char* label, const char* id,
@@ -3159,6 +9190,18 @@ std::string ShortcutBindingName(CaptureDevice device,
     return name;
 }
 
+const char* ShortcutActionLabel(dkr::runtime::input::ShortcutAction action) {
+    using dkr::runtime::input::ShortcutAction;
+    switch (action) {
+        case ShortcutAction::QuickRestart: return "QUICK RACE RESTART";
+        case ShortcutAction::ToggleOverlay: return "OPEN / CLOSE DKR-R MENU";
+        case ShortcutAction::ToggleTexturePack: return "TOGGLE TEXTURE PACK";
+        case ShortcutAction::ToggleFullscreen: return "WINDOWED / FULLSCREEN";
+        case ShortcutAction::RecenterGyro: return "RECENTER GYRO";
+        default: return "SHORTCUT";
+    }
+}
+
 void CommitShortcutCapture() {
     dkr::runtime::input::ShortcutBinding binding{
         g_shortcut_capture_sources[0],
@@ -3166,17 +9209,21 @@ void CommitShortcutCapture() {
             ? g_shortcut_capture_sources[1]
             : dkr::runtime::input::kUnbound};
     if (g_capture_device == CaptureDevice::Keyboard) {
-        dkr::runtime::input::set_quick_restart_keyboard_binding(binding);
+        dkr::runtime::input::set_shortcut_keyboard_binding(
+            g_capture_shortcut_action, binding);
     } else if (g_capture_device == CaptureDevice::Controller) {
-        dkr::runtime::input::set_quick_restart_controller_binding(binding);
+        dkr::runtime::input::set_shortcut_controller_binding(
+            g_capture_shortcut_action, binding);
     }
     SaveSettings();
     g_capture_finished = true;
 }
 
-void BeginShortcutCapture(CaptureDevice device) {
+void BeginShortcutCapture(CaptureDevice device,
+                          dkr::runtime::input::ShortcutAction action) {
     g_capture_action = kShortcutCaptureAction;
     g_capture_device = device;
+    g_capture_shortcut_action = action;
     g_capture_popup_pending = true;
     g_capture_finished = false;
     g_shortcut_capture_sources = {
@@ -3185,44 +9232,397 @@ void BeginShortcutCapture(CaptureDevice device) {
     g_shortcut_capture_deadline = {};
 }
 
+void DrawPlayerSelector() {
+    ImGui::TextUnformatted("LOCAL PLAYERS");
+    ImGui::Separator();
+    const float width = std::max(ImGui::GetContentRegionAvail().x - 30.0F, 1.0F);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    const float player_button_width = std::max((width - gap * 3.0F) / 4.0F, 1.0F);
+    for (std::size_t player = 0; player < dkr::runtime::input::kPlayerCount;
+         ++player) {
+        if (player != 0U) {
+            ImGui::SameLine(0.0F, gap);
+        }
+        const bool selected = player == g_selected_player;
+        if (selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, kWarm);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBackground);
+        }
+        const std::string label = "PLAYER " + std::to_string(player + 1U);
+        if (ImGui::Button(label.c_str(), {player_button_width, 46.0F})) {
+            g_selected_player = player;
+        }
+        if (selected) {
+            ImGui::PopStyleColor(2);
+        }
+    }
+}
+
+void DrawLocalPlayers() {
+    const float width = std::max(ImGui::GetContentRegionAvail().x - 30.0F, 1.0F);
+    const float gap = ImGui::GetStyle().ItemSpacing.x;
+    int input_backend = static_cast<int>(
+        dkr::runtime::platform::requested_input_backend());
+    ImGui::TextUnformatted("Controller input backend");
+    ImGui::SetNextItemWidth(width);
+    if (ControlCombo("##controller-input-backend", &input_backend,
+                     "Automatic (SDL3 on Steam Deck)\0"
+                     "SDL2 compatibility\0SDL3 native\0")) {
+        dkr::runtime::platform::set_requested_input_backend(
+            input_backend == static_cast<int>(
+                dkr::runtime::platform::InputBackend::SDL2Compatibility)
+                ? dkr::runtime::platform::InputBackend::SDL2Compatibility
+            : input_backend == static_cast<int>(
+                dkr::runtime::platform::InputBackend::SDL3Native)
+                ? dkr::runtime::platform::InputBackend::SDL3Native
+                : dkr::runtime::platform::InputBackend::Automatic);
+        SaveSettings();
+    }
+    ImGui::TextColored(
+        kAccent, "Active: %s",
+        dkr::runtime::platform::input_backend_name(
+            dkr::runtime::platform::active_input_backend()));
+    const std::string backend_detail =
+        dkr::runtime::platform::input_backend_detail();
+    ImGui::TextWrapped("%s", backend_detail.c_str());
+    if (dkr::runtime::platform::input_backend_switch_pending()) {
+        ImGui::TextColored(kWarm,
+                           "Switching controller backend safely...");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped(
+            "Backend changes apply live; the launcher, game window, audio and "
+            "renderer remain running.");
+        ImGui::PopStyleColor();
+    }
+    const bool sdl3_native =
+        dkr::runtime::platform::active_input_backend() ==
+        dkr::runtime::platform::InputBackend::SDL3Native;
+    const auto status =
+        dkr::runtime::platform::player_controller_status(g_selected_player);
+    ImGui::Dummy({0.0F, 10.0F});
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.92F});
+    constexpr float kControllerPreviewCardHeight = 294.0F;
+    constexpr float kControllerPreviewBarHeight = 26.0F;
+    BeginPaddedChild("player-controller",
+                     {width, kControllerPreviewCardHeight}, true,
+                     ImGuiWindowFlags_NoScrollbar, {16.0F, 14.0F});
+    PushHeadingFont();
+    ImGui::Text("PLAYER %zu", g_selected_player + 1U);
+    PopHeadingFont();
+    if (status.connected) {
+        ImGui::TextWrapped("%s", status.name.c_str());
+        std::string capabilities = "Connected";
+        if (status.rumble) capabilities += "  |  Rumble";
+        if (status.gyro) capabilities += "  |  Motion";
+        ImGui::TextColored(kAccent, "%s", capabilities.c_str());
+        if (!status.mapping_source.empty()) {
+            ImGui::TextDisabled("Input map: %s", status.mapping_source.c_str());
+        }
+    } else {
+        ImGui::TextUnformatted(status.assigned
+            ? "Assigned controller disconnected"
+            : "No controller assigned");
+        ImGui::TextColored(kMuted, status.assigned
+            ? "Reconnect it to reclaim this player automatically"
+            : "Choose one below or press a button to assign");
+    }
+    const auto preview_state =
+        dkr::runtime::platform::player_input_preview(g_selected_player);
+    const float stick_x = std::clamp((preview_state.stick_x + 1.0F) * 0.5F,
+                                     0.0F, 1.0F);
+    const float stick_y = std::clamp((preview_state.stick_y + 1.0F) * 0.5F,
+                                     0.0F, 1.0F);
+    ImGui::ProgressBar(stick_x, {-1.0F, kControllerPreviewBarHeight},
+                       "Horizontal stick");
+    ImGui::ProgressBar(stick_y, {-1.0F, kControllerPreviewBarHeight},
+                       "Vertical stick");
+    ImGui::TextDisabled("Buttons: %s",
+                        preview_state.buttons != 0U ? "Active" : "Idle");
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    int assignment_mode = static_cast<int>(
+        dkr::runtime::platform::controller_assignment_mode());
+    ImGui::TextUnformatted("Assignment style");
+    ImGui::SetNextItemWidth(width);
+    if (ControlCombo("##assignment-mode", &assignment_mode,
+                     "Automatic (first connected)\0Manual\0")) {
+        dkr::runtime::platform::set_controller_assignment_mode(
+            assignment_mode == 1
+                ? dkr::runtime::controllers::AssignmentMode::Manual
+                : dkr::runtime::controllers::AssignmentMode::Automatic);
+        SaveSettings();
+    }
+
+    const auto devices = dkr::runtime::platform::connected_controllers();
+    const int current_instance =
+        dkr::runtime::platform::controller_instance_for_player(g_selected_player);
+    const char* preview = status.connected ? status.name.c_str() : "Unassigned";
+    ImGui::TextUnformatted("Controller");
+    ImGui::SetNextItemWidth(width);
+    {
+        // Match every other launcher combo: use the control font and leave a
+        // cap above the first controller and below the last controller.
+        const ControlFontScope controller_combo_scope(true);
+        if (ImGui::BeginCombo("##assigned-controller", preview)) {
+            if (ImGui::Selectable("Unassigned", current_instance < 0)) {
+                dkr::runtime::platform::clear_controller_assignment(g_selected_player);
+                SaveSettings();
+            }
+            for (std::size_t index = 0; index < devices.size(); ++index) {
+                const auto& device = devices[index];
+                std::string label = device.name;
+                const std::size_t same_name_before = static_cast<std::size_t>(
+                    std::count_if(devices.begin(), devices.begin() + index,
+                        [&](const auto& other) { return other.name == device.name; }));
+                const std::size_t same_name_total = static_cast<std::size_t>(
+                    std::count_if(devices.begin(), devices.end(),
+                        [&](const auto& other) { return other.name == device.name; }));
+                if (same_name_total > 1U) {
+                    label += " #" + std::to_string(same_name_before + 1U);
+                }
+                if (device.assigned_player >= 0 &&
+                    device.assigned_player != static_cast<int>(g_selected_player)) {
+                    label += "  (Player " +
+                             std::to_string(device.assigned_player + 1) + ")";
+                }
+                if (!device.mapped) {
+                    label += "  (Setup required)";
+                }
+                if (ImGui::Selectable(label.c_str(),
+                                      device.instance == current_instance)) {
+                    if (device.mapped) {
+                        dkr::runtime::platform::assign_controller(
+                            g_selected_player, device.instance);
+                        SaveSettings();
+                    } else if (dkr::runtime::platform::begin_controller_mapping(
+                                   device.instance, g_selected_player)) {
+                        g_controller_mapping_popup_pending = true;
+                        g_controller_mapping_completion_saved = false;
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+
+    const float half_width = std::max((width - gap) * 0.5F, 1.0F);
+    if (ImGui::Button("PRESS A BUTTON TO ASSIGN", {half_width, 44.0F})) {
+        g_capture_action = kAssignControllerCaptureAction;
+        g_capture_device = CaptureDevice::Controller;
+        g_capture_popup_pending = true;
+        g_capture_finished = false;
+    }
+    ImGui::SameLine(0.0F, gap);
+    ImGui::BeginDisabled(!status.connected || !status.rumble);
+    if (ImGui::Button("IDENTIFY WITH RUMBLE", {half_width, 44.0F})) {
+        dkr::runtime::platform::identify_controller(g_selected_player);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(sdl3_native);
+    if (status.connected &&
+        ImGui::Button("REMAP THIS CONTROLLER", {width, 42.0F}) &&
+        dkr::runtime::platform::begin_controller_mapping(
+            current_instance, g_selected_player)) {
+        g_controller_mapping_popup_pending = true;
+        g_controller_mapping_completion_saved = false;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::BeginDisabled(sdl3_native);
+    if (ImGui::Button("IMPORT CONTROLLER MAPS", {half_width, 42.0F})) {
+        ImportControllerMappingsWithDialog();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0.0F, gap);
+    if (ImGui::Button("EXPORT CUSTOM MAPS", {half_width, 42.0F})) {
+        ExportControllerMappingsWithDialog();
+    }
+    if (sdl3_native) {
+        ImGui::TextWrapped(
+            "SDL3 uses its native controller database. Switch to SDL2 "
+            "compatibility and restart to create or import raw mappings.");
+    }
+    if (!g_controller_mapping_status.empty()) {
+        ImGui::TextWrapped("%s", g_controller_mapping_status.c_str());
+    }
+
+    int keyboard_player = dkr::runtime::input::keyboard_player();
+    ImGui::TextUnformatted("Keyboard player");
+    ImGui::SetNextItemWidth(width);
+    if (ControlCombo("##keyboard-player", &keyboard_player,
+                     "Player 1\0Player 2\0Player 3\0Player 4\0")) {
+        dkr::runtime::input::set_keyboard_player(keyboard_player);
+        SaveSettings();
+    }
+    if (g_selected_player != 0U) {
+        if (ImGui::Button("COPY PLAYER 1 BINDINGS", {width, 42.0F})) {
+            dkr::runtime::input::copy_bindings(0U, g_selected_player);
+            SaveSettings();
+        }
+    }
+    ImGui::Dummy({0.0F, 18.0F});
+}
+
+void DrawControllerMappingModal() {
+    constexpr const char* kMappingPopup = "SET UP CONTROLLER";
+    const auto progress =
+        dkr::runtime::platform::controller_mapping_progress();
+    if (g_controller_mapping_popup_pending ||
+        (progress.visible && !ImGui::IsPopupOpen(kMappingPopup))) {
+        ImGui::OpenPopup(kMappingPopup);
+        g_controller_mapping_popup_pending = false;
+    }
+    if (!progress.visible) {
+        // Escape can cancel capture in the event handler before this frame is
+        // drawn. Close the already-open modal explicitly so its ImGui popup
+        // state cannot leak into the next setup session.
+        if (ImGui::IsPopupOpen(kMappingPopup) &&
+            BeginPaddedModal(kMappingPopup,
+                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        return;
+    }
+    if (progress.complete && progress.success &&
+        !g_controller_mapping_completion_saved) {
+        SaveSettings();
+        g_controller_mapping_completion_saved = true;
+    }
+
+    const ImVec2 display_size = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(
+        {std::min(620.0F, display_size.x - 32.0F),
+         std::min(420.0F, display_size.y - 32.0F)},
+        ImGuiCond_Appearing);
+    if (!BeginPaddedModal(kMappingPopup,
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        return;
+    }
+
+    PushHeadingFont();
+    ImGui::TextUnformatted(progress.success ? "CONTROLLER READY" :
+                           "N64 CONTROLLER SETUP");
+    PopHeadingFont();
+    ImGui::TextWrapped("%s", progress.controller_name.c_str());
+    if (progress.capturing) {
+        const float fraction = progress.total > 0U
+            ? static_cast<float>(progress.step) /
+                  static_cast<float>(progress.total)
+            : 0.0F;
+        const std::string overlay = "Control " +
+            std::to_string(std::min(progress.step + 1U, progress.total)) +
+            " of " + std::to_string(progress.total);
+        ImGui::ProgressBar(fraction, {-1.0F, 28.0F}, overlay.c_str());
+        ImGui::Dummy({0.0F, 8.0F});
+        ImGui::TextColored(kWarm, "%s", progress.prompt.c_str());
+    }
+    if (!progress.message.empty()) {
+        ImGui::TextWrapped("%s", progress.message.c_str());
+    }
+    ImGui::Dummy({0.0F, 12.0F});
+    if (progress.capturing) {
+        if (ImGui::Button("CANCEL SETUP", {-1.0F, 46.0F})) {
+            dkr::runtime::platform::cancel_controller_mapping();
+            ImGui::CloseCurrentPopup();
+        }
+    } else {
+        const char* button = progress.success ? "DONE" : "CLOSE";
+        if (ImGui::Button(button, {-1.0F, 46.0F})) {
+            dkr::runtime::platform::dismiss_controller_mapping();
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndPopup();
+}
+
 void DrawControlsReference(bool live) {
     using dkr::runtime::input::Action;
+    DrawPlayerSelector();
+    ImGui::Dummy({0.0F, 14.0F});
+    constexpr std::array<const char*, 5> sections{
+        "DEVICE", "N64 BINDINGS", "DRIVING", "GYRO", "SHORTCUTS"};
+    // Match the exact usable width of the four-player selector above. A
+    // per-button minimum used to make this five-item row spill farther right
+    // at compact launcher sizes.
+    const float section_total_width = std::max(
+        ImGui::GetContentRegionAvail().x - 30.0F, 1.0F);
+    const float section_width = std::max(
+        (section_total_width - ImGui::GetStyle().ItemSpacing.x * 4.0F) /
+            5.0F,
+        1.0F);
+    for (std::size_t index = 0; index < sections.size(); ++index) {
+        if (index != 0U) ImGui::SameLine();
+        const bool selected = g_controls_section == static_cast<int>(index);
+        if (selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, kWarm);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBackground);
+        }
+        if (ImGui::Button(sections[index], {section_width, 42.0F})) {
+            g_controls_section = static_cast<int>(index);
+        }
+        if (selected) ImGui::PopStyleColor(2);
+    }
+    ImGui::Dummy({0.0F, 14.0F});
+    // Keep a real gutter on the right at every width. Tables and full-width
+    // controls otherwise consume the parent's last pixel and collide with the
+    // card border or scrollbar.
+    constexpr float kControlsRightPadding = 30.0F;
+    const float available_width = std::max(
+        ImGui::GetContentRegionAvail().x - kControlsRightPadding, 1.0F);
+    if (g_controls_section == 0) {
+        DrawLocalPlayers();
+    }
+    if (g_controls_section == 1) {
     ImGui::TextUnformatted("DRIVER BINDINGS");
     ImGui::Separator();
     const auto begin_capture_button = [](Action action, std::size_t index,
-                                         CaptureDevice device, float width) {
+                                         CaptureDevice device, float width,
+                                         bool secondary = false) {
         const std::string binding_name = device == CaptureDevice::Keyboard
             ? dkr::runtime::input::keyboard_binding_name(
-                  dkr::runtime::input::keyboard_binding(action))
-            : dkr::runtime::input::controller_binding_name(
-                  dkr::runtime::input::controller_binding(action));
-        ImGui::PushID(static_cast<int>(index * 2U +
-                      (device == CaptureDevice::Controller ? 1U : 0U)));
+                  dkr::runtime::input::keyboard_binding(g_selected_player, action))
+            : dkr::runtime::input::controller_binding_name(secondary
+                  ? dkr::runtime::input::secondary_controller_binding(
+                        g_selected_player, action)
+                  : dkr::runtime::input::controller_binding(
+                        g_selected_player, action));
+        ImGui::PushID(static_cast<int>(index * 3U +
+                      (device == CaptureDevice::Controller
+                           ? (secondary ? 2U : 1U) : 0U)));
         const bool pressed = ImGui::Button(binding_name.c_str(), {width, 38.0F});
         ImGui::PopID();
         if (pressed) {
             g_capture_action = static_cast<int>(index);
             g_capture_device = device;
+            g_capture_secondary_controller = secondary;
             g_capture_popup_pending = true;
             g_capture_finished = false;
         }
     };
 
-    // Keep a real gutter on the right at every width. Tables and full-width
-    // capture buttons otherwise consume the parent's last pixel and appear to
-    // collide with the card border/scrollbar.
-    constexpr float kControlsRightPadding = 30.0F;
-    const float available_width = std::max(
-        ImGui::GetContentRegionAvail().x - kControlsRightPadding, 1.0F);
-    if (available_width >= 620.0F &&
-        ImGui::BeginTable("controls", 3,
+    const bool show_keyboard_bindings =
+        dkr::runtime::input::keyboard_player() ==
+        static_cast<int>(g_selected_player);
+    const float table_threshold = show_keyboard_bindings ? 780.0F : 600.0F;
+    const int table_columns = show_keyboard_bindings ? 4 : 3;
+    if (available_width >= table_threshold &&
+        ImGui::BeginTable("controls", table_columns,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                           ImGuiTableFlags_SizingStretchProp,
                           {available_width, 0.0F})) {
-        const float label_width = std::clamp(available_width * 0.30F, 180.0F, 260.0F);
+        const float label_width = std::clamp(
+            available_width * (show_keyboard_bindings ? 0.30F : 0.38F),
+            180.0F, 300.0F);
         ImGui::TableSetupColumn("N64 CONTROL", ImGuiTableColumnFlags_WidthFixed, label_width);
-        ImGui::TableSetupColumn("KEYBOARD", ImGuiTableColumnFlags_WidthStretch, 1.0F);
-        ImGui::TableSetupColumn("GAMEPAD", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        if (show_keyboard_bindings) {
+            ImGui::TableSetupColumn("KEYBOARD", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        }
+        ImGui::TableSetupColumn("GAMEPAD PRIMARY", ImGuiTableColumnFlags_WidthStretch, 1.0F);
+        ImGui::TableSetupColumn("GAMEPAD SECONDARY", ImGuiTableColumnFlags_WidthStretch, 1.0F);
         ImGui::TableHeadersRow();
         for (std::size_t index = 0; index < dkr::runtime::input::action_count(); ++index) {
             const auto action = static_cast<Action>(index);
@@ -3230,22 +9630,27 @@ void DrawControlsReference(bool live) {
             ImGui::TableSetColumnIndex(0);
             ImGui::AlignTextToFramePadding();
             ImGui::TextWrapped("%s", dkr::runtime::input::action_label(action));
-            ImGui::TableSetColumnIndex(1);
-            begin_capture_button(action, index, CaptureDevice::Keyboard, -1.0F);
-            ImGui::TableSetColumnIndex(2);
+            int gamepad_column = 1;
+            if (show_keyboard_bindings) {
+                ImGui::TableSetColumnIndex(1);
+                begin_capture_button(action, index, CaptureDevice::Keyboard, -1.0F);
+                gamepad_column = 2;
+            }
+            ImGui::TableSetColumnIndex(gamepad_column);
             begin_capture_button(action, index, CaptureDevice::Controller, -1.0F);
+            ImGui::TableSetColumnIndex(gamepad_column + 1);
+            begin_capture_button(action, index, CaptureDevice::Controller,
+                                 -1.0F, true);
         }
         ImGui::EndTable();
-    } else if (available_width < 620.0F) {
+    } else if (available_width < table_threshold) {
         // A two-row card is easier to read and drive with a controller than
         // squeezing the three desktop columns into a narrow overlay.
-        const float gap = ImGui::GetStyle().ItemSpacing.x;
-        const bool side_by_side = available_width >= 360.0F;
         for (std::size_t index = 0; index < dkr::runtime::input::action_count(); ++index) {
             const auto action = static_cast<Action>(index);
             ImGui::PushID(static_cast<int>(index));
             ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.92F});
-            const float card_height = side_by_side ? 112.0F : 166.0F;
+            const float card_height = show_keyboard_bindings ? 220.0F : 166.0F;
             BeginPaddedChild("binding-card", {available_width, card_height}, true,
                              ImGuiWindowFlags_NoScrollbar, {16.0F, 14.0F});
             ImGui::PushTextWrapPos(available_width - 16.0F);
@@ -3253,43 +9658,48 @@ void DrawControlsReference(bool live) {
             ImGui::PopTextWrapPos();
             ImGui::SetCursorPosX(16.0F);
             const float inner_width = std::max(available_width - 32.0F, 1.0F);
-            const float button_width = side_by_side
-                ? std::max((inner_width - gap) * 0.5F, 1.0F)
-                : inner_width;
-            begin_capture_button(action, index, CaptureDevice::Keyboard, button_width);
-            if (side_by_side) {
-                ImGui::SameLine(0.0F, gap);
-            } else {
+            const float button_width = inner_width;
+            if (show_keyboard_bindings) {
+                begin_capture_button(action, index, CaptureDevice::Keyboard, button_width);
                 ImGui::SetCursorPosX(16.0F);
             }
             begin_capture_button(action, index, CaptureDevice::Controller, button_width);
+            ImGui::SetCursorPosX(16.0F);
+            begin_capture_button(action, index, CaptureDevice::Controller,
+                                 button_width, true);
             ImGui::EndChild();
             ImGui::PopStyleColor();
             ImGui::PopID();
         }
     }
     ImGui::Spacing();
-    if (ImGui::Button("RESTORE T.T.'S DEFAULTS", {available_width, 44.0F})) {
-        dkr::runtime::input::reset_defaults();
-        dkr::runtime::input::set_stick_deadzone(23.95F);
-        dkr::runtime::input::set_stick_anti_deadzone(0.0F);
-        dkr::runtime::input::set_stick_sensitivity(100.0F);
-        dkr::runtime::input::set_stick_curve(1.0F);
-        dkr::runtime::input::set_stick_x_inverted(false);
-        dkr::runtime::input::set_stick_y_inverted(false);
-        dkr::runtime::input::set_trigger_threshold(0.5F);
+    const float reset_gap = ImGui::GetStyle().ItemSpacing.x;
+    const float reset_width = std::max((available_width - reset_gap) * 0.5F, 1.0F);
+    if (ImGui::Button("RESET THIS PLAYER", {reset_width, 44.0F})) {
+        dkr::runtime::input::reset_defaults(g_selected_player);
         SaveSettings();
     }
+    ImGui::SameLine(0.0F, reset_gap);
+    if (ImGui::Button("RESET ALL PLAYERS", {reset_width, 44.0F})) {
+        for (std::size_t player = 0;
+             player < dkr::runtime::input::kPlayerCount; ++player) {
+            dkr::runtime::input::reset_defaults(player);
+        }
+        SaveSettings();
+    }
+    }
 
-    if (dkr::runtime::enhancements::modern_options_visible(
-            dkr::runtime::enhancements::presentation_profile())) {
+    const bool modern_controls =
+        dkr::runtime::enhancements::modern_options_visible(
+            dkr::runtime::enhancements::presentation_profile());
+    {
         if (g_capture_action == kShortcutCaptureAction &&
             g_shortcut_capture_count == 1 &&
             std::chrono::steady_clock::now() >= g_shortcut_capture_deadline) {
             CommitShortcutCapture();
         }
-        ImGui::Dummy({0.0F, 18.0F});
-        ImGui::SeparatorText("Controller feel");
+        if (g_controls_section == 2 && modern_controls) {
+        ImGui::SeparatorText("CONTROLLER FEEL");
         const auto tune_slider = [&](const char* label, const char* id,
                                      float value, float minimum, float maximum,
                                      const char* format, auto setter) {
@@ -3316,138 +9726,245 @@ void DrawControlsReference(bool live) {
         tune_slider("Trigger threshold", "##trigger-threshold",
                     dkr::runtime::input::trigger_threshold(), 0.05F, 0.95F, "%.2f",
                     dkr::runtime::input::set_trigger_threshold);
-        bool invert_x = dkr::runtime::input::stick_x_inverted();
-        if (ImGui::Checkbox("Invert horizontal stick", &invert_x)) {
-            dkr::runtime::input::set_stick_x_inverted(invert_x);
-            SaveSettings();
-        }
-        bool invert_y = dkr::runtime::input::stick_y_inverted();
-        if (ImGui::Checkbox("Invert vertical stick", &invert_y)) {
-            dkr::runtime::input::set_stick_y_inverted(invert_y);
-            SaveSettings();
+        ImGui::SeparatorText("VEHICLE-SPECIFIC AXIS DIRECTION");
+        constexpr std::array<const char*, 3> vehicle_names{
+            "Car", "Hovercraft", "Plane"};
+        if (ImGui::BeginTable("vehicle-inversion", 3,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV,
+                {available_width, 0.0F})) {
+            ImGui::TableSetupColumn("VEHICLE", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("HORIZONTAL", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("VERTICAL", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (std::size_t index = 0; index < vehicle_names.size(); ++index) {
+                const auto vehicle = static_cast<
+                    dkr::runtime::input::VehicleClass>(index);
+                bool invert_x =
+                    dkr::runtime::input::vehicle_stick_x_inverted(vehicle);
+                bool invert_y =
+                    dkr::runtime::input::vehicle_stick_y_inverted(vehicle);
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(vehicle_names[index]);
+                ImGui::TableSetColumnIndex(1);
+                if (ImGui::Checkbox("Invert##x", &invert_x)) {
+                    dkr::runtime::input::set_vehicle_stick_x_inverted(
+                        vehicle, invert_x);
+                    SaveSettings();
+                }
+                ImGui::TableSetColumnIndex(2);
+                if (ImGui::Checkbox("Invert##y", &invert_y)) {
+                    dkr::runtime::input::set_vehicle_stick_y_inverted(
+                        vehicle, invert_y);
+                    SaveSettings();
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
         }
         ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
         ImGui::TextWrapped("These adjustments shape the final N64 stick sample once per authored game update. Accurate keeps the original response.");
         ImGui::PopStyleColor();
+        if (ImGui::Button("RESTORE CONTROLLER FEEL", {available_width, 42.0F})) {
+            dkr::runtime::input::set_stick_deadzone(23.95F);
+            dkr::runtime::input::set_stick_anti_deadzone(0.0F);
+            dkr::runtime::input::set_stick_sensitivity(100.0F);
+            dkr::runtime::input::set_stick_curve(1.0F);
+            dkr::runtime::input::set_stick_x_inverted(false);
+            dkr::runtime::input::set_stick_y_inverted(false);
+            dkr::runtime::input::set_trigger_threshold(0.5F);
+            SaveSettings();
+        }
+        }
 
-        ImGui::Dummy({0.0F, 18.0F});
-        ImGui::SeparatorText("Quick restart");
+        if (g_controls_section == 4) {
+            ImGui::SeparatorText("BACKGROUND PLAY");
+            bool allow_background =
+                dkr::runtime::input::background_input_enabled(
+                    g_selected_player);
+            if (ImGui::Checkbox("Allow Background Inputs",
+                                &allow_background)) {
+                dkr::runtime::input::set_background_input_enabled(
+                    g_selected_player, allow_background);
+                SaveSettings();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+            ImGui::TextWrapped(
+                "The controller assigned to Player %u can keep racing while "
+                "DKR-R is not focused. Keyboard input remains focus-only.",
+                static_cast<unsigned>(g_selected_player + 1U));
+            ImGui::PopStyleColor();
+            ImGui::Dummy({0.0F, 10.0F});
+        }
+
+        if (g_controls_section == 4 && g_selected_player != 0U) {
+            ImGui::TextDisabled(
+                "Game shortcuts are configured from Player 1.");
+        }
+        if (g_controls_section == 4) {
+        ImGui::BeginDisabled(g_selected_player != 0U);
+        ImGui::SeparatorText("GAME SHORTCUTS");
         bool quick_restart = dkr::runtime::input::quick_restart_enabled();
         if (ImGui::Checkbox("Enable quick race restart", &quick_restart)) {
             dkr::runtime::input::set_quick_restart_enabled(quick_restart);
             SaveSettings();
         }
-        if (quick_restart) {
+        constexpr std::array<dkr::runtime::input::ShortcutAction,
+                             kShortcutActionCount> shortcuts{
+            dkr::runtime::input::ShortcutAction::QuickRestart,
+            dkr::runtime::input::ShortcutAction::ToggleOverlay,
+            dkr::runtime::input::ShortcutAction::ToggleTexturePack,
+            dkr::runtime::input::ShortcutAction::ToggleFullscreen,
+            dkr::runtime::input::ShortcutAction::RecenterGyro};
+        for (const auto shortcut : shortcuts) {
+            if (shortcut == dkr::runtime::input::ShortcutAction::QuickRestart &&
+                !quick_restart) continue;
             const float shortcut_gap = ImGui::GetStyle().ItemSpacing.x;
             const float shortcut_width = std::max(
                 (available_width - shortcut_gap) * 0.5F, 1.0F);
             const auto keyboard =
-                dkr::runtime::input::quick_restart_keyboard_binding();
+                dkr::runtime::input::shortcut_keyboard_binding(shortcut);
             const auto controller =
-                dkr::runtime::input::quick_restart_controller_binding();
+                dkr::runtime::input::shortcut_controller_binding(shortcut);
+            ImGui::PushID(static_cast<int>(shortcut));
+            ImGui::TextUnformatted(ShortcutActionLabel(shortcut));
             ImGui::TextUnformatted("Keyboard shortcut");
             ImGui::SameLine(shortcut_width + shortcut_gap);
             ImGui::TextUnformatted("Controller shortcut");
             if (ImGui::Button(
                     ShortcutBindingName(CaptureDevice::Keyboard, keyboard).c_str(),
                     {shortcut_width, 42.0F})) {
-                BeginShortcutCapture(CaptureDevice::Keyboard);
+                BeginShortcutCapture(CaptureDevice::Keyboard, shortcut);
             }
             ImGui::SameLine(0.0F, shortcut_gap);
             if (ImGui::Button(
                     ShortcutBindingName(CaptureDevice::Controller, controller).c_str(),
                     {shortcut_width, 42.0F})) {
-                BeginShortcutCapture(CaptureDevice::Controller);
+                BeginShortcutCapture(CaptureDevice::Controller, shortcut);
             }
+            ImGui::PopID();
+        }
+        ImGui::EndDisabled();
         }
 
-        ImGui::Dummy({0.0F, 18.0F});
-        ImGui::SeparatorText("Motion steering");
-        bool gyro = dkr::runtime::input::gyro_enabled();
+        if (g_controls_section == 3 && modern_controls) {
+        ImGui::SeparatorText("MOTION STEERING");
+        const std::size_t gyro_player = g_selected_player;
+        bool gyro = dkr::runtime::input::gyro_enabled(gyro_player);
         if (ImGui::Checkbox("Gyro steering", &gyro)) {
-            dkr::runtime::input::set_gyro_enabled(gyro);
+            dkr::runtime::input::set_gyro_enabled(gyro, gyro_player);
             SaveSettings();
         }
         if (gyro) {
-            int axis = static_cast<int>(dkr::runtime::input::gyro_axis());
+            int axis = static_cast<int>(
+                dkr::runtime::input::gyro_axis(gyro_player));
             ImGui::TextUnformatted("Motion style");
             ImGui::SetNextItemWidth(available_width);
             if (ControlCombo("##gyro-axis", &axis,
                              "Roll controller like a wheel\0Yaw controller left and right\0")) {
                 dkr::runtime::input::set_gyro_axis(
                     axis == 1 ? dkr::runtime::input::GyroAxis::Yaw
-                              : dkr::runtime::input::GyroAxis::Roll);
+                              : dkr::runtime::input::GyroAxis::Roll,
+                    gyro_player);
                 SaveSettings();
             }
-            float sensitivity = dkr::runtime::input::gyro_sensitivity();
+            float sensitivity =
+                dkr::runtime::input::gyro_sensitivity(gyro_player);
             ImGui::TextUnformatted("Horizontal gyro sensitivity");
             ImGui::SetNextItemWidth(available_width);
-            if (ControlSliderFloat("##gyro-x-sensitivity", &sensitivity,
-                                   25.0F, 300.0F, "%.0f%%",
-                                   ImGuiSliderFlags_AlwaysClamp)) {
-                dkr::runtime::input::set_gyro_sensitivity(sensitivity);
+            ImGui::PushStyleVar(
+                ImGuiStyleVar_FramePadding,
+                {ImGui::GetStyle().FramePadding.x, 9.0F});
+            const bool horizontal_sensitivity_changed = ControlSliderFloat(
+                "##gyro-x-sensitivity", &sensitivity, 25.0F, 300.0F,
+                "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopStyleVar();
+            if (horizontal_sensitivity_changed) {
+                dkr::runtime::input::set_gyro_sensitivity(sensitivity,
+                                                          gyro_player);
                 SaveSettings();
             }
-            float y_sensitivity = dkr::runtime::input::gyro_y_sensitivity();
+            float y_sensitivity =
+                dkr::runtime::input::gyro_y_sensitivity(gyro_player);
             ImGui::TextUnformatted("Vertical gyro sensitivity");
             ImGui::SetNextItemWidth(available_width);
-            if (ControlSliderFloat("##gyro-y-sensitivity", &y_sensitivity,
-                                   25.0F, 300.0F, "%.0f%%",
-                                   ImGuiSliderFlags_AlwaysClamp)) {
-                dkr::runtime::input::set_gyro_y_sensitivity(y_sensitivity);
+            ImGui::PushStyleVar(
+                ImGuiStyleVar_FramePadding,
+                {ImGui::GetStyle().FramePadding.x, 9.0F});
+            const bool vertical_sensitivity_changed = ControlSliderFloat(
+                "##gyro-y-sensitivity", &y_sensitivity, 25.0F, 300.0F,
+                "%.0f%%", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::PopStyleVar();
+            if (vertical_sensitivity_changed) {
+                dkr::runtime::input::set_gyro_y_sensitivity(y_sensitivity,
+                                                            gyro_player);
                 SaveSettings();
             }
-            float deadzone = dkr::runtime::input::gyro_deadzone();
+            float deadzone = dkr::runtime::input::gyro_deadzone(gyro_player);
             ImGui::TextUnformatted("Motion deadzone");
             ImGui::SetNextItemWidth(available_width);
             if (ControlSliderFloat("##gyro-deadzone", &deadzone,
                                    0.0F, 12.0F, "%.1f deg/s",
                                    ImGuiSliderFlags_AlwaysClamp)) {
-                dkr::runtime::input::set_gyro_deadzone(deadzone);
+                dkr::runtime::input::set_gyro_deadzone(deadzone, gyro_player);
                 SaveSettings();
             }
-            bool inverted = dkr::runtime::input::gyro_inverted();
+            bool inverted = dkr::runtime::input::gyro_inverted(gyro_player);
             if (ImGui::Checkbox("Invert horizontal gyro", &inverted)) {
-                dkr::runtime::input::set_gyro_inverted(inverted);
+                dkr::runtime::input::set_gyro_inverted(inverted, gyro_player);
                 SaveSettings();
             }
-            bool y_inverted = dkr::runtime::input::gyro_y_inverted();
+            bool y_inverted =
+                dkr::runtime::input::gyro_y_inverted(gyro_player);
             if (ImGui::Checkbox("Invert vertical gyro", &y_inverted)) {
-                dkr::runtime::input::set_gyro_y_inverted(y_inverted);
+                dkr::runtime::input::set_gyro_y_inverted(y_inverted,
+                                                         gyro_player);
                 SaveSettings();
             }
-            const bool available = dkr::runtime::platform::gyro_available();
+            const bool available =
+                dkr::runtime::platform::gyro_available(gyro_player);
             const float steering =
-                dkr::runtime::input::gyro_steering_position();
+                dkr::runtime::input::gyro_steering_position(gyro_player);
             ImGui::ProgressBar((steering + 1.0F) * 0.5F,
-                               {available_width, 18.0F},
+                               {available_width, 26.0F},
                                "Horizontal steering");
             const float vertical =
-                dkr::runtime::input::gyro_steering_y_position();
+                dkr::runtime::input::gyro_steering_y_position(gyro_player);
             ImGui::ProgressBar((vertical + 1.0F) * 0.5F,
-                               {available_width, 18.0F},
+                               {available_width, 26.0F},
                                "Vertical steering");
             ImGui::BeginDisabled(!live || !available);
             if (ImGui::Button("RECENTER STEERING", {available_width, 44.0F})) {
-                dkr::runtime::input::recenter_gyro();
+                dkr::runtime::input::recenter_gyro(gyro_player);
             }
             ImGui::EndDisabled();
             ImGui::BeginDisabled(!live || !available ||
-                                 dkr::runtime::input::gyro_calibrating());
+                                 dkr::runtime::input::gyro_calibrating(
+                                     gyro_player));
             if (ImGui::Button("CALIBRATE CONTROLLER", {available_width, 44.0F})) {
-                dkr::runtime::input::begin_gyro_calibration();
+                dkr::runtime::input::begin_gyro_calibration(gyro_player);
             }
             ImGui::EndDisabled();
-            if (dkr::runtime::input::gyro_calibrating()) {
-                const float progress = dkr::runtime::input::gyro_calibration_progress();
+            if (dkr::runtime::input::gyro_calibrating(gyro_player)) {
+                const float progress =
+                    dkr::runtime::input::gyro_calibration_progress(gyro_player);
                 ImGui::ProgressBar(progress, {available_width, 18.0F},
                                    "Keep the controller still");
             } else if (!live) {
                 ImGui::TextDisabled("Calibration is available from the in-game overlay.");
             } else if (!available) {
-                ImGui::TextDisabled("No SDL gyro sensor was reported by Controller 1.");
+                ImGui::TextDisabled(
+                    "No SDL gyro sensor was reported by Controller %zu.",
+                    gyro_player + 1U);
             }
         }
+        }
+    }
+    if (!modern_controls &&
+        (g_controls_section == 2 || g_controls_section == 3)) {
+        ImGui::TextDisabled(
+            "Driving and gyro tuning are available in Modern presentation style.");
     }
 
     constexpr const char* kCapturePopup = "CHOOSE A NEW CONTROL";
@@ -3455,21 +9972,26 @@ void DrawControlsReference(bool live) {
         ImGui::OpenPopup(kCapturePopup);
         g_capture_popup_pending = false;
     }
-    ImGui::SetNextWindowSize({std::min(520.0F, ImGui::GetIO().DisplaySize.x - 32.0F), 230.0F},
-                             ImGuiCond_Appearing);
+    const ImVec2 capture_display_size = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(
+        {std::min(520.0F, capture_display_size.x - 32.0F),
+         std::min(300.0F, capture_display_size.y - 32.0F)},
+        ImGuiCond_Appearing);
     if (BeginPaddedModal(kCapturePopup,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
         if (g_capture_action >= 0) {
             const auto action = static_cast<Action>(g_capture_action);
             PushHeadingFont();
-            ImGui::TextWrapped("%s", dkr::runtime::input::action_label(action));
+            ImGui::TextWrapped("PLAYER %zu - %s", g_selected_player + 1U,
+                               dkr::runtime::input::action_label(action));
             PopHeadingFont();
             ImGui::TextWrapped(g_capture_device == CaptureDevice::Keyboard
                 ? "Press a keyboard key. Escape cancels."
                 : "Press a gamepad button or move an axis firmly. Escape cancels.");
         } else if (g_capture_action == kShortcutCaptureAction) {
             PushHeadingFont();
-            ImGui::TextUnformatted("QUICK RESTART");
+            ImGui::TextUnformatted(ShortcutActionLabel(
+                g_capture_shortcut_action));
             PopHeadingFont();
             ImGui::TextWrapped(g_capture_device == CaptureDevice::Keyboard
                 ? "Press one key, or hold the first and press a second. The chord is saved automatically. Escape cancels."
@@ -3481,28 +10003,44 @@ void DrawControlsReference(bool live) {
                 ImGui::Text("Captured: %s",
                             ShortcutBindingName(g_capture_device, pending).c_str());
             }
+        } else if (g_capture_action == kAssignControllerCaptureAction) {
+            PushHeadingFont();
+            ImGui::Text("ASSIGN PLAYER %zu", g_selected_player + 1U);
+            PopHeadingFont();
+            ImGui::TextWrapped("Press any button on the controller you want this player to use. Escape cancels.");
         }
         ImGui::Dummy({0.0F, 12.0F});
         const float popup_gap = ImGui::GetStyle().ItemSpacing.x;
         const float popup_button_width = std::max(
             (ImGui::GetContentRegionAvail().x - popup_gap) * 0.5F, 1.0F);
-        if (ImGui::Button("UNBIND", {popup_button_width, 44.0F})) {
+        const char* clear_label = g_capture_action == kAssignControllerCaptureAction
+            ? "CLEAR ASSIGNMENT" : "UNBIND";
+        if (ImGui::Button(clear_label, {popup_button_width, 44.0F})) {
             if (g_capture_action >= 0) {
                 const auto action = static_cast<Action>(g_capture_action);
                 if (g_capture_device == CaptureDevice::Keyboard) {
                     dkr::runtime::input::set_keyboard_binding(
-                        action, dkr::runtime::input::kUnbound);
+                        g_selected_player, action, dkr::runtime::input::kUnbound);
+                } else if (g_capture_secondary_controller) {
+                    dkr::runtime::input::set_secondary_controller_binding(
+                        g_selected_player, action,
+                        dkr::runtime::input::kUnbound);
                 } else {
                     dkr::runtime::input::set_controller_binding(
-                        action, dkr::runtime::input::kUnbound);
+                        g_selected_player, action, dkr::runtime::input::kUnbound);
                 }
             } else if (g_capture_action == kShortcutCaptureAction) {
                 const dkr::runtime::input::ShortcutBinding unbound{};
                 if (g_capture_device == CaptureDevice::Keyboard) {
-                    dkr::runtime::input::set_quick_restart_keyboard_binding(unbound);
+                    dkr::runtime::input::set_shortcut_keyboard_binding(
+                        g_capture_shortcut_action, unbound);
                 } else {
-                    dkr::runtime::input::set_quick_restart_controller_binding(unbound);
+                    dkr::runtime::input::set_shortcut_controller_binding(
+                        g_capture_shortcut_action, unbound);
                 }
+            } else if (g_capture_action == kAssignControllerCaptureAction) {
+                dkr::runtime::platform::clear_controller_assignment(
+                    g_selected_player);
             }
             SaveSettings();
             g_capture_finished = true;
@@ -3515,14 +10053,27 @@ void DrawControlsReference(bool live) {
             ImGui::CloseCurrentPopup();
             g_capture_action = -1;
             g_capture_device = CaptureDevice::None;
+            g_capture_secondary_controller = false;
             g_capture_finished = false;
         }
         ImGui::EndPopup();
     }
+    DrawControllerMappingModal();
     ImGui::Dummy({0.0F, 44.0F});
 }
 
 bool HandleInputCaptureEvent(SDL_Event* event) {
+    const auto mapping =
+        dkr::runtime::platform::controller_mapping_progress();
+    if (mapping.capturing) {
+        if (event != nullptr && event->type == SDL_KEYDOWN &&
+            event->key.repeat == 0 &&
+            event->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+            dkr::runtime::platform::cancel_controller_mapping();
+            return true;
+        }
+        return dkr::runtime::platform::handle_controller_mapping_event(event);
+    }
     if (event == nullptr || g_capture_action == -1 || g_capture_finished) {
         return false;
     }
@@ -3537,7 +10088,9 @@ bool HandleInputCaptureEvent(SDL_Event* event) {
             event->type == SDL_KEYDOWN && event->key.repeat == 0) {
             source = static_cast<int>(event->key.keysym.scancode);
         } else if (g_capture_device == CaptureDevice::Controller &&
-                   event->type == SDL_CONTROLLERBUTTONDOWN) {
+                   event->type == SDL_CONTROLLERBUTTONDOWN &&
+                   event->cbutton.which ==
+                       dkr::runtime::platform::controller_instance_for_player(0U)) {
             source = dkr::runtime::input::encode_controller_button(
                 event->cbutton.button);
         }
@@ -3556,6 +10109,29 @@ bool HandleInputCaptureEvent(SDL_Event* event) {
         }
         return false;
     }
+    if (g_capture_action == kAssignControllerCaptureAction) {
+        if (event->type == SDL_KEYDOWN && event->key.repeat == 0 &&
+            event->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+            g_capture_finished = true;
+            return true;
+        }
+        if (event->type == SDL_CONTROLLERBUTTONDOWN &&
+            dkr::runtime::platform::assign_controller(
+                g_selected_player, event->cbutton.which)) {
+            SaveSettings();
+            g_capture_finished = true;
+            return true;
+        }
+        if (event->type == SDL_JOYBUTTONDOWN &&
+            dkr::runtime::platform::begin_controller_mapping(
+                event->jbutton.which, g_selected_player)) {
+            g_capture_finished = true;
+            g_controller_mapping_popup_pending = true;
+            g_controller_mapping_completion_saved = false;
+            return true;
+        }
+        return false;
+    }
     using dkr::runtime::input::Action;
     const auto action = static_cast<Action>(g_capture_action);
     if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
@@ -3565,25 +10141,46 @@ bool HandleInputCaptureEvent(SDL_Event* event) {
         }
         if (g_capture_device == CaptureDevice::Keyboard) {
             dkr::runtime::input::set_keyboard_binding(
-                action, static_cast<int>(event->key.keysym.scancode));
+                g_selected_player, action,
+                static_cast<int>(event->key.keysym.scancode));
             SaveSettings();
             g_capture_finished = true;
             return true;
         }
     }
     if (g_capture_device == CaptureDevice::Controller &&
-        event->type == SDL_CONTROLLERBUTTONDOWN) {
-        dkr::runtime::input::set_controller_binding(
-            action, dkr::runtime::input::encode_controller_button(event->cbutton.button));
+        event->type == SDL_CONTROLLERBUTTONDOWN &&
+        event->cbutton.which ==
+            dkr::runtime::platform::controller_instance_for_player(
+                g_selected_player)) {
+        const int source = dkr::runtime::input::encode_controller_button(
+            event->cbutton.button);
+        if (g_capture_secondary_controller) {
+            dkr::runtime::input::set_secondary_controller_binding(
+                g_selected_player, action, source);
+        } else {
+            dkr::runtime::input::set_controller_binding(
+                g_selected_player, action, source);
+        }
         SaveSettings();
         g_capture_finished = true;
         return true;
     }
     if (g_capture_device == CaptureDevice::Controller &&
-        event->type == SDL_CONTROLLERAXISMOTION && std::abs(event->caxis.value) >= 20000) {
-        dkr::runtime::input::set_controller_binding(
-            action, dkr::runtime::input::encode_controller_axis(
-                        event->caxis.axis, event->caxis.value > 0));
+        event->type == SDL_CONTROLLERAXISMOTION &&
+        event->caxis.which ==
+            dkr::runtime::platform::controller_instance_for_player(
+                g_selected_player) &&
+        std::abs(event->caxis.value) >= 20000) {
+        const int source = dkr::runtime::input::encode_controller_axis(
+            event->caxis.axis, event->caxis.value > 0);
+        if (g_capture_secondary_controller) {
+            dkr::runtime::input::set_secondary_controller_binding(
+                g_selected_player, action, source);
+        } else {
+            dkr::runtime::input::set_controller_binding(
+                g_selected_player, action, source);
+        }
         SaveSettings();
         g_capture_finished = true;
         return true;
@@ -3639,12 +10236,12 @@ void DrawOverlayContent(float content_width) {
             }
         }
         bool memory_pak = dkr::runtime::pak::enabled();
-        if (ImGui::Checkbox("Virtual Memory Pak", &memory_pak)) {
+        if (ImGui::Checkbox("Virtual Controller Paks", &memory_pak)) {
             dkr::runtime::pak::set_enabled(memory_pak);
             SaveSettings();
         }
         ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        ImGui::TextWrapped("T.T. keeps Controller Pak data safely in your DKR-R settings folder, with a recovery backup after every successful write.");
+        ImGui::TextWrapped("Creates a separate Controller Pak for every connected local racer while keeping rumble available at the same time. T.T. stores each Pak safely in your DKR-R settings folder with a recovery backup after every successful write.");
         ImGui::PopStyleColor();
     } else if (g_overlay_page == kPageSaveManager) {
         DrawPageHeading("SAVE MANAGER");
@@ -3652,17 +10249,9 @@ void DrawOverlayContent(float content_width) {
         ImGui::Dummy({0.0F, 12.0F});
         DrawSaveManager(true);
     } else if (g_overlay_page == kPageOnlineMp) {
-        DrawComingSoonPage(
-            "ONLINE MP", "online-mp-coming-soon",
-            "Online multiplayer will let racers meet beyond the shores of DKR-R.",
-            "Taj is still tuning the network karts and testing every shortcut.",
-            content_width);
+        DrawOnlinePage(content_width, false, true);
     } else if (g_overlay_page == kPageModsHacks) {
-        DrawComingSoonPage(
-            "MODS / HACKS", "mods-hacks-coming-soon",
-            "A dedicated garage for community mods and game hacks is planned for DKR-R.",
-            "T.T. is still checking every part before the mod garage opens.",
-            content_width);
+        DrawModsHacks(content_width);
     } else if (g_overlay_page == kPageAbout) {
         DrawAboutDkrR(content_width);
     }
@@ -3673,10 +10262,51 @@ void DrawOverlayContent(float content_width) {
 
 void dkr::runtime::ui::configure(const std::filesystem::path& config_directory) {
     g_config_directory = config_directory;
+    dkr::runtime::hud::configure(config_directory);
+    const auto adventure = dkr::runtime::saves::adventure_info();
+    if (adventure.exists &&
+        adventure.size == dkr::runtime::saves::codec::kImageSize &&
+        !adventure.valid) {
+        bool changed = false;
+        std::filesystem::path backup;
+        std::string error;
+        if (dkr::runtime::saves::repair_adventure_checksums(
+                changed, backup, error) && changed) {
+            g_save_manager_status =
+                "DKR-R safely repaired the Adventure EEPROM checksums. The exact original is preserved at " +
+                PathUtf8(backup);
+        } else if (!error.empty()) {
+            g_save_manager_status =
+                "Automatic checksum repair was not applied: " + error;
+        }
+    }
     dkr::runtime::magic_codes::configure(config_directory);
     dkr::runtime::texture_packs::configure(config_directory);
+    dkr::runtime::netplay::session().configure_artifact_directory(
+        config_directory / "netplay" / "replays");
     RefreshCrtFilters();
     LoadSettings();
+    // HUD placement is temporarily unavailable. Normalize any previously
+    // persisted experimental mode so hidden state cannot alter gameplay.
+    if (dkr::runtime::hud::mode() !=
+        dkr::runtime::hud::LayoutMode::Original) {
+        dkr::runtime::hud::set_mode(
+            dkr::runtime::hud::LayoutMode::Original);
+        SaveSettings();
+    }
+    dkr::runtime::netplay::friend_service().configure(
+        config_directory, g_online_player_name);
+    const std::string profile_name =
+        dkr::runtime::netplay::friend_service().display_name();
+    const auto copy_profile_name = [&](char* destination,
+                                       std::size_t capacity) {
+        const std::size_t length =
+            std::min(profile_name.size(), capacity - 1U);
+        std::memcpy(destination, profile_name.data(), length);
+        destination[length] = '\0';
+    };
+    copy_profile_name(g_online_profile_name, sizeof(g_online_profile_name));
+    copy_profile_name(g_online_player_name, sizeof(g_online_player_name));
     if (!g_crt_filters.empty()) {
         g_crt_filter_index = std::clamp(
             g_crt_filter_index, 0, static_cast<int>(g_crt_filters.size()) - 1);
@@ -3697,20 +10327,21 @@ void dkr::runtime::ui::persist_graphics_api_fallback() {
                  "[boot][settings] unavailable graphics API recovered to Automatic\n");
 }
 
-dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window* window) {
+dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
+    SDL_Window* window, const std::filesystem::path& preselected_rom) {
     StartupResult result{};
     if (window == nullptr) {
         return result;
     }
 
     SDL_SetWindowTitle(window, "DKR-R - Diddy Kong Racing Recompiled");
-    // SDL's accelerated Linux renderers can replace the native window state
-    // used by SDL_Vulkan_CreateSurface. That leaves the launcher visible but
-    // makes the window disappear as soon as RT64 takes over under Gamescope.
-    // The launcher is inexpensive 2D UI, so keep it on the software backend
-    // and reserve the Vulkan-capable window for the game renderer.
 #if defined(__linux__)
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    // The launcher and RT64 share this Vulkan-capable SDL window for the
+    // complete process lifetime. An accelerated SDL renderer can replace the
+    // native surface state under Gamescope, so keep the lightweight launcher
+    // on the software backend and let RT64 take over the same window directly.
+    SDL_Renderer* renderer = SDL_CreateRenderer(
+        window, -1, SDL_RENDERER_SOFTWARE);
 #else
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -3740,41 +10371,298 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
     ApplyStyle();
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
+    int launcher_display_refresh_rate = 60;
+    const int launcher_display = SDL_GetWindowDisplayIndex(window);
+    SDL_DisplayMode launcher_display_mode{};
+    if (launcher_display >= 0 &&
+        SDL_GetCurrentDisplayMode(launcher_display,
+                                  &launcher_display_mode) == 0 &&
+        launcher_display_mode.refresh_rate > 0) {
+        launcher_display_refresh_rate = std::clamp(
+            launcher_display_mode.refresh_rate, 30, 240);
+    }
+    const int launcher_interactive_refresh_rate =
+        std::min(launcher_display_refresh_rate, 60);
+    const int launcher_quiet_refresh_rate =
+        std::min(launcher_interactive_refresh_rate, 30);
+    std::fprintf(stderr,
+                 "[boot][launcher] refresh targets interactive=%dHz quiet=%dHz "
+                 "unfocused=10Hz hidden=event-driven\n",
+                 launcher_interactive_refresh_rate,
+                 launcher_quiet_refresh_rate);
+
+    const LauncherBackgroundTexture launcher_background =
+        LoadLauncherBackground(renderer);
+    const auto launcher_animation_epoch = std::chrono::steady_clock::now();
+    constexpr auto kLauncherIdleInterval = std::chrono::milliseconds{100};
+    constexpr auto kLauncherInteractionWindow =
+        std::chrono::milliseconds{850};
+    auto launcher_last_activity = launcher_animation_epoch;
+    double launcher_background_scroll = 0.0;
+    std::uint64_t launcher_rendered_frames = 0U;
+    std::uint64_t launcher_interactive_frames = 0U;
+    std::uint64_t launcher_quiet_frames = 0U;
+    std::uint64_t launcher_unfocused_frames = 0U;
+    std::uint64_t launcher_hidden_wakes = 0U;
+    std::uint64_t launcher_total_vertices = 0U;
+    std::uint64_t launcher_total_indices = 0U;
+    std::uint64_t launcher_peak_vertices = 0U;
+    std::uint64_t launcher_ui_build_microseconds = 0U;
+    std::uint64_t launcher_present_microseconds = 0U;
 
     std::filesystem::path selected_rom;
+    std::filesystem::path online_manifest_rom;
+    dkr::runtime::rom::Identity online_manifest_identity{};
+    std::optional<dkr::runtime::netplay::CompatibilityManifest>
+        online_manifest;
     std::string rom_status = "Choose your legally obtained Diddy Kong Racing Game Pak.";
     bool rom_ready = false;
-    if (const auto remembered = LoadLastRom(); remembered.has_value()) {
+    std::vector<RomCatalogEntry> rom_catalog = LoadRomCatalog();
+    const std::optional<std::filesystem::path> initial_rom =
+        !preselected_rom.empty()
+            ? std::optional<std::filesystem::path>{preselected_rom}
+            : LoadLastRom();
+    if (initial_rom.has_value()) {
         std::string error;
-        if (dkr::runtime::SelectRom(*remembered, error)) {
-            selected_rom = *remembered;
+        dkr::runtime::rom::Identity identity{};
+        if (dkr::runtime::ValidateRomForLauncher(*initial_rom, identity, error)) {
+            CommitRomSelection(*initial_rom, identity, selected_rom,
+                               rom_catalog, rom_status);
             rom_ready = true;
-            rom_status = "Game Pak ready. The adventure can begin!";
         } else {
             rom_status = "T.T. could not find the previous Game Pak. Choose it again.";
         }
     }
+    if (!rom_ready && !rom_catalog.empty()) {
+        const RomCatalogEntry fallback = rom_catalog.front();
+        rom_ready = SelectCatalogRom(fallback, selected_rom, rom_catalog,
+                                     rom_status);
+    }
 
     int page = 0;
-    bool focus_selected_tab = true;
+    int last_rendered_page = -1;
+    int sidebar_selection = 0;
+    bool focus_content = true;
     bool running = true;
     bool launch_requested = false;
     while (running) {
+        if (g_online_compatibility_sync_requested) {
+            g_online_compatibility_sync_requested = false;
+            auto& online = dkr::runtime::netplay::session();
+            const auto failed_view = online.view();
+            if (failed_view.state !=
+                    dkr::runtime::netplay::ConnectionState::Failed ||
+                !failed_view.compatibility_sync_offer.has_value() ||
+                failed_view.invite.empty()) {
+                g_online_action_status =
+                    "The authenticated host sync offer expired. Enter the current Quick Join code again.";
+            } else {
+                const auto expected = *failed_view.compatibility_sync_offer;
+                std::optional<std::pair<RomCatalogEntry,
+                                        dkr::runtime::rom::Identity>> matching_rom;
+                for (const RomCatalogEntry& entry : rom_catalog) {
+                    dkr::runtime::rom::Identity identity{};
+                    std::string validation_error;
+                    if (!dkr::runtime::ValidateRomForLauncher(
+                            entry.path, identity, validation_error)) {
+                        continue;
+                    }
+                    const auto revision = identity.revision ==
+                            dkr::runtime::rom::Revision::UsV80
+                        ? dkr::runtime::netplay::Revision::UsV80
+                        : dkr::runtime::netplay::Revision::UsV77;
+                    if (revision == expected.revision &&
+                        identity.canonical_xxh3 == expected.canonical_rom_hash) {
+                        matching_rom = std::make_pair(entry, identity);
+                        break;
+                    }
+                }
+
+                if (!matching_rom.has_value()) {
+                    g_online_action_status =
+                        "One-click sync stopped safely: the host's exact supported Game Pak is not already imported on this device. DKR-R never transfers ROM data.";
+                } else {
+                    const std::filesystem::path previous_rom = selected_rom;
+                    const bool previous_rom_ready = rom_ready;
+                    const std::uint32_t previous_persistent =
+                        dkr::runtime::magic_codes::persistent_mask();
+                    const std::uint32_t previous_one_shot =
+                        dkr::runtime::magic_codes::queued_one_shot_mask();
+                    const auto previous_manifest = online_manifest;
+                    const std::string invitation = failed_view.invite;
+                    std::string sync_error;
+                    if ((expected.magic_codes_hash >> 32U) != 0U) {
+                        sync_error =
+                            "The host supplied an invalid Magic Code compatibility value.";
+                    }
+                    const std::uint32_t expected_codes =
+                        static_cast<std::uint32_t>(expected.magic_codes_hash);
+
+                    bool applied = sync_error.empty();
+                    if (applied) {
+                        dkr::runtime::magic_codes::set_persistent_mask(
+                            expected_codes &
+                            dkr::runtime::magic_codes::kPersistentMagicCodeMask);
+                    }
+                    if (applied) {
+                        applied =
+                        dkr::runtime::magic_codes::set_queued_one_shot_mask(
+                            expected_codes &
+                            dkr::runtime::magic_codes::kOneShotMagicCodeMask,
+                            sync_error);
+                    }
+                    if (applied) {
+                        CommitRomSelection(
+                            matching_rom->first.path, matching_rom->second,
+                            selected_rom, rom_catalog, rom_status);
+                        rom_ready = true;
+                        auto candidate = BuildNetplayManifest(
+                            matching_rom->second);
+                        auto comparable = candidate;
+                        comparable.session_save_hash = expected.session_save_hash;
+                        const std::string remaining =
+                            dkr::runtime::netplay::incompatibility_reason(
+                                expected, comparable);
+                        if (!remaining.empty()) {
+                            sync_error =
+                                "The host also differs in a setting that cannot be changed safely: " +
+                                dkr::runtime::netplay::online_failure_display_message(
+                                    remaining);
+                            applied = false;
+                        } else {
+                            online.disconnect(
+                                "Applying the authenticated host compatibility offer.");
+                            online.configure_manifest(candidate);
+                            std::vector<std::uint8_t> canonical_save;
+                            std::string save_error;
+                            dkr::runtime::saves::canonical_adventure_bytes(
+                                canonical_save, save_error);
+                            online.configure_session_save(
+                                std::move(canonical_save),
+                                dkr::runtime::saves::install_synchronized_online_adventure);
+                            online_manifest_rom = selected_rom;
+                            online_manifest_identity = matching_rom->second;
+                            online_manifest = candidate;
+                            if (!online.join(invitation, g_online_player_name,
+                                             sync_error)) {
+                                applied = false;
+                            }
+                        }
+                    }
+
+                    if (!applied) {
+                        online.disconnect(
+                            "The one-click compatibility sync was rolled back safely.");
+                        dkr::runtime::magic_codes::set_persistent_mask(
+                            previous_persistent);
+                        std::string restore_error;
+                        dkr::runtime::magic_codes::set_queued_one_shot_mask(
+                            previous_one_shot, restore_error);
+                        selected_rom = previous_rom;
+                        rom_ready = previous_rom_ready;
+                        if (!selected_rom.empty()) SaveLastRom(selected_rom);
+                        online_manifest_rom = selected_rom;
+                        online_manifest_identity = previous_rom_ready
+                            ? dkr::runtime::rom::inspect(previous_rom)
+                            : dkr::runtime::rom::Identity{};
+                        online_manifest = previous_manifest;
+                        if (previous_manifest) {
+                            online.configure_manifest(*previous_manifest);
+                        }
+                        SaveSettings();
+                        g_online_action_status =
+                            "One-click host sync made no lasting changes: " +
+                            (sync_error.empty() ?
+                                 "the retry could not be started." : sync_error);
+                    } else {
+                        SaveSettings();
+                        g_online_failure_modal_active = false;
+                        g_online_action_status =
+                            "Host Game Pak and Magic Codes matched. Reconnecting with the authenticated invitation...";
+                    }
+                }
+            }
+        }
+        if (rom_ready && selected_rom != online_manifest_rom) {
+            online_manifest_identity =
+                dkr::runtime::rom::inspect(selected_rom);
+            online_manifest_rom = selected_rom;
+            online_manifest.reset();
+        }
+        // ROM revision is game-core data, not frontend ownership. Keep this
+        // launcher, its window, input routing and online session alive for
+        // every supported revision; the matching game engine is selected only
+        // after the player explicitly starts the game.
+        if (rom_ready && !online_manifest &&
+            online_manifest_identity.supported() &&
+            dkr::runtime::netplay::session().view().state ==
+                dkr::runtime::netplay::ConnectionState::Offline) {
+            const auto candidate = BuildNetplayManifest(
+                online_manifest_identity);
+            if (!online_manifest || *online_manifest != candidate) {
+                dkr::runtime::netplay::session().configure_manifest(candidate);
+                std::vector<std::uint8_t> canonical_save;
+                std::string save_error;
+                dkr::runtime::saves::canonical_adventure_bytes(
+                    canonical_save, save_error);
+                dkr::runtime::netplay::session().configure_session_save(
+                    std::move(canonical_save),
+                    dkr::runtime::saves::install_synchronized_online_adventure);
+                online_manifest = candidate;
+            }
+        }
+        PumpDirectSessionIfDue();
+        PumpFriendPresence();
+        if (rom_ready &&
+            dkr::runtime::netplay::session().consume_launch_request()) {
+            result.start_game = true;
+            result.rom_path = selected_rom;
+            running = false;
+            continue;
+        }
         bool request_quit_popup = false;
         bool request_restart_popup = false;
         constexpr int launcher_page_count = kMenuPageCount;
+        constexpr int launcher_sidebar_count = kMenuPageCount + 2;
         if (page >= launcher_page_count) {
             page = 0;
         }
+        const Uint32 launcher_window_flags_before_events =
+            SDL_GetWindowFlags(window);
+        const bool launcher_window_focused_before_events =
+            (launcher_window_flags_before_events &
+             (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) == 0U &&
+            (launcher_window_flags_before_events &
+             SDL_WINDOW_INPUT_FOCUS) != 0U;
+        dkr::runtime::platform::pump_input_backend_events();
         SDL_Event event{};
-        while (SDL_PollEvent(&event) != 0) {
+        const auto process_launcher_event = [&](SDL_Event& event) {
+            const bool input_activity =
+                event.type == SDL_MOUSEMOTION ||
+                event.type == SDL_MOUSEBUTTONDOWN ||
+                event.type == SDL_MOUSEBUTTONUP ||
+                event.type == SDL_MOUSEWHEEL ||
+                event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ||
+                event.type == SDL_TEXTINPUT ||
+                (event.type == SDL_CONTROLLERAXISMOTION &&
+                 std::abs(static_cast<int>(event.caxis.value)) >= 8192) ||
+                event.type == SDL_CONTROLLERBUTTONDOWN ||
+                event.type == SDL_CONTROLLERBUTTONUP ||
+                (event.type == SDL_WINDOWEVENT &&
+                 (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ||
+                  event.window.event == SDL_WINDOWEVENT_RESTORED ||
+                  event.window.event == SDL_WINDOWEVENT_SHOWN ||
+                  event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED));
+            if (input_activity) {
+                launcher_last_activity = std::chrono::steady_clock::now();
+            }
             dkr::runtime::platform::update_fullscreen_cursor(&event);
             ImGui_ImplSDL2_ProcessEvent(&event);
             if (HandleInputCaptureEvent(&event)) {
-                continue;
+                return;
             }
             if (dkr::runtime::platform::handle_window_shortcut(&event, false)) {
-                continue;
+                return;
             }
             if (event.type == SDL_QUIT ||
                 (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE)) {
@@ -3784,24 +10672,82 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
                 event.key.keysym.scancode == SDL_SCANCODE_ESCAPE && g_rom_browser.open) {
                 g_rom_browser.close_requested = true;
             }
+            const bool code_keyboard_visible =
+                g_online_code_keyboard_visible.load(std::memory_order_acquire);
+            if (code_keyboard_visible &&
+                ((event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
+                  event.key.keysym.scancode == SDL_SCANCODE_ESCAPE) ||
+                 (event.type == SDL_CONTROLLERBUTTONDOWN &&
+                  event.cbutton.button == SDL_CONTROLLER_BUTTON_B))) {
+                g_online_code_keyboard_cancel_requested.store(
+                    true, std::memory_order_release);
+                return;
+            }
             if (event.type == SDL_CONTROLLERBUTTONDOWN) {
                 if (event.cbutton.button == SDL_CONTROLLER_BUTTON_B && g_rom_browser.open) {
                     RomBrowserBack();
-                } else if (!g_rom_browser.open &&
+                } else if (!g_rom_browser.open && !code_keyboard_visible &&
                            event.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-                    page = (page + launcher_page_count - 1) % launcher_page_count;
-                    focus_selected_tab = true;
-                } else if (!g_rom_browser.open &&
+                    sidebar_selection =
+                        (sidebar_selection + launcher_sidebar_count - 1) %
+                        launcher_sidebar_count;
+                    if (sidebar_selection < launcher_page_count) {
+                        page = sidebar_selection;
+                        focus_content = true;
+                    }
+                } else if (!g_rom_browser.open && !code_keyboard_visible &&
                            event.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-                    page = (page + 1) % launcher_page_count;
-                    focus_selected_tab = true;
+                    sidebar_selection =
+                        (sidebar_selection + 1) % launcher_sidebar_count;
+                    if (sidebar_selection < launcher_page_count) {
+                        page = sidebar_selection;
+                        focus_content = true;
+                    }
+                } else if (!g_rom_browser.open && !code_keyboard_visible &&
+                           event.cbutton.button == SDL_CONTROLLER_BUTTON_A &&
+                           sidebar_selection >= launcher_page_count) {
+                    if (sidebar_selection == launcher_page_count) {
+                        request_restart_popup = true;
+                    } else {
+                        request_quit_popup = true;
+                    }
                 } else if (!g_rom_browser.open && page == 0 && rom_ready &&
                            event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
                     launch_requested = true;
                 }
             }
+        };
+        if (!launcher_window_focused_before_events &&
+            SDL_WaitEventTimeout(&event,
+                static_cast<int>(kLauncherIdleInterval.count())) != 0) {
+            process_launcher_event(event);
+        }
+        while (SDL_PollEvent(&event) != 0) {
+            process_launcher_event(event);
         }
         dkr::runtime::platform::update_fullscreen_cursor();
+
+        const Uint32 launcher_window_flags = SDL_GetWindowFlags(window);
+        const bool launcher_window_visible =
+            (launcher_window_flags &
+             (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) == 0U;
+        const bool launcher_window_focused = launcher_window_visible &&
+            (launcher_window_flags & SDL_WINDOW_INPUT_FOCUS) != 0U;
+        if (!launcher_window_visible) {
+            // Do not construct or submit an ImGui frame that cannot be seen.
+            // SDL_WaitEventTimeout above still wakes immediately for restore,
+            // close and input events, and the lightweight services continue at
+            // their own bounded cadence.
+            ++launcher_hidden_wakes;
+            continue;
+        }
+
+        const auto animation_now = std::chrono::steady_clock::now();
+        g_launcher_animation_seconds = std::chrono::duration<double>(
+            animation_now - launcher_animation_epoch).count();
+        constexpr double kBackgroundScrollPixelsPerSecond = 12.5;
+        launcher_background_scroll =
+            g_launcher_animation_seconds * kBackgroundScrollPixelsPerSecond;
 
         if (launch_requested) {
             result.start_game = true;
@@ -3810,81 +10756,143 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
             continue;
         }
 
+        const bool launcher_interaction_recent = launcher_window_focused &&
+            animation_now - launcher_last_activity <=
+                kLauncherInteractionWindow;
+        const int launcher_frame_rate = !launcher_window_focused
+            ? 10
+            : (launcher_interaction_recent
+                   ? launcher_interactive_refresh_rate
+                   : launcher_quiet_refresh_rate);
+        const auto launcher_frame_interval = std::chrono::microseconds{
+            1000000 / std::max(launcher_frame_rate, 1)};
+        const auto launcher_frame_started = std::chrono::steady_clock::now();
+        if (!launcher_window_focused) {
+            ++launcher_unfocused_frames;
+        } else if (launcher_interaction_recent) {
+            ++launcher_interactive_frames;
+        } else {
+            ++launcher_quiet_frames;
+        }
+
+        const auto launcher_ui_build_started =
+            std::chrono::steady_clock::now();
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         dkr::runtime::platform::update_ui_gamepad_navigation();
         ImGui::NewFrame();
+        int hud_viewport_width = 0;
+        int hud_viewport_height = 0;
+        SDL_GetWindowSize(window, &hud_viewport_width, &hud_viewport_height);
+        dkr::runtime::hud::set_viewport_extent(hud_viewport_width,
+                                               hud_viewport_height);
         BeginMainWindow("DKR-R Startup");
-        DrawRaceBackdrop(false);
+        DrawLauncherBackdrop(launcher_background, launcher_background_scroll);
         const ImVec2 available = ImGui::GetContentRegionAvail();
-        const float outer_margin = std::clamp(available.x * 0.022F, 16.0F, 34.0F);
-        const float content_height = available.y - outer_margin * 2.0F;
-        const float panel_gap = std::clamp(available.x * 0.018F, 14.0F, 28.0F);
+        const float layout_width = std::floor(available.x);
+        const float layout_height = std::floor(available.y);
+        const float outer_margin = std::round(
+            std::clamp(layout_width * 0.022F, 16.0F, 34.0F));
+        const float content_height = std::max(
+            std::floor(layout_height - outer_margin * 2.0F), 1.0F);
+        const float panel_gap = std::round(
+            std::clamp(layout_width * 0.018F, 14.0F, 28.0F));
         const float minimum_sidebar = available.x < 980.0F ? 190.0F : 230.0F;
-        const float sidebar_width = std::clamp(
-            available.x * 0.235F, minimum_sidebar,
-            std::min(340.0F, available.x * 0.34F));
+        const float sidebar_width = std::round(std::clamp(
+            layout_width * 0.235F, minimum_sidebar,
+            std::min(340.0F, layout_width * 0.34F)));
+        const float content_x =
+            outer_margin + sidebar_width + panel_gap;
         const float right_width = std::max(
-            available.x - outer_margin * 2.0F - sidebar_width - panel_gap,
-            320.0F);
-        const float panel_padding = std::clamp(right_width * 0.045F, 20.0F, 44.0F);
+            std::floor(layout_width - content_x - outer_margin), 320.0F);
+        const float panel_padding = std::round(
+            std::clamp(right_width * 0.045F, 20.0F, 44.0F));
         const float right_inner_width = std::max(right_width - panel_padding * 2.0F, 1.0F);
         ImGui::SetCursorPos({outer_margin, outer_margin});
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.025F, 0.105F, 0.15F, 0.96F});
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.025F, 0.105F, 0.15F, 0.88F});
         ImGui::PushStyleColor(ImGuiCol_Border, {1.0F, 0.67F, 0.08F, 0.92F});
+        const SidebarLayout sidebar_layout = CalculateSidebarLayout(
+            content_height, sidebar_width);
         ImGui::BeginChild("launcher-nav", {sidebar_width, content_height}, true,
-                          ImGuiWindowFlags_NavFlattened);
-        const float nav_padding = sidebar_width < 220.0F ? 16.0F : 24.0F;
+                          ImGuiWindowFlags_NavFlattened |
+                              ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
+        const float nav_padding = sidebar_layout.padding;
         const float nav_inner_width = sidebar_width - nav_padding * 2.0F;
         ImGui::SetCursorPos({nav_padding, nav_padding});
         ImGui::PushTextWrapPos(sidebar_width - nav_padding);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ItemSpacing,
+            {ImGui::GetStyle().ItemSpacing.x, sidebar_layout.item_spacing_y});
         ImGui::BeginGroup();
-        BrandBlock(nav_inner_width, content_height < 760.0F ? 170.0F : 218.0F);
-        ImGui::Dummy({0.0F, 18.0F});
-        LauncherSidebarButton("PLAY", 0, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("GRAPHICS", 1, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("SOUND", 2, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("CONTROLS", 3, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("SAVE MANAGER", 4, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("ONLINE MP", 5, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("MODS / HACKS", 6, page, focus_selected_tab,
-                              nav_inner_width);
-        LauncherSidebarButton("ABOUT DKR-R", 7, page, focus_selected_tab,
-                              nav_inner_width);
-        focus_selected_tab = false;
-        ImGui::Dummy({0.0F, 18.0F});
-        DrawSidebarNote(nav_inner_width);
-        ImGui::Dummy({0.0F, 16.0F});
-        ImGui::PushStyleColor(ImGuiCol_Button, {0.92F, 0.43F, 0.06F, 1.0F});
-        if (ImGui::Button("RESTART DKR-R", {nav_inner_width, 44.0F})) {
+        BrandBlock(nav_inner_width, sidebar_layout.logo_size);
+        ImGui::Dummy({0.0F, sidebar_layout.brand_gap});
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+        LauncherSidebarButton("PLAY", 0, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("GRAPHICS", 1, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("SOUND", 2, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("CONTROLS", 3, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("SAVE MANAGER", 4, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("DKR-R ONLINE", 5, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("MODS / HACKS", 6, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        LauncherSidebarButton("ABOUT DKR-R", 7, page, sidebar_selection,
+                              nav_inner_width, sidebar_layout.button_height);
+        ImGui::Dummy({0.0F, sidebar_layout.action_section_gap});
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            sidebar_selection == launcher_page_count
+                ? ImVec4{1.0F, 0.58F, 0.04F, 1.0F}
+                : ImVec4{0.92F, 0.43F, 0.06F, 1.0F});
+        if (ImGui::Button("RESTART DKR-R",
+                          {nav_inner_width, sidebar_layout.button_height})) {
+            sidebar_selection = launcher_page_count;
             request_restart_popup = true;
         }
         ImGui::PopStyleColor();
-        ImGui::Dummy({0.0F, 8.0F});
-        ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
-        if (ImGui::Button("EXIT DKR-R", {nav_inner_width, 44.0F})) {
+        ImGui::Dummy({0.0F, sidebar_layout.action_gap});
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            sidebar_selection == launcher_page_count + 1 ? kWarm : kRaceRed);
+        if (ImGui::Button("EXIT DKR-R",
+                          {nav_inner_width, sidebar_layout.button_height})) {
+            sidebar_selection = launcher_page_count + 1;
             request_quit_popup = true;
         }
         ImGui::PopStyleColor();
+        ImGui::PopItemFlag();
         ImGui::EndGroup();
+        ImGui::PopStyleVar();
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
-        ImGui::SameLine(0.0F, panel_gap);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.035F, 0.085F, 0.12F, 0.98F});
+        ImGui::SetCursorPos({content_x, outer_margin});
+        constexpr ImVec4 launcher_content_color{
+            0.035F, 0.085F, 0.12F, 0.90F};
+        DrawLinuxSoftwarePanelUnderlay(
+            {right_width, content_height}, launcher_content_color);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, launcher_content_color);
         ImGui::PushStyleColor(ImGuiCol_Border, {0.12F, 0.62F, 0.58F, 0.88F});
         ImGui::BeginChild("launcher-content", {right_width, content_height}, true,
                           ImGuiWindowFlags_NavFlattened);
+        if (page != last_rendered_page) {
+            ImGui::SetScrollY(0.0F);
+            last_rendered_page = page;
+        }
         ImGui::SetCursorPos({panel_padding, panel_padding});
         ImGui::PushItemWidth(right_inner_width);
         ImGui::PushTextWrapPos(panel_padding + right_inner_width);
         ImGui::BeginGroup();
+        if (focus_content) {
+            ImGui::SetKeyboardFocusHere();
+            focus_content = false;
+        }
         if (page == 0) {
             DrawPageHeading("PLAY");
             ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
@@ -3916,10 +10924,63 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
                 ImGui::PopStyleColor();
             }
             ImGui::Dummy({0.0F, 6.0F});
-            if (ImGui::Button(rom_ready ? "CHOOSE ANOTHER GAME PAK" : "CHOOSE YOUR GAME PAK",
-                              {std::min(260.0F, right_inner_width - 48.0F), 46.0F})) {
+            const float rom_row_width =
+                std::max(right_inner_width - 48.0F, 1.0F);
+            const float rom_row_spacing = ImGui::GetStyle().ItemSpacing.x;
+            const char* choose_label =
+                rom_ready ? "CHOOSE ANOTHER GAME PAK" : "CHOOSE YOUR GAME PAK";
+            const float desired_choose_width = std::ceil(
+                ImGui::CalcTextSize(choose_label).x +
+                ImGui::GetStyle().FramePadding.x * 2.0F + 24.0F);
+            const float maximum_choose_width = std::max(
+                rom_row_width - rom_row_spacing - 180.0F, 175.0F);
+            const float choose_width = std::min(
+                std::max(desired_choose_width, 260.0F), maximum_choose_width);
+            const float catalog_width = std::max(
+                rom_row_width - choose_width - rom_row_spacing, 120.0F);
+            if (ImGui::Button(choose_label, {choose_width, 46.0F})) {
                 OpenRomBrowser(selected_rom);
             }
+            ImGui::SameLine();
+            const std::string selected_key = RomPathKey(selected_rom);
+            const auto selected_entry = std::find_if(
+                rom_catalog.begin(), rom_catalog.end(),
+                [&selected_key](const RomCatalogEntry& entry) {
+                    return RomPathKey(entry.path) == selected_key;
+                });
+            const char* catalog_preview = rom_catalog.empty()
+                ? "ROM CATALOG EMPTY"
+                : (selected_entry != rom_catalog.end()
+                       ? selected_entry->label.c_str()
+                       : "SELECT GAME PAK");
+            ImGui::BeginDisabled(rom_catalog.empty());
+            ImGui::SetNextItemWidth(catalog_width);
+            {
+                const ControlFontScope catalog_combo_scope(true);
+                if (ImGui::BeginCombo("##rom-catalog", catalog_preview,
+                                      ImGuiComboFlags_HeightLarge)) {
+                    for (std::size_t index = 0; index < rom_catalog.size(); ++index) {
+                        const RomCatalogEntry entry = rom_catalog[index];
+                        const bool selected = RomPathKey(entry.path) == selected_key;
+                        const std::string label = entry.label + "##rom-catalog-" +
+                                                  std::to_string(index);
+                        if (ImGui::Selectable(label.c_str(), selected)) {
+                            if (SelectCatalogRom(entry, selected_rom, rom_catalog,
+                                                 rom_status)) {
+                                rom_ready = true;
+                            }
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%s", PathUtf8(entry.path).c_str());
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            ImGui::EndDisabled();
             ImGui::EndGroup();
             ImGui::PopTextWrapPos();
             ImGui::EndChild();
@@ -3936,6 +10997,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
             }
             ImGui::PopStyleColor(2);
             ImGui::EndDisabled();
+            ImGui::Dummy({0.0F, 22.0F});
+            DrawSupportSummary(right_inner_width);
         } else if (page == 1) {
             DrawPageHeading("GRAPHICS");
             ImGui::TextDisabled("Tune the view and presentation for your machine.");
@@ -3957,17 +11020,9 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
             ImGui::Dummy({0.0F, 12.0F});
             DrawSaveManager(false);
         } else if (page == kPageOnlineMp) {
-            DrawComingSoonPage(
-                "ONLINE MP", "launcher-online-mp-coming-soon",
-                "Online multiplayer will let racers meet beyond the shores of DKR-R.",
-                "Taj is still tuning the network karts and testing every shortcut.",
-                right_inner_width);
+            DrawOnlinePage(right_inner_width, true, rom_ready);
         } else if (page == kPageModsHacks) {
-            DrawComingSoonPage(
-                "MODS / HACKS", "launcher-mods-hacks-coming-soon",
-                "A dedicated garage for community mods and game hacks is planned for DKR-R.",
-                "T.T. is still checking every part before the mod garage opens.",
-                right_inner_width);
+            DrawModsHacks(right_inner_width);
         } else {
             DrawAboutDkrR(right_inner_width);
         }
@@ -3977,7 +11032,7 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
         ImGui::PopItemWidth();
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
-        DrawRomBrowser(selected_rom, rom_status, rom_ready);
+        DrawRomBrowser(selected_rom, rom_status, rom_ready, rom_catalog);
         if (request_restart_popup) {
             ImGui::OpenPopup("Restart DKR-R?");
         }
@@ -4014,18 +11069,107 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(SDL_Window*
             ImGui::EndPopup();
         }
         ImGui::End();
+        DrawTexturePackImportModal();
+        DrawTextEntryKeyboard();
+        DrawOnlineNotification();
+        DrawOnlineStartCountdown();
+        DrawOnlineWaitingNotification(
+            dkr::runtime::netplay::session().view());
+        const bool show_online_error = UpdateOnlineErrorNotification();
+        DrawOnlineFailureModal();
+        if (show_online_error) {
+            DrawOnlineErrorNotification();
+        }
 
         ImGui::Render();
+        const auto launcher_ui_build_finished =
+            std::chrono::steady_clock::now();
+        ImDrawData* launcher_draw_data = ImGui::GetDrawData();
+        if (launcher_draw_data != nullptr) {
+            launcher_total_vertices += static_cast<std::uint64_t>(
+                std::max(launcher_draw_data->TotalVtxCount, 0));
+            launcher_total_indices += static_cast<std::uint64_t>(
+                std::max(launcher_draw_data->TotalIdxCount, 0));
+            launcher_peak_vertices = std::max(
+                launcher_peak_vertices,
+                static_cast<std::uint64_t>(
+                    std::max(launcher_draw_data->TotalVtxCount, 0)));
+        }
+        launcher_ui_build_microseconds +=
+            static_cast<std::uint64_t>(std::chrono::duration_cast<
+                std::chrono::microseconds>(launcher_ui_build_finished -
+                                           launcher_ui_build_started).count());
+        const auto launcher_present_started = launcher_ui_build_finished;
         SDL_SetRenderDrawColor(renderer, 6, 9, 14, 255);
         SDL_RenderClear(renderer);
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplSDLRenderer2_RenderDrawData(launcher_draw_data);
         SDL_RenderPresent(renderer);
+        const auto launcher_present_finished =
+            std::chrono::steady_clock::now();
+        launcher_present_microseconds +=
+            static_cast<std::uint64_t>(std::chrono::duration_cast<
+                std::chrono::microseconds>(launcher_present_finished -
+                                           launcher_present_started).count());
+        ++launcher_rendered_frames;
+        if (ImGui::IsAnyItemActive()) {
+            launcher_last_activity = launcher_present_finished;
+        }
+        if (launcher_window_focused) {
+            // Present may already block on vsync. The deadline is an explicit
+            // ceiling for backends/compositors that return immediately.
+            const auto launcher_frame_deadline =
+                launcher_frame_started + launcher_frame_interval;
+            if (launcher_present_finished < launcher_frame_deadline) {
+                std::this_thread::sleep_until(launcher_frame_deadline);
+            }
+        }
     }
 
+    g_launcher_animation_seconds = -1.0;
+
+    if (launcher_background.texture != nullptr) {
+        SDL_DestroyTexture(launcher_background.texture);
+    }
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
     SDL_DestroyRenderer(renderer);
+    const auto launcher_elapsed_microseconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - launcher_animation_epoch)
+            .count();
+    const double launcher_average_vertices = launcher_rendered_frames > 0U
+        ? static_cast<double>(launcher_total_vertices) /
+              static_cast<double>(launcher_rendered_frames)
+        : 0.0;
+    const double launcher_average_indices = launcher_rendered_frames > 0U
+        ? static_cast<double>(launcher_total_indices) /
+              static_cast<double>(launcher_rendered_frames)
+        : 0.0;
+    const double launcher_average_build_ms = launcher_rendered_frames > 0U
+        ? static_cast<double>(launcher_ui_build_microseconds) /
+              static_cast<double>(launcher_rendered_frames) / 1000.0
+        : 0.0;
+    const double launcher_average_present_ms = launcher_rendered_frames > 0U
+        ? static_cast<double>(launcher_present_microseconds) /
+              static_cast<double>(launcher_rendered_frames) / 1000.0
+        : 0.0;
+    std::fprintf(stderr,
+                 "[perf][launcher] elapsed=%.2fs frames=%llu interactive=%llu "
+                 "quiet=%llu unfocused=%llu hidden-wakes=%llu "
+                 "avg-vertices=%.0f avg-indices=%.0f peak-vertices=%llu "
+                 "avg-build=%.3fms avg-present=%.3fms\n",
+                 static_cast<double>(launcher_elapsed_microseconds) /
+                     1000000.0,
+                 static_cast<unsigned long long>(launcher_rendered_frames),
+                 static_cast<unsigned long long>(launcher_interactive_frames),
+                 static_cast<unsigned long long>(launcher_quiet_frames),
+                 static_cast<unsigned long long>(launcher_unfocused_frames),
+                 static_cast<unsigned long long>(launcher_hidden_wakes),
+                 launcher_average_vertices,
+                 launcher_average_indices,
+                 static_cast<unsigned long long>(launcher_peak_vertices),
+                 launcher_average_build_ms, launcher_average_present_ms);
     std::fprintf(stderr,
                  "[boot][launcher] handoff complete window-flags=0x%08X\n",
                  static_cast<unsigned>(SDL_GetWindowFlags(window)));
@@ -4065,6 +11209,7 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
     if (application.presentQueue == nullptr || application.framebufferGraphicsWorker == nullptr) {
         return;
     }
+    PumpFriendPresence();
     const bool show_overlay =
         g_overlay_visible.load(std::memory_order_acquire);
     const bool show_fps = g_fps_overlay_enabled &&
@@ -4073,7 +11218,24 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
         dkr::runtime::enhancements::modern_presentation_enabled() &&
         g_crt_filter_index >= 0 &&
         g_crt_filter_index < static_cast<int>(g_crt_filters.size());
-    if (!show_overlay && !show_fps && !show_crt) {
+    const bool show_online_error = UpdateOnlineErrorNotification();
+    const bool show_online_failure_modal =
+        g_online_failure_modal_requested || g_online_failure_modal_active;
+    const bool show_online_notification = OnlineNotificationActive();
+    const bool show_network = g_network_overlay_enabled &&
+        dkr::runtime::netplay::session().active();
+    const bool show_controller_input = g_controller_input_overlay_enabled &&
+        dkr::runtime::netplay::session().active();
+    const auto online_session_view = dkr::runtime::netplay::session().view();
+    const bool show_online_countdown =
+        online_session_view.launch_countdown_active &&
+        online_session_view.launch_countdown_remaining_ms > 0U;
+    const bool show_online_waiting = OnlineWaitingActive(online_session_view);
+    if (!show_overlay && !show_fps && !show_crt && !show_online_error &&
+        !show_online_failure_modal &&
+        !show_online_notification &&
+        !show_network && !show_controller_input && !show_online_countdown &&
+        !show_online_waiting) {
         if (application.presentQueue->inspector != nullptr) {
             detach(application);
         }
@@ -4093,6 +11255,13 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
     }
     RT64::Inspector* inspector = application.presentQueue->inspector.get();
     inspector->newFrame(application.framebufferGraphicsWorker.get());
+    if (auto* hud_window = static_cast<SDL_Window*>(dkr::runtime::platform::sdl_window())) {
+        int hud_viewport_width = 0;
+        int hud_viewport_height = 0;
+        SDL_GetWindowSize(hud_window, &hud_viewport_width, &hud_viewport_height);
+        dkr::runtime::hud::set_viewport_extent(hud_viewport_width,
+                                               hud_viewport_height);
+    }
     ApplyStyle();
     ImGui::GetIO().ConfigFlags |=
         ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
@@ -4109,6 +11278,17 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
     BeginMainWindow("DKR-R Overlay", ImGuiWindowFlags_NoBackground);
         bool request_quit_popup = false;
         bool request_restart_popup = false;
+        constexpr int overlay_sidebar_count = kMenuPageCount + 2;
+        int sidebar_selection = std::clamp(
+            g_overlay_sidebar_selection.load(std::memory_order_acquire), 0,
+            overlay_sidebar_count - 1);
+        const int sidebar_action =
+            g_overlay_sidebar_action.exchange(0, std::memory_order_acq_rel);
+        if (sidebar_action == 1) {
+            request_restart_popup = true;
+        } else if (sidebar_action == 2) {
+            request_quit_popup = true;
+        }
         const bool focus_selected_page =
             g_overlay_focus_requested.exchange(false, std::memory_order_acq_rel);
         const float overlay_margin = std::clamp(ImGui::GetWindowWidth() * 0.025F, 12.0F, 38.0F);
@@ -4123,48 +11303,72 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
         ImGui::SetCursorPos({overlay_margin, overlay_margin});
         ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.025F, 0.09F, 0.13F, 0.84F});
         ImGui::PushStyleColor(ImGuiCol_Border, kWarm);
+        const SidebarLayout sidebar_layout = CalculateSidebarLayout(
+            overlay_height, sidebar_width);
         ImGui::BeginChild("overlay-nav", {sidebar_width, overlay_height}, true,
-                          ImGuiWindowFlags_NavFlattened);
-        const float nav_padding = sidebar_width < 220.0F ? 16.0F : 24.0F;
+                          ImGuiWindowFlags_NavFlattened |
+                              ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
+        const float nav_padding = sidebar_layout.padding;
         ImGui::SetCursorPos({nav_padding, nav_padding});
         const float nav_inner_width = sidebar_width - nav_padding * 2.0F;
         ImGui::PushTextWrapPos(sidebar_width - nav_padding);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ItemSpacing,
+            {ImGui::GetStyle().ItemSpacing.x, sidebar_layout.item_spacing_y});
         ImGui::BeginGroup();
-        BrandBlock(nav_inner_width, overlay_height < 800.0F ? 150.0F : 190.0F);
-        ImGui::Dummy({0.0F, 18.0F});
-        if (focus_selected_page && g_overlay_page == 0) ImGui::SetKeyboardFocusHere();
-        SidebarButton("PLAY", 0, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 1) ImGui::SetKeyboardFocusHere();
-        SidebarButton("GRAPHICS", 1, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 2) ImGui::SetKeyboardFocusHere();
-        SidebarButton("SOUND", 2, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 3) ImGui::SetKeyboardFocusHere();
-        SidebarButton("CONTROLS", 3, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 4) ImGui::SetKeyboardFocusHere();
-        SidebarButton("SAVE MANAGER", 4, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 5) ImGui::SetKeyboardFocusHere();
-        SidebarButton("ONLINE MP", 5, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 6) ImGui::SetKeyboardFocusHere();
-        SidebarButton("MODS / HACKS", 6, nav_inner_width);
-        if (focus_selected_page && g_overlay_page == 7) ImGui::SetKeyboardFocusHere();
-        SidebarButton("ABOUT DKR-R", 7, nav_inner_width);
-        ImGui::Dummy({0.0F, 16.0F});
-        DrawSidebarNote(nav_inner_width);
-        ImGui::Dummy({0.0F, 16.0F});
-        ImGui::PushStyleColor(ImGuiCol_Button, {0.92F, 0.43F, 0.06F, 1.0F});
-        if (ImGui::Button("RESTART DKR-R", {nav_inner_width, 44.0F})) {
+        BrandBlock(nav_inner_width, sidebar_layout.logo_size);
+        ImGui::Dummy({0.0F, sidebar_layout.brand_gap});
+        // The sidebar is a shoulder-button rail. Excluding its widgets from
+        // ImGui navigation keeps the D-pad entirely inside the content panel.
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+        SidebarButton("PLAY", 0, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("GRAPHICS", 1, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("SOUND", 2, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("CONTROLS", 3, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("SAVE MANAGER", 4, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("DKR-R ONLINE", 5, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("MODS / HACKS", 6, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        SidebarButton("ABOUT DKR-R", 7, sidebar_selection, nav_inner_width,
+                      sidebar_layout.button_height);
+        ImGui::Dummy({0.0F, sidebar_layout.action_section_gap});
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            sidebar_selection == kMenuPageCount
+                ? ImVec4{1.0F, 0.58F, 0.04F, 1.0F}
+                : ImVec4{0.92F, 0.43F, 0.06F, 1.0F});
+        if (ImGui::Button("RESTART DKR-R",
+                          {nav_inner_width, sidebar_layout.button_height})) {
+            sidebar_selection = kMenuPageCount;
+            g_overlay_sidebar_selection.store(sidebar_selection,
+                                               std::memory_order_release);
             request_restart_popup = true;
         }
         ImGui::PopStyleColor();
-        ImGui::Dummy({0.0F, 8.0F});
-        ImGui::PushStyleColor(ImGuiCol_Button, kRaceRed);
+        ImGui::Dummy({0.0F, sidebar_layout.action_gap});
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            sidebar_selection == kMenuPageCount + 1 ? kWarm : kRaceRed);
         const bool leave_island_pressed =
-            ImGui::Button("EXIT DKR-R", {nav_inner_width, 44.0F});
+            ImGui::Button("EXIT DKR-R",
+                          {nav_inner_width, sidebar_layout.button_height});
         if (leave_island_pressed) {
+            sidebar_selection = kMenuPageCount + 1;
+            g_overlay_sidebar_selection.store(sidebar_selection,
+                                               std::memory_order_release);
             request_quit_popup = true;
         }
         ImGui::PopStyleColor();
+        ImGui::PopItemFlag();
         ImGui::EndGroup();
+        ImGui::PopStyleVar();
         ImGui::PopTextWrapPos();
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
@@ -4173,12 +11377,22 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
         ImGui::PushStyleColor(ImGuiCol_Border, kAccent);
         ImGui::BeginChild("overlay-content", {content_panel_width, overlay_height}, true,
                           ImGuiWindowFlags_NavFlattened);
+        const int overlay_content_page =
+            g_overlay_page.load(std::memory_order_relaxed);
+        if (g_overlay_last_rendered_page.exchange(
+                overlay_content_page, std::memory_order_acq_rel) !=
+            overlay_content_page) {
+            ImGui::SetScrollY(0.0F);
+        }
         const float content_padding = std::clamp(content_panel_width * 0.045F, 20.0F, 44.0F);
         const float content_inner_width = content_panel_width - content_padding * 2.0F;
         ImGui::SetCursorPos({content_padding, content_padding});
         ImGui::PushItemWidth(content_inner_width);
         ImGui::PushTextWrapPos(content_padding + content_inner_width);
         ImGui::BeginGroup();
+        if (focus_selected_page) {
+            ImGui::SetKeyboardFocusHere();
+        }
         DrawOverlayContent(content_inner_width);
         ImGui::EndGroup();
         ImGui::PopTextWrapPos();
@@ -4233,7 +11447,16 @@ void dkr::runtime::ui::draw(RT64::Application& application) {
         }
     ImGui::End();
     }
+    DrawTexturePackImportModal();
+    DrawTextEntryKeyboard();
     DrawFpsOverlay(application);
+    DrawNetworkOverlay();
+    DrawControllerInputOverlay();
+    DrawOnlineStartCountdown();
+    DrawOnlineWaitingNotification(online_session_view);
+    DrawOnlineFailureModal();
+    if (show_online_error) DrawOnlineErrorNotification();
+    if (show_online_notification) DrawOnlineNotification();
     inspector->endFrame();
 }
 
@@ -4244,26 +11467,71 @@ bool dkr::runtime::ui::handle_runtime_event(SDL_Event* event) {
     if (HandleInputCaptureEvent(event)) {
         return true;
     }
+    const bool code_keyboard_visible =
+        g_online_code_keyboard_visible.load(std::memory_order_acquire);
+    if (code_keyboard_visible &&
+        ((event->type == SDL_KEYDOWN && event->key.repeat == 0 &&
+          event->key.keysym.scancode == SDL_SCANCODE_ESCAPE) ||
+         (event->type == SDL_CONTROLLERBUTTONDOWN &&
+          event->cbutton.button == SDL_CONTROLLER_BUTTON_B))) {
+        g_online_code_keyboard_cancel_requested.store(
+            true, std::memory_order_release);
+        return true;
+    }
     if (event->type == SDL_KEYDOWN && event->key.repeat == 0 &&
         event->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
         toggle_overlay();
         return true;
     }
     if (g_overlay_visible.load(std::memory_order_acquire) &&
+        !code_keyboard_visible &&
         event->type == SDL_CONTROLLERBUTTONDOWN) {
         if (event->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-            const int page = g_overlay_page.load(std::memory_order_relaxed);
-            g_overlay_page.store((page + kMenuPageCount - 1) % kMenuPageCount,
-                                 std::memory_order_relaxed);
-            g_overlay_focus_requested.store(true, std::memory_order_release);
+            constexpr int sidebar_count = kMenuPageCount + 2;
+            const int current = g_overlay_sidebar_selection.load(
+                std::memory_order_relaxed);
+            const int selected = (current + sidebar_count - 1) % sidebar_count;
+            g_overlay_sidebar_selection.store(selected,
+                                              std::memory_order_release);
+            if (selected < kMenuPageCount) {
+                g_overlay_page.store(selected, std::memory_order_relaxed);
+                g_overlay_focus_requested.store(true,
+                                                std::memory_order_release);
+            }
             return true;
         }
         if (event->cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-            const int page = g_overlay_page.load(std::memory_order_relaxed);
-            g_overlay_page.store((page + 1) % kMenuPageCount,
-                                 std::memory_order_relaxed);
-            g_overlay_focus_requested.store(true, std::memory_order_release);
+            constexpr int sidebar_count = kMenuPageCount + 2;
+            const int current = g_overlay_sidebar_selection.load(
+                std::memory_order_relaxed);
+            const int selected = (current + 1) % sidebar_count;
+            g_overlay_sidebar_selection.store(selected,
+                                              std::memory_order_release);
+            if (selected < kMenuPageCount) {
+                g_overlay_page.store(selected, std::memory_order_relaxed);
+                g_overlay_focus_requested.store(true,
+                                                std::memory_order_release);
+            }
             return true;
+        }
+        if (event->cbutton.button == SDL_CONTROLLER_BUTTON_A) {
+            const int selected = g_overlay_sidebar_selection.load(
+                std::memory_order_relaxed);
+            if (selected == kMenuPageCount) {
+                g_overlay_sidebar_action.store(1, std::memory_order_release);
+                return true;
+            }
+            if (selected == kMenuPageCount + 1) {
+                g_overlay_sidebar_action.store(2, std::memory_order_release);
+                return true;
+            }
+        }
+        if (event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP ||
+            event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN ||
+            event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_LEFT ||
+            event->cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
+            // D-pad events continue to the ImGui content panel; sidebar items
+            // carry NoNav and therefore cannot steal this focus.
         }
     }
     std::scoped_lock guard(g_inspector_guard);
@@ -4279,12 +11547,17 @@ bool dkr::runtime::ui::handle_runtime_event(SDL_Event* event) {
 }
 
 bool dkr::runtime::ui::input_capture_active() {
-    return g_capture_action != -1 && !g_capture_finished;
+    return (g_capture_action != -1 && !g_capture_finished) ||
+           dkr::runtime::platform::controller_mapping_progress().capturing ||
+           g_online_code_keyboard_visible.load(std::memory_order_acquire);
 }
 
 void dkr::runtime::ui::toggle_overlay() {
     const bool next = !g_overlay_visible.load(std::memory_order_acquire);
     g_overlay_page = 0;
+    g_overlay_last_rendered_page.store(-1, std::memory_order_release);
+    g_overlay_sidebar_selection.store(0, std::memory_order_release);
+    g_overlay_sidebar_action.store(0, std::memory_order_release);
     g_overlay_visible.store(next, std::memory_order_release);
     g_overlay_focus_requested.store(next, std::memory_order_release);
 }

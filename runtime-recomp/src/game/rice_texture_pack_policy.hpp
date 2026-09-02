@@ -11,6 +11,13 @@
 
 namespace dkr::runtime::rice_texture {
 
+// Rice packs were authored against legacy Project64/GlideN64 coordinates.
+// RT64's v3 half-texel replacement shift moves those assets into the adjacent
+// tile at the right and bottom edges, most visibly on DKR's sliced title art.
+inline constexpr std::string_view kLegacyCoordinateShift = "none";
+inline constexpr std::string_view kLegacyCoordinatePolicy =
+    "legacy-rice-no-shift";
+
 enum class Variant {
     All,
     Rgb,

@@ -1,4 +1,5 @@
 #include "runtime_telemetry.hpp"
+#include "runtime_netplay.hpp"
 
 #include "recomp.h"
 
@@ -123,5 +124,6 @@ dkr::runtime::telemetry::Metrics dkr::runtime::telemetry::metrics() {
 }
 
 extern "C" void dkr_telemetry_simulation_tick(std::uint8_t*, recomp_context*) {
+    if (!dkr::runtime::netplay::external_side_effects_allowed()) return;
     dkr::runtime::telemetry::record_simulation_tick();
 }

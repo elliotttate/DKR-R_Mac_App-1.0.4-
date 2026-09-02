@@ -2,12 +2,19 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "dkr_save_codec.hpp"
 
 namespace dkr::runtime::saves {
+
+enum class OnlineSaveSeedMode : std::uint8_t {
+    CopySinglePlayer,
+    Fresh,
+    ContinuePreviousSession,
+};
 
 struct SaveInfo {
     std::filesystem::path path;
@@ -28,6 +35,26 @@ bool import_adventure(const std::filesystem::path& source, std::string& error);
 bool reset_adventure(std::string& error);
 bool load_adventure(codec::SaveImage& image, std::string& error);
 bool commit_adventure(const codec::SaveImage& image, std::string& error);
+bool repair_adventure_checksums(bool& changed,
+                                std::filesystem::path& original_backup,
+                                std::string& error);
+bool canonical_adventure_bytes(std::vector<std::uint8_t>& bytes,
+                               std::string& error);
+SaveInfo previous_online_adventure_info();
+bool prepare_host_online_adventure(
+    OnlineSaveSeedMode mode, std::vector<std::uint8_t>& bytes,
+    std::string& error);
+bool install_synchronized_online_adventure(
+    std::uint64_t match_id,
+    std::span<const std::uint8_t> bytes,
+    std::filesystem::path& installed_path,
+    std::string& error);
+bool read_online_adventure(bool host, std::uint64_t match_id,
+                           std::vector<std::uint8_t>& bytes,
+                           std::filesystem::path& path,
+                           std::string& error);
+std::filesystem::path online_adventure_subfolder(bool host,
+                                                  std::uint64_t match_id);
 
 SaveInfo controller_pak_info(int channel);
 std::vector<std::filesystem::path> controller_pak_backups(int channel);

@@ -3,10 +3,16 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 build_dir="${DKR_LINUX_BUILD_DIR:-${project_root}/build/dkr-runtime-linux}"
+revision_80_generated="${DKR_LINUX_V80_GENERATED_SOURCE:-}"
+generated_source="${DKR_LINUX_GENERATED_SOURCE:-${project_root}/runtime-recomp/RecompiledFuncs}"
 version="${DKR_RELEASE_VERSION:-$(tr -d '\r\n' < "${project_root}/VERSION")}"
 
-[[ -d "${project_root}/runtime-recomp/RecompiledFuncs" ]] || {
-  echo 'Generated DKR functions are missing. Prepare them on Windows with Build-DKR-Runtime.cmd first.' >&2
+[[ -d "${generated_source}" ]] || {
+  echo "US v1.0/v77 Patch Pipeline output is missing: ${generated_source}" >&2
+  exit 1
+}
+[[ -n "${revision_80_generated}" && -d "${revision_80_generated}" ]] || {
+  echo 'Set DKR_LINUX_V80_GENERATED_SOURCE to the US Rev A/v1.1 Patch Pipeline output.' >&2
   exit 1
 }
 [[ -d "${project_root}/extern/n64-modern-runtime" ]] || {
@@ -23,7 +29,10 @@ cmake -S "${project_root}/runtime-recomp" -B "${build_dir}" -G Ninja \
   -DDKRPORT_ROOT="${project_root}" \
   -DDKR_RELEASE_VERSION="${version}" \
   -DDKR_RUNTIME_BUILD_GENERATED=ON \
-  -DDKR_RUNTIME_BUILD_RT64=ON
+  -DDKR_RUNTIME_BUILD_RT64=ON \
+  -DDKR_RUNTIME_BUILD_SDL3_INPUT_HOST=ON \
+  -DDKR_GENERATED_SOURCE_V77="${generated_source}" \
+  -DDKR_GENERATED_SOURCE_V80="${revision_80_generated}"
 cmake --build "${build_dir}" --parallel
 ctest --test-dir "${build_dir}" --output-on-failure -R '^DKR'
 

@@ -4,7 +4,9 @@ param(
     [string]$Configuration = 'Release',
     [switch]$Clean,
     [switch]$SkipTests,
-    [switch]$Package
+    [switch]$Package,
+    [string]$GeneratedSource = '',
+    [string]$Revision80GeneratedSource = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +14,18 @@ Set-StrictMode -Version Latest
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $buildDirectory = Join-Path $projectRoot 'build\dkr-runtime-rt64'
+$generatedSource = if ([string]::IsNullOrWhiteSpace($GeneratedSource)) {
+    Join-Path $projectRoot 'runtime-recomp\RecompiledFuncs'
+} else {
+    [IO.Path]::GetFullPath($GeneratedSource)
+}
+$revision80Generated = if (-not [string]::IsNullOrWhiteSpace($Revision80GeneratedSource)) {
+    [IO.Path]::GetFullPath($Revision80GeneratedSource)
+} elseif (-not [string]::IsNullOrWhiteSpace($env:DKR_WINDOWS_V80_GENERATED_SOURCE)) {
+    [IO.Path]::GetFullPath($env:DKR_WINDOWS_V80_GENERATED_SOURCE)
+} else {
+    throw 'Set -Revision80GeneratedSource or DKR_WINDOWS_V80_GENERATED_SOURCE to the US Rev A/v1.1 Patch Pipeline output.'
+}
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim()
 $cmakeCandidates = @(
     (Join-Path ${env:ProgramFiles} 'Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'),
@@ -33,7 +47,6 @@ if (-not (Test-Path -LiteralPath $ctest -PathType Leaf)) {
 }
 
 foreach ($required in @(
-    'runtime-recomp\RecompiledFuncs',
     'runtime-recomp\RecompiledRSP',
     'extern\n64-modern-runtime',
     'extern\rt64'
@@ -41,6 +54,12 @@ foreach ($required in @(
     if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $required))) {
         throw "Required runtime input is missing: $required. Run Build-DKR-Runtime.cmd first."
     }
+}
+if (-not (Test-Path -LiteralPath $generatedSource -PathType Container)) {
+    throw "US v1.0/v77 Patch Pipeline output is missing: $generatedSource"
+}
+if (-not (Test-Path -LiteralPath $revision80Generated -PathType Container)) {
+    throw "US Rev A/v1.1 Patch Pipeline output is missing: $revision80Generated"
 }
 
 if ($Clean -and (Test-Path -LiteralPath $buildDirectory)) {
@@ -59,7 +78,10 @@ Write-Host "Configuring DKR-R $version ($Configuration)..." -ForegroundColor Cya
     "-DDKRPORT_ROOT=$projectRoot" `
     "-DDKR_RELEASE_VERSION=$version" `
     -DDKR_RUNTIME_BUILD_GENERATED=ON `
-    -DDKR_RUNTIME_BUILD_RT64=ON
+    -DDKR_RUNTIME_BUILD_RT64=ON `
+    -DDKR_RUNTIME_BUILD_SDL3_INPUT_HOST=ON `
+    "-DDKR_GENERATED_SOURCE_V77=$generatedSource" `
+    "-DDKR_GENERATED_SOURCE_V80=$revision80Generated"
 if ($LASTEXITCODE -ne 0) { throw 'DKR-R CMake configuration failed.' }
 
 & $cmake --build $buildDirectory --config $Configuration --parallel
@@ -98,7 +120,7 @@ try {
 if ($Package) {
     & (Join-Path $PSScriptRoot 'Package-Windows.ps1') `
         -Version $version -Configuration $Configuration `
-        -BuildDirectory 'build\dkr-runtime-rt64'
+        -BuildDirectory $buildDirectory
     if ($LASTEXITCODE -ne 0) { throw 'Windows release packaging failed.' }
 }
 

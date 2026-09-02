@@ -1,0 +1,78 @@
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index 08f926f..62fdff1 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -63,6 +63,8 @@ namespace ultramodern {
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
++        void prepare_input_read();
++        void complete_input_read();
+         void notify_frame_boundary(uint8_t* rdram, recomp_context* context);
+     }
+ }
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index 8fda5af..026c5ab 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -34,6 +34,20 @@ static void update_poll_time() {
+     input_poll_time = std::chrono::high_resolution_clock::now();
+ }
+ 
++void ultramodern::input::prepare_input_read() {
++    const bool physical_poll_allowed =
++        input_callbacks.physical_poll_allowed == nullptr ||
++        input_callbacks.physical_poll_allowed();
++    if (physical_poll_allowed && input_callbacks.poll_input != nullptr) {
++        input_callbacks.poll_input();
++    }
++    update_poll_time();
++}
++
++void ultramodern::input::complete_input_read() {
++    ultramodern::send_si_message();
++}
++
+ void ultramodern::measure_input_latency() {
+ #if 0
+     printf("Delta: %ld micros\n", std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - input_poll_time));
+@@ -122,15 +136,8 @@ extern "C" s32 osContStartQuery(RDRAM_ARG PTR(OSMesgQueue) mq) {
+ }
+ 
+ extern "C" s32 osContStartReadData(RDRAM_ARG PTR(OSMesgQueue) mq) {
+-    const bool physical_poll_allowed =
+-        input_callbacks.physical_poll_allowed == nullptr ||
+-        input_callbacks.physical_poll_allowed();
+-    if (physical_poll_allowed && input_callbacks.poll_input != nullptr) {
+-        input_callbacks.poll_input();
+-    }
+-    update_poll_time();
+-
+-    ultramodern::send_si_message();
++    ultramodern::input::prepare_input_read();
++    ultramodern::input::complete_input_read();
+ 
+     return 0;
+ }
+diff --git a/librecomp/src/cont.cpp b/librecomp/src/cont.cpp
+index 12d5342..565ca1c 100644
+--- a/librecomp/src/cont.cpp
++++ b/librecomp/src/cont.cpp
+@@ -37,11 +37,14 @@ extern "C" void osContReset_recomp(uint8_t* rdram, recomp_context* ctx) {
+ extern "C" void osContStartReadData_recomp(uint8_t* rdram, recomp_context* ctx) {
+     PTR(OSMesgQueue) mq = _arg<0, PTR(OSMesgQueue)>(rdram, ctx);
+ 
+-    s32 ret = osContStartReadData(PASS_RDRAM mq);
+-
++    // Install the synchronized authored input before posting the SI completion
++    // edge. Otherwise the emulated consumer can wake and read the neutral
++    // online ports before the frame-boundary callback has filled them.
++    ultramodern::input::prepare_input_read();
+     ultramodern::input::notify_frame_boundary(rdram, ctx);
++    ultramodern::input::complete_input_read();
+ 
+-    _return<s32>(ctx, ret);
++    _return<s32>(ctx, 0);
+ }
+ 
+ extern "C" void osContGetReadData_recomp(uint8_t* rdram, recomp_context* ctx) {

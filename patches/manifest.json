@@ -57,6 +57,58 @@
         {
           "path": "patches/n64-modern-runtime/0013-use-reliable-external-message-fifo.patch",
           "sha256": "61712c2e214a2604b5460bcfa3c9a6dc1735859a53fd0f0e9e9f0b138a12cc08"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0014-expose-authored-input-frame-boundary.patch",
+          "sha256": "6649f610b5f5e165e31dd3f4635681466ccf6e86465647688c725d763e3bd603"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0015-place-authored-boundary-after-physical-poll.patch",
+          "sha256": "d7e291d27e98a894265ffea82f721cd20a98cdbfbb8a1daae6c62882ad39808f"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0016-notify-authored-thread-retirement.patch",
+          "sha256": "6bcc69b673198647d08df0965e9a35aeee830304fbf83793540afe53a6850f9e"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0017-use-canonical-recomp-context-definition.patch",
+          "sha256": "7d8a46a4d6efbf71f51a74991a57c4aa9680d59285d441a3ac600ad66849e7f9"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0018-forward-declare-named-recomp-context.patch",
+          "sha256": "4b60cb0c81e6ba002b5ce0219a9f0d2c57ee170f7dcac3e9daa616243e65aad0"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0019-suppress-rollback-replay-presentation.patch",
+          "sha256": "17c4e0c6b7692af5fc22877f837c5e8cf17e6cd69129a6b1e9472a0952f42d4f"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0020-suppress-rollback-replay-save-writes.patch",
+          "sha256": "9f57dfb4bd649fa6fc452a56410a77568b5ce2ed27d72fb58270a37be911d290"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0021-isolate-rollback-replay-external-work.patch",
+          "sha256": "9ca2cdd9256b84cdf78dadfe3129652d54050ae57ef1c240c9db77748a47fdb2"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0022-suppress-rollback-replay-audio-and-rumble.patch",
+          "sha256": "a772a428ed23dc832d84816d984f14fe979ecda41a9e7812125e02695039d2ac"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0023-install-synchronized-input-before-si-ready.patch",
+          "sha256": "1037204e680a39ff6e8361980335d6a493f3bb84a4424ece75a069d0fe601f34"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0024-queue-suppressed-gfx-completion.patch",
+          "sha256": "b99fb87d820769880fbc1c87091ac72ee3eed4a8ab41bf4925846f696d1134c5"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0025-support-reusable-runtime-sessions.patch",
+          "sha256": "3707fe84f0e245169d8b0820e30d950d7be480ad7ce6b384f2567948b61429fa"
+        },
+        {
+          "path": "patches/n64-modern-runtime/0026-client-authored-vi-catch-up-pacing.patch",
+          "sha256": "40f4dc029a6a0db8719eb8f8f7a723d4158d6402d5e54fc48c6ee31e61b9765e"
         }
       ]
     },
@@ -68,6 +120,10 @@
         {
           "path": "patches/n64recomp/0001-fix-high-vram-entrypoint-comparison.patch",
           "sha256": "a3a60874019e1118453cfe9030b071ac22eb1fea41ea7b81b4a8d50e56bd3967"
+        },
+        {
+          "path": "patches/n64recomp/0002-name-recomp-context-struct.patch",
+          "sha256": "6cf31eebf6a5f0a9a31c2912f562f8ef977c0a43dfffd76531f3ceb94ae2bee7"
         }
       ]
     },
@@ -119,8 +175,51 @@
         {
           "path": "patches/rt64/0012-cache-rice-replacement-decisions.patch",
           "sha256": "edefb089502f69e8eb1cd99e47307dcb307c973c22ab2838da7acf380f1bb53e"
+        },
+        {
+          "path": "patches/rt64/0013-count-completed-swapchain-presentations.patch",
+          "sha256": "c86a936a477ae6846f47382baff66204c6c240a17307bb3a218f541df940772d"
+        },
+        {
+          "path": "patches/rt64/0014-inset-full-tile-texrect-sampling.patch",
+          "sha256": "a19b0e286482980724c4375433f8d0da41e45306d78bd24bf0553f42c2472bb2"
         }
       ]
+    },
+    {
+      "name": "GekkoNet",
+      "repositoryPath": "extern/gekkonet",
+      "expectedCommit": "5924b5c7abb5b1156c3c5609c9c36e9bede58c1c",
+      "patches": []
+    },
+    {
+      "name": "Monocypher",
+      "repositoryPath": "extern/monocypher",
+      "expectedCommit": "0d85f98c9d9b0227e42cf795cb527dff372b40a4",
+      "patches": []
+    },
+    {
+      "name": "libdatachannel",
+      "repositoryPath": "extern/libdatachannel",
+      "expectedCommit": "c6696d157b5612df2a741d9a03b192b47ab6cefb",
+      "patches": [
+        {
+          "path": "patches/libdatachannel/0001-verify-explicit-windows-websocket-ca.patch",
+          "sha256": "4e1ebb9d0fa5440ee0513a00d4e8e6975f0b5be0405441f1e769e91e1e9fb398"
+        }
+      ]
+    },
+    {
+      "name": "MbedTLS",
+      "repositoryPath": "extern/mbedtls",
+      "expectedCommit": "c765c831e5c2a0971410692f92f7a81d6ec65ec2",
+      "patches": []
+    },
+    {
+      "name": "SDL3",
+      "repositoryPath": "extern/sdl3",
+      "expectedCommit": "147a8ee32dbf9ac02f3794964490687b6bbda1bc",
+      "patches": []
     }
   ]
 }

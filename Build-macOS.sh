@@ -14,8 +14,9 @@ for tool in cmake ninja ditto codesign; do
   }
 done
 
-[[ -d "${project_root}/runtime-recomp/RecompiledFuncs" ]] || {
-  echo 'Generated DKR functions are missing. Prepare them through the Patch Pipeline first.' >&2
+generated_source="${DKR_MAC_GENERATED_SOURCE:-${project_root}/runtime-recomp/RecompiledFuncs}"
+[[ -d "${generated_source}" ]] || {
+  echo "US v1.0/v77 Patch Pipeline output is missing: ${generated_source}" >&2
   exit 1
 }
 [[ -d "${project_root}/extern/n64-modern-runtime" ]] || {
@@ -32,6 +33,7 @@ host_arch="$(uname -m)"
 architectures="${DKR_MAC_ARCHITECTURES:-${host_arch}}"
 archive_arch="$(printf '%s' "${architectures}" | tr ';' '-')"
 build_dir="${DKR_MAC_BUILD_DIR:-${project_root}/build/dkr-runtime-macos}"
+revision_80_generated="${DKR_MAC_V80_GENERATED_SOURCE:-}"
 dist_dir="${project_root}/dist"
 stage="${dist_dir}/DKR-R-${version}-macOS-${archive_arch}"
 output="${stage}.zip"
@@ -44,6 +46,10 @@ output="${stage}.zip"
   echo "Release archive already exists: ${output}" >&2
   exit 1
 }
+[[ -n "${revision_80_generated}" && -d "${revision_80_generated}" ]] || {
+  echo 'Set DKR_MAC_V80_GENERATED_SOURCE to Patch Pipeline output generated from the matching US Rev A/v1.1 ELF.' >&2
+  exit 1
+}
 
 cmake -S "${project_root}/runtime-recomp" -B "${build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -52,7 +58,9 @@ cmake -S "${project_root}/runtime-recomp" -B "${build_dir}" -G Ninja \
   -DDKRPORT_ROOT="${project_root}" \
   -DDKR_RELEASE_VERSION="${version}" \
   -DDKR_RUNTIME_BUILD_GENERATED=ON \
-  -DDKR_RUNTIME_BUILD_RT64=ON
+  -DDKR_RUNTIME_BUILD_RT64=ON \
+  -DDKR_GENERATED_SOURCE_V77="${generated_source}" \
+  -DDKR_GENERATED_SOURCE_V80="${revision_80_generated}"
 cmake --build "${build_dir}" --parallel "$(sysctl -n hw.logicalcpu)"
 ctest --test-dir "${build_dir}" --output-on-failure -R '^DKR'
 
@@ -74,8 +82,8 @@ trap cleanup EXIT
 mkdir -p "${stage}"
 ditto "${built_app}" "${stage}/DKR-R.app"
 mkdir -p "${stage}/DKR-R.app/Contents/Resources/ThirdPartyLicenses"
-install -m 0644 "${project_root}/assets/ui/Icons/DKR-R8.bmp" \
-  "${stage}/DKR-R.app/Contents/MacOS/assets/ui/Icons/DKR-R8.bmp"
+install -m 0644 "${project_root}/assets/ui/Icons/DKR-R-Logo.bmp" \
+  "${stage}/DKR-R.app/Contents/MacOS/assets/ui/Icons/DKR-R-Logo.bmp"
 install -m 0644 "${project_root}/packaging/RELEASE-README.md" "${stage}/README.md"
 install -m 0644 "${project_root}/LICENSE.md" "${stage}/LICENSE.md"
 install -m 0644 "${project_root}/THIRD_PARTY.md" "${stage}/THIRD_PARTY.md"
@@ -94,18 +102,22 @@ install -m 0644 "${project_root}/packaging/licenses/Jumpman-LICENSE.txt" \
   "${notices}/Jumpman-LICENSE.txt"
 install -m 0644 "${project_root}/packaging/licenses/CRT-FILTERS-NOTICE.md" \
   "${notices}/CRT-FILTERS-NOTICE.md"
+install -m 0644 "${project_root}/packaging/licenses/GEKKONET-LICENSE.txt" \
+  "${notices}/GEKKONET-LICENSE.txt"
+install -m 0644 "${project_root}/packaging/licenses/MONOCYPHER-LICENSE.txt" \
+  "${notices}/MONOCYPHER-LICENSE.txt"
 
 # Generate a native icon from the approved DKR-R artwork when the standard
 # macOS image utilities are available. The app remains valid without it.
 if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 && \
-   [[ -f "${project_root}/assets/ui/Icons/DKR-R8.png" ]]; then
+   [[ -f "${project_root}/assets/ui/Icons/DKR-R-Icon.png" ]]; then
   iconset="${stage}/DKR-R.iconset"
   mkdir -p "${iconset}"
   for size in 16 32 128 256 512; do
-    sips -z "${size}" "${size}" "${project_root}/assets/ui/Icons/DKR-R8.png" \
+    sips -z "${size}" "${size}" "${project_root}/assets/ui/Icons/DKR-R-Icon.png" \
       --out "${iconset}/icon_${size}x${size}.png" >/dev/null
     doubled=$((size * 2))
-    sips -z "${doubled}" "${doubled}" "${project_root}/assets/ui/Icons/DKR-R8.png" \
+    sips -z "${doubled}" "${doubled}" "${project_root}/assets/ui/Icons/DKR-R-Icon.png" \
       --out "${iconset}/icon_${size}x${size}@2x.png" >/dev/null
   done
   iconutil -c icns "${iconset}" -o \

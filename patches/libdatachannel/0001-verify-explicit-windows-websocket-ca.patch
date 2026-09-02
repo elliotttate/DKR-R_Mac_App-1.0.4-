@@ -1,0 +1,15 @@
+diff --git a/src/impl/websocket.cpp b/src/impl/websocket.cpp
+index ac72e02..b66829c 100644
+--- a/src/impl/websocket.cpp
++++ b/src/impl/websocket.cpp
+@@ -367,8 +367,9 @@ void WebSocket::initTlsTransport() {
+ 		bool verify = mHostname.has_value() && !config.disableTlsVerification;
+ 
+ #ifdef _WIN32
+-		if (std::exchange(verify, false)) {
++		if (verify && !config.caCertificatePemFile) {
+ 			PLOG_WARNING << "TLS certificate verification with root CA is not supported on Windows";
++			verify = false;
+ 		}
+ #endif
+ 

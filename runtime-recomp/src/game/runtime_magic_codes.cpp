@@ -1,6 +1,7 @@
 #include "runtime_magic_codes.hpp"
 
 #include "magic_code_policy.hpp"
+#include "revision_addresses.hpp"
 
 #include "recomp.h"
 
@@ -19,8 +20,10 @@
 
 namespace {
 
-constexpr std::uint32_t kActiveMagicCodesAddress = 0x800DFD98U;
-constexpr std::uint32_t kUnlockedMagicCodesAddress = 0x800DFD9CU;
+const std::uint32_t& kActiveMagicCodesAddress =
+    dkr::runtime::revision_addresses::ActiveMagicCodes;
+const std::uint32_t& kUnlockedMagicCodesAddress =
+    dkr::runtime::revision_addresses::UnlockedMagicCodes;
 
 std::atomic<std::uint32_t> g_persistent_mask{0U};
 std::atomic<std::uint32_t> g_queued_one_shot_mask{0U};
@@ -31,7 +34,6 @@ std::mutex g_queue_file_guard;
 gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
 }
-
 bool ReplaceQueueFile(const std::filesystem::path& temporary,
                       const std::filesystem::path& destination) {
 #if defined(_WIN32)
@@ -211,3 +213,4 @@ extern "C" void dkr_apply_launch_magic_codes(std::uint8_t* rdram,
         RemoveConsumedQueueFile();
     }
 }
+

@@ -1,0 +1,76 @@
+diff --git a/librecomp/include/librecomp/game.hpp b/librecomp/include/librecomp/game.hpp
+index 560b00f..36c01d2 100644
+--- a/librecomp/include/librecomp/game.hpp
++++ b/librecomp/include/librecomp/game.hpp
+@@ -99,6 +99,7 @@ namespace recomp {
+         ultramodern::input::callbacks_t input_callbacks;
+         ultramodern::gfx_callbacks_t gfx_callbacks;
+         ultramodern::events::callbacks_t events_callbacks;
++        bool (*save_write_allowed_callback)() = nullptr;
+         ultramodern::error_handling::callbacks_t error_handling_callbacks;
+         ultramodern::threads::callbacks_t threads_callbacks;
+         ultramodern::MessageQueueControl message_queue_control;
+@@ -113,4 +114,5 @@ namespace recomp {
+     SaveType get_save_type();
+     bool eeprom_allowed();
++    bool save_write_allowed();
+     bool sram_allowed();
+     bool flashram_allowed();
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 7221a2b..ab095a9 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -58,7 +58,8 @@ std::filesystem::path config_path;
+ // The project's version.
+ recomp::Version project_version;
+ // The current game's save type.
+ recomp::SaveType save_type = recomp::SaveType::None;
++static bool (*save_write_allowed_callback)() = nullptr;
+ 
+ std::u8string recomp::GameEntry::stored_filename() const {
+     return game_id + u8".z64";
+@@ -721,4 +722,8 @@ bool recomp::eeprom_allowed() {
+         save_type == SaveType::AllowAll;
+ }
+ 
++bool recomp::save_write_allowed() {
++    return save_write_allowed_callback == nullptr || save_write_allowed_callback();
++}
++
+ bool recomp::sram_allowed() {
+@@ -736,6 +741,7 @@ bool recomp::flashram_allowed() {
+ 
+ void recomp::start(const recomp::Configuration& cfg) {
+     project_version = cfg.project_version;
++    save_write_allowed_callback = cfg.save_write_allowed_callback;
+     recomp::check_all_stored_roms();
+ 
+     recomp::rsp::set_callbacks(cfg.rsp_callbacks);
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index f699d18..bb5a888 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -161,6 +161,7 @@ void saving_thread_func(RDRAM_ARG1) {
+ }
+ 
+ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
++    if (!recomp::save_write_allowed()) return;
+     assert(offset + count <= save_context.save_buffer.size());
+ 
+     {
+@@ -174,6 +175,7 @@ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
+ }
+ 
+ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
++    if (!recomp::save_write_allowed()) return;
+     assert(offset + count <= save_context.save_buffer.size());
+ 
+     {
+@@ -194,6 +196,7 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+ }
+ 
+ void save_clear(uint32_t start, uint32_t size, char value) {
++    if (!recomp::save_write_allowed()) return;
+     assert(start + size < save_context.save_buffer.size());
+ 
+     {

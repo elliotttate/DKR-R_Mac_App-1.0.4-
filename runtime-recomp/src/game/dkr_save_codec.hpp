@@ -67,6 +67,21 @@ std::vector<std::uint8_t> blank_bytes();
 bool validate(std::span<const std::uint8_t> bytes,
               std::string* error = nullptr);
 
+// Rebuild only the six derived checksum regions in a 512-byte EEPROM image.
+// All gameplay, record, reserved and erased-slot bytes are preserved exactly.
+// This cannot infer whether payload data was damaged, so callers must retain
+// the original image as a safety backup before activating the result.
+bool repair_checksums(std::span<const std::uint8_t> bytes,
+                      std::vector<std::uint8_t>& repaired,
+                      std::string* error = nullptr);
+
+// Decode and re-encode a valid image into one deterministic representation.
+// In particular, a retail erased (0xFF) empty slot and DKR-R's checksummed
+// empty slot become identical for multiplayer compatibility comparisons.
+bool canonical_bytes(std::span<const std::uint8_t> bytes,
+                     std::vector<std::uint8_t>& canonical,
+                     std::string* error = nullptr);
+
 // Constrain only fields that the Save Builder owns. Opaque/reserved bits and
 // T.T. records are deliberately preserved so loading the builder never
 // destroys data it does not expose for editing.

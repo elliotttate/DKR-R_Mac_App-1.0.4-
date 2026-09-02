@@ -1,9 +1,22 @@
-# Troubleshooting DKR-R 1.0.0
+# Troubleshooting DKR-R 1.0.1
 
 ## ROM rejected
 
-Only Diddy Kong Racing US 1.0/v77 is supported. Normalized SHA-1:
-`0cb115d8716dbbc2922fda38e533b9fe63bb9670`.
+Diddy Kong Racing US v1.0/v77 and US Rev A/v1.1/v80 are supported. Normalized
+SHA-1 values are `0cb115d8716dbbc2922fda38e533b9fe63bb9670` and
+`6d96743d46f8c0cd0edb0ec5600b003c89b93755`. The file extension does not decide
+byte order.
+
+Byte-swapped and little-endian dumps are converted once into a verified local
+big-endian cache. If that cache is interrupted or damaged, close DKR-R and
+remove only the `rom-cache` directory from the active configuration folder;
+the launcher recreates it from the selected ROM on the next start.
+
+Players always start the single public DKR-R application; engine selection is
+automatic. On Windows, a damaged private Rev A cache can be repaired by closing
+DKR-R and removing only `%LOCALAPPDATA%\DKR-R\engines`. The verified engine is
+recreated from `DKR-R.exe` on the next Rev A launch. If verification still
+fails, restore the official package and compare its published SHA-256.
 
 ## Saves or settings appear missing
 
@@ -37,8 +50,18 @@ LB/RB. Mouse input remains active while the overlay is open.
 ## Gyro drift
 
 Place the controller still, calibrate, then recenter at the desired neutral
-angle. Steam Input can intercept motion sensors on SteamOS; disable conflicting
-Steam Input gyro mappings when using DKR-R's native gyro.
+angle. On Steam Deck, select SDL3 native input and leave the Steam Input gyro
+action set to None; DKR-R reads the built-in IMU directly when Steam's virtual
+gamepad does not advertise a sensor. Do not map gyro to mouse or joystick at the
+same time. DKR-R uses hardware sensor timestamps when available, so duplicate
+high-rate polls do not integrate the same gyro sample more than once.
+
+If the Controls page still reports no gyro, run the packaged private helper
+from a terminal with `--self-test`. A Deck should list either a gamepad with
+`gyro=yes` or at least one `Steam Deck physical gyro interface`. Zero physical
+interfaces means SteamOS did not expose the Deck's `28de:1205` HID interface to
+the application; update SteamOS and verify the standard Steam device permission
+rules are installed.
 
 ## Graphics API recovery
 
@@ -49,3 +72,17 @@ or choose Automatic on the next launch. Do not delete your ROM or save files.
 
 Run `Diagnose-DKR-Recompile.cmd`. Never edit generated functions or dependency
 worktrees directly.
+
+## Creating a support report
+
+Open **PLAY**, expand the support summary, then select **EXPORT SUPPORT REPORT**.
+The report records the DKR-R release, presentation and graphics settings,
+enabled texture-pack count, operating system, CPU, memory, graphics adapter and
+storage type. It deliberately excludes paths, ROM data, saves, account names,
+controller identifiers, Friend Codes and lobby codes.
+
+Diagnostic logging and crash dumps are separate opt-in switches in the same
+card. Enable them only while reproducing a problem, restart if requested, and
+use **OPEN LOGS** or **OPEN CRASH DUMPS** to reach the resulting files. Turning
+either switch off does not delete existing reports. Review any file before
+sharing it publicly.

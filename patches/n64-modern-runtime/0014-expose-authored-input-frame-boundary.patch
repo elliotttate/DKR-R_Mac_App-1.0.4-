@@ -1,0 +1,62 @@
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index b992879..73f48ab 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -4,5 +4,7 @@
+ 
+ #include <cstdint>
+ 
++struct recomp_context;
++
+ namespace ultramodern {
+     namespace input {
+@@ -25,10 +27,12 @@ namespace ultramodern {
+ 
+         struct callbacks_t {
+             using poll_input_t = void(void);
++            using frame_boundary_t = void(uint8_t* rdram, recomp_context* context);
+             using get_input_t = bool(int controller_num, uint16_t* buttons, float* x, float* y);
+             using set_rumble_t = void(int controller_num, bool rumble);
+             using get_connected_device_info_t = connected_device_info_t(int controller_num);
+ 
+             poll_input_t* poll_input;
++            frame_boundary_t* frame_boundary;
+ 
+             /**
+@@ -62,5 +66,6 @@ namespace ultramodern {
+         };
+ 
+         void set_callbacks(const callbacks_t& callbacks);
++        void notify_frame_boundary(uint8_t* rdram, recomp_context* context);
+     }
+ }
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index eab9d7b..225f386 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -20,6 +20,13 @@ void ultramodern::input::set_callbacks(const callbacks_t& callbacks) {
+     input_callbacks = callbacks;
+ }
+ 
++void ultramodern::input::notify_frame_boundary(uint8_t* rdram,
++                                                recomp_context* context) {
++    if (input_callbacks.frame_boundary != nullptr) {
++        input_callbacks.frame_boundary(rdram, context);
++    }
++}
++
+ static std::chrono::high_resolution_clock::time_point input_poll_time;
+ 
+ static void update_poll_time() {
+diff --git a/librecomp/src/cont.cpp b/librecomp/src/cont.cpp
+index 0d26c38..1bd1c3d 100644
+--- a/librecomp/src/cont.cpp
++++ b/librecomp/src/cont.cpp
+@@ -37,5 +37,7 @@ extern "C" void osContStartReadData_recomp(uint8_t* rdram, recomp_context* ctx) {
+     PTR(OSMesgQueue) mq = _arg<0, PTR(OSMesgQueue)>(rdram, ctx);
+ 
++    ultramodern::input::notify_frame_boundary(rdram, ctx);
++
+     s32 ret = osContStartReadData(PASS_RDRAM mq);
+ 
+     _return<s32>(ctx, ret);

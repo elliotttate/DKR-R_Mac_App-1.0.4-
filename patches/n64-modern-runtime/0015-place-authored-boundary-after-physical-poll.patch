@@ -1,0 +1,15 @@
+diff --git a/librecomp/src/cont.cpp b/librecomp/src/cont.cpp
+index 1bd1c3d..12d5342 100644
+--- a/librecomp/src/cont.cpp
++++ b/librecomp/src/cont.cpp
+@@ -37,8 +37,8 @@ extern "C" void osContStartReadData_recomp(uint8_t* rdram, recomp_context* ctx) {
+     PTR(OSMesgQueue) mq = _arg<0, PTR(OSMesgQueue)>(rdram, ctx);
+ 
+-    ultramodern::input::notify_frame_boundary(rdram, ctx);
+-
+     s32 ret = osContStartReadData(PASS_RDRAM mq);
++
++    ultramodern::input::notify_frame_boundary(rdram, ctx);
+ 
+     _return<s32>(ctx, ret);
+ }

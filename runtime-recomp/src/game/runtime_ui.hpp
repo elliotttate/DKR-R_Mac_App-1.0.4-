@@ -14,6 +14,7 @@ namespace dkr::runtime::ui {
 
 enum class LifecycleRequest : std::uint8_t {
     None = 0,
+    StopGame,
     Exit,
     Restart,
 };
@@ -30,7 +31,9 @@ void persist_settings();
 // successfully recovers with Automatic. Persist the recovered choice so the
 // next launch does not repeat the same failure loop.
 void persist_graphics_api_fallback();
-StartupResult run_startup_screen(SDL_Window* window);
+StartupResult run_startup_screen(
+    SDL_Window* window,
+    const std::filesystem::path& preselected_rom = {});
 
 void attach(RT64::Application& application);
 void detach(RT64::Application& application);

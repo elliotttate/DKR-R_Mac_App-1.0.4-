@@ -3,7 +3,9 @@
 #include "character_select_animation_policy.hpp"
 #include "character_select_music_policy.hpp"
 #include "modern_camera_policy.hpp"
+#include "presentation_identity.hpp"
 #include "runtime_platform.hpp"
+#include "revision_addresses.hpp"
 
 #include "recomp.h"
 
@@ -24,30 +26,51 @@ std::atomic<dkr::runtime::enhancements::PresentationProfile> g_presentation_prof
 std::atomic<int> g_fov_offset{0};
 std::atomic<int> g_view_distance_multiplier{2};
 std::atomic<bool> g_keep_hub_scenery_enabled{false};
+std::atomic<bool> g_keep_track_scenery_enabled{false};
+std::atomic<bool> g_keep_minigame_scenery_enabled{false};
+std::atomic<dkr::runtime::enhancements::SceneryRetentionMode>
+    g_scenery_retention_mode{
+        dkr::runtime::enhancements::SceneryRetentionMode::Authored};
+std::atomic<int> g_animated_scenery_distance_multiplier{1};
+std::atomic<int> g_billboard_effect_distance_multiplier{1};
+std::atomic<int> g_water_lava_detail_multiplier{1};
 std::atomic<bool> g_extended_culling_enabled{true};
 std::atomic<int> g_frustum_guard_percent{5};
 std::atomic<bool> g_fit_to_window_enabled{false};
 std::atomic<int> g_anisotropy_level{16};
+std::atomic<bool> g_multiplayer_race_music_enabled{true};
 
-constexpr std::uint32_t kBlockMusicChangeAddress = 0x800DC648U;
-constexpr std::uint32_t kMusicNextSequenceAddress = 0x800DC65CU;
-constexpr std::uint32_t kDynamicMusicChannelMaskAddress = 0x80115F7CU;
-constexpr std::uint32_t kMenuSelectedCharacterAddress = 0x801263B4U;
-constexpr std::uint32_t kMenuCurrentCharacterAddress = 0x801263C0U;
-constexpr std::uint32_t kMusicTempoAddress = 0x80115D30U;
+const std::uint32_t& kBlockMusicChangeAddress =
+    dkr::runtime::revision_addresses::BlockMusicChange;
+const std::uint32_t& kMusicNextSequenceAddress =
+    dkr::runtime::revision_addresses::MusicNextSequence;
+const std::uint32_t& kDynamicMusicChannelMaskAddress =
+    dkr::runtime::revision_addresses::DynamicMusicChannelMask;
+const std::uint32_t& kMenuSelectedCharacterAddress =
+    dkr::runtime::revision_addresses::MenuSelectedCharacter;
+const std::uint32_t& kMenuCurrentCharacterAddress =
+    dkr::runtime::revision_addresses::MenuCurrentCharacter;
+const std::uint32_t& kMusicTempoAddress =
+    dkr::runtime::revision_addresses::MusicTempo;
 constexpr std::uint16_t kTimeTrialGhostBehaviour = 0x003AU;
-constexpr std::uint32_t kFrustumReferenceAddress = 0x800DC8ACU;
-constexpr std::uint32_t kViewportLayoutAddress = 0x80120CE0U;
-constexpr std::uint32_t kCurrentMapIdAddress = 0x80121164U;
-constexpr std::uint32_t kCurrentLevelHeaderAddress = 0x80121168U;
+const std::uint32_t& kFrustumReferenceAddress =
+    dkr::runtime::revision_addresses::FrustumReference;
+const std::uint32_t& kViewportLayoutAddress =
+    dkr::runtime::revision_addresses::ViewportLayout;
+const std::uint32_t& kCurrentLevelHeaderAddress =
+    dkr::runtime::revision_addresses::CurrentLevelHeader;
 constexpr std::uint32_t kLevelHeaderRaceTypeOffset = 0x4CU;
-constexpr std::uint32_t kSceneActiveCameraAddress = 0x8011B0B0U;
-constexpr std::uint32_t kCameraModeOffset = 0x36U;
-constexpr std::uint32_t kWaveControllerAddress = 0x80129FC8U;
+const std::uint32_t& kSceneActiveCameraAddress =
+    dkr::runtime::revision_addresses::SceneActiveCamera;
+const std::uint32_t& kWaveControllerAddress =
+    dkr::runtime::revision_addresses::WaveController;
 constexpr std::uint32_t kWaveViewDistanceOffset = 0x24U;
-constexpr std::uint32_t kWaveSelectionMapAddress = 0x800E30D4U;
-constexpr std::uint32_t kWaveModelAddress = 0x800E30D8U;
-constexpr std::uint32_t kNumberOfLevelSegmentsAddress = 0x8012A0E0U;
+const std::uint32_t& kWaveSelectionMapAddress =
+    dkr::runtime::revision_addresses::WaveSelectionMap;
+const std::uint32_t& kWaveModelAddress =
+    dkr::runtime::revision_addresses::WaveModel;
+const std::uint32_t& kNumberOfLevelSegmentsAddress =
+    dkr::runtime::revision_addresses::NumberOfLevelSegments;
 constexpr std::uint32_t kWaveModelStride = 0x1CU;
 constexpr std::uint32_t kWaveModelSelectionOffset = 0x0CU;
 constexpr std::uint32_t kWaveModelFadeOffset = 0x14U;
@@ -58,7 +81,6 @@ constexpr std::array<std::uint32_t, 4> kSideReferenceOffsets = {
 gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
 }
-
 float ReadRdramFloat(std::uint8_t* rdram, std::uint32_t address) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(
         MEM_W(0, RdramAddress(address))));
@@ -137,6 +159,21 @@ bool dkr::runtime::enhancements::modern_presentation_enabled() {
     return presentation_profile() == PresentationProfile::Modern;
 }
 
+bool dkr::runtime::enhancements::multiplayer_race_music_requested() {
+    return g_multiplayer_race_music_enabled.load(std::memory_order_acquire);
+}
+
+bool dkr::runtime::enhancements::multiplayer_race_music_enabled() {
+    return multiplayer_race_music_effective(
+        presentation_profile(), multiplayer_race_music_requested());
+}
+
+void dkr::runtime::enhancements::set_multiplayer_race_music_enabled(
+    bool enabled) {
+    g_multiplayer_race_music_enabled.store(enabled,
+                                           std::memory_order_release);
+}
+
 int dkr::runtime::enhancements::fov_offset() {
     return g_fov_offset.load(std::memory_order_acquire);
 }
@@ -164,6 +201,77 @@ bool dkr::runtime::enhancements::keep_hub_scenery_enabled() {
 
 void dkr::runtime::enhancements::set_keep_hub_scenery_enabled(bool enabled) {
     g_keep_hub_scenery_enabled.store(enabled, std::memory_order_release);
+}
+
+bool dkr::runtime::enhancements::keep_track_scenery_requested() {
+    return g_keep_track_scenery_enabled.load(std::memory_order_acquire);
+}
+
+bool dkr::runtime::enhancements::keep_track_scenery_enabled() {
+    return modern_presentation_enabled() && keep_track_scenery_requested();
+}
+
+void dkr::runtime::enhancements::set_keep_track_scenery_enabled(bool enabled) {
+    g_keep_track_scenery_enabled.store(enabled, std::memory_order_release);
+}
+
+bool dkr::runtime::enhancements::keep_minigame_scenery_requested() {
+    return g_keep_minigame_scenery_enabled.load(std::memory_order_acquire);
+}
+
+bool dkr::runtime::enhancements::keep_minigame_scenery_enabled() {
+    return modern_presentation_enabled() && keep_minigame_scenery_requested();
+}
+
+void dkr::runtime::enhancements::set_keep_minigame_scenery_enabled(bool enabled) {
+    g_keep_minigame_scenery_enabled.store(enabled, std::memory_order_release);
+}
+
+dkr::runtime::enhancements::SceneryRetentionMode
+dkr::runtime::enhancements::scenery_retention_mode() {
+    return g_scenery_retention_mode.load(std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_scenery_retention_mode(
+    SceneryRetentionMode mode) {
+    g_scenery_retention_mode.store(
+        normalise_scenery_retention_mode(static_cast<int>(mode)),
+        std::memory_order_release);
+}
+
+int dkr::runtime::enhancements::animated_scenery_distance_multiplier() {
+    return g_animated_scenery_distance_multiplier.load(
+        std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_animated_scenery_distance_multiplier(
+    int multiplier) {
+    g_animated_scenery_distance_multiplier.store(
+        clamp_animated_scenery_multiplier(multiplier),
+        std::memory_order_release);
+}
+
+int dkr::runtime::enhancements::billboard_effect_distance_multiplier() {
+    return g_billboard_effect_distance_multiplier.load(
+        std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_billboard_effect_distance_multiplier(
+    int multiplier) {
+    g_billboard_effect_distance_multiplier.store(
+        clamp_billboard_effect_multiplier(multiplier),
+        std::memory_order_release);
+}
+
+int dkr::runtime::enhancements::water_lava_detail_multiplier() {
+    return g_water_lava_detail_multiplier.load(std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_water_lava_detail_multiplier(
+    int multiplier) {
+    g_water_lava_detail_multiplier.store(
+        clamp_water_lava_detail_multiplier(multiplier),
+        std::memory_order_release);
 }
 
 bool dkr::runtime::enhancements::extended_culling_requested() {
@@ -281,6 +389,20 @@ extern "C" void dkr_apply_maximum_racer_detail(std::uint8_t* rdram,
     }
 }
 
+extern "C" void dkr_restore_multiplayer_race_music(std::uint8_t*,
+                                                      recomp_context* context) {
+    if (context != nullptr &&
+        dkr::runtime::enhancements::multiplayer_race_music_enabled() &&
+        static_cast<std::int32_t>(context->r2) >= 2) {
+        // The following authored `slti v0, 2` chooses between muting music and
+        // calling level_music_start. Present the existing branch with the
+        // two-player value so the complete retail start/fade path is reused.
+        // No sequence player is started from native code and Accurate retains
+        // the original 3/4-player silence exactly.
+        context->r2 = 1;
+    }
+}
+
 extern "C" void dkr_apply_gameplay_fov(std::uint8_t*,
                                         recomp_context* context) {
     const int authored = static_cast<std::int32_t>(context->r12);
@@ -300,13 +422,26 @@ extern "C" void dkr_apply_gameplay_fov(std::uint8_t*,
     }
 }
 
-extern "C" void dkr_extend_object_draw_distance(std::uint8_t*,
+extern "C" void dkr_extend_object_draw_distance(std::uint8_t* rdram,
                                                   recomp_context* context) {
     const int authored = static_cast<std::int32_t>(context->r3);
+    int behaviour = -1;
+    const std::uint32_t object = static_cast<std::uint32_t>(context->r4);
+    if (object >= 0x80000000U && object <= 0x807FFFB6U) {
+        behaviour = static_cast<std::int16_t>(
+            MEM_H(0x48, RdramAddress(object)));
+    }
+    const int multiplier =
+        dkr::runtime::enhancements::object_view_distance_multiplier(
+            behaviour,
+            dkr::runtime::enhancements::view_distance_multiplier(),
+            dkr::runtime::enhancements::animated_scenery_distance_multiplier(),
+            dkr::runtime::enhancements::billboard_effect_distance_multiplier(),
+            dkr::runtime::enhancements::water_lava_detail_multiplier());
     context->r3 = static_cast<gpr>(
         dkr::runtime::enhancements::effective_view_distance(
             dkr::runtime::enhancements::presentation_profile(), authored,
-            dkr::runtime::enhancements::view_distance_multiplier()));
+            multiplier));
 }
 
 extern "C" void dkr_maximise_persistent_water_detail(
@@ -316,7 +451,7 @@ extern "C" void dkr_maximise_persistent_water_detail(
     const int effective =
         dkr::runtime::enhancements::effective_wave_view_distance(
             dkr::runtime::enhancements::presentation_profile(),
-            dkr::runtime::enhancements::keep_hub_scenery_requested(),
+            dkr::runtime::enhancements::water_lava_detail_multiplier(),
             CurrentLevelRaceType(rdram),
             authored);
     MEM_W(kWaveViewDistanceOffset, RdramAddress(kWaveControllerAddress)) =
@@ -327,7 +462,7 @@ extern "C" void dkr_anchor_persistent_water_to_camera(
     std::uint8_t* rdram, recomp_context* context) {
     if (!dkr::runtime::enhancements::persistent_water_override_enabled(
             dkr::runtime::enhancements::presentation_profile(),
-            dkr::runtime::enhancements::keep_hub_scenery_requested(),
+            dkr::runtime::enhancements::water_lava_detail_multiplier(),
             CurrentLevelRaceType(rdram))) {
         return;
     }
@@ -353,7 +488,7 @@ extern "C" void dkr_stabilise_persistent_water_transition(
     std::uint8_t* rdram, recomp_context*) {
     using namespace dkr::runtime::enhancements;
     if (!persistent_water_override_enabled(
-            presentation_profile(), keep_hub_scenery_requested(),
+            presentation_profile(), water_lava_detail_multiplier(),
             CurrentLevelRaceType(rdram))) {
         return;
     }
@@ -389,7 +524,8 @@ extern "C" void dkr_stabilise_persistent_water_transition(
         const std::uint32_t selection = static_cast<std::uint32_t>(
             MEM_W(selector_index * sizeof(std::uint32_t),
                   RdramAddress(selections)));
-        if (persistent_water_hq_fade(presentation_profile(), true,
+        if (persistent_water_hq_fade(presentation_profile(),
+                                     water_lava_detail_multiplier(),
                                      selection != 0U, 0x80) != 0) {
             continue;
         }
@@ -402,46 +538,36 @@ extern "C" void dkr_stabilise_persistent_water_transition(
 
 extern "C" void dkr_extend_hub_segment_bitfield(std::uint8_t* rdram,
                                                   recomp_context* context) {
-    const int level_id = static_cast<std::int32_t>(
-        MEM_W(0, RdramAddress(kCurrentMapIdAddress)));
     const int race_type = CurrentLevelRaceType(rdram);
-    if (dkr::runtime::enhancements::relax_scenery_segment_bitfield(
-            dkr::runtime::enhancements::presentation_profile(), level_id,
-            race_type,
-            dkr::runtime::enhancements::view_distance_multiplier(),
-            dkr::runtime::enhancements::keep_hub_scenery_requested())) {
+    const bool authored_region_visible = context->r12 != 0;
+    const bool retention_active =
+        dkr::runtime::enhancements::relax_scenery_segment_bitfield(
+            dkr::runtime::enhancements::presentation_profile(), race_type,
+            dkr::runtime::enhancements::scenery_retention_mode(),
+            dkr::runtime::enhancements::keep_hub_scenery_requested(),
+            dkr::runtime::enhancements::keep_track_scenery_requested(),
+            dkr::runtime::enhancements::keep_minigame_scenery_requested());
+    if (retention_active) {
         // At 0x80029D78 r12 is the original per-region bitfield result.
-        // block_visible still performs the ordinary camera-plane test unless
-        // the explicit all-scenery persistence toggle is enabled below.
+        // block_visible still performs the ordinary camera-plane test. This
+        // only relaxes DKR's authored regional visibility ownership.
         context->r12 = 1;
     }
+    dkr::runtime::presentation::interpolation_trace_segment_region(
+        rdram, static_cast<std::uint32_t>(context->r7), race_type,
+        authored_region_visible, context->r12 != 0, retention_active);
 }
 
 extern "C" void dkr_keep_hub_segment_visible(std::uint8_t* rdram,
                                                recomp_context* context) {
-    const std::uint32_t camera = static_cast<std::uint32_t>(
-        MEM_W(0, RdramAddress(kSceneActiveCameraAddress)));
-    if (camera >= 0x80000000U && camera <= 0x807FFFBCU) {
-        const int camera_mode = static_cast<std::int16_t>(
-            MEM_H(kCameraModeOffset, RdramAddress(camera)));
-        if (dkr::runtime::enhancements::is_finish_camera_mode(camera_mode)) {
-            // A fixed finish shot must retain DKR's ordinary camera-plane
-            // rejection. Forcing behind-camera BSP segments here can exceed
-            // the authored task's display-list/matrix budget and was the root
-            // of the cross-track race-end vertex explosions.
-            return;
-        }
-    }
-    const int race_type = CurrentLevelRaceType(rdram);
-    if (dkr::runtime::enhancements::force_scenery_segment_visible(
-            dkr::runtime::enhancements::presentation_profile(), race_type,
-            dkr::runtime::enhancements::keep_hub_scenery_requested())) {
-        // This hook runs after block_visible returns and before its result is
-        // tested. The explicit toggle therefore keeps every BSP segment in a
-        // hub, track, boss race or minigame render list, including segments
-        // behind the camera. Frontend and cutscene race types remain authored.
-        context->r2 = 1;
-    }
+    // Intentionally preserve block_visible's camera-plane result. The former
+    // master toggle overwrote r2 here and rendered geometry behind the camera,
+    // which could overflow authored display-list/matrix budgets. Retention is
+    // now implemented only by the regional bitfield and forward frustum hooks.
+    const std::uint32_t segment_id = static_cast<std::uint32_t>(
+        MEM_W(0x18, context->r29));
+    dkr::runtime::presentation::interpolation_trace_segment_block(
+        rdram, segment_id, context->r2 != 0);
 }
 
 extern "C" void dkr_extended_frustum_begin(std::uint8_t* rdram,
@@ -477,11 +603,16 @@ extern "C" void dkr_extended_frustum_begin(std::uint8_t* rdram,
         dkr::runtime::enhancements::extended_culling_enabled(),
         static_cast<float>(width) / static_cast<float>(height), layout,
         dkr::runtime::enhancements::frustum_guard_percent());
-    const int level_id = static_cast<std::int32_t>(
-        MEM_W(0, RdramAddress(kCurrentMapIdAddress)));
-    scale *= dkr::runtime::enhancements::hub_segment_frustum_scale(
-        dkr::runtime::enhancements::presentation_profile(), level_id,
-        dkr::runtime::enhancements::view_distance_multiplier());
+    const float retention_scale =
+        dkr::runtime::enhancements::scenery_retention_frustum_scale(
+            dkr::runtime::enhancements::presentation_profile(),
+            CurrentLevelRaceType(rdram),
+            dkr::runtime::enhancements::scenery_retention_mode(),
+            dkr::runtime::enhancements::view_distance_multiplier(),
+            dkr::runtime::enhancements::keep_hub_scenery_requested(),
+            dkr::runtime::enhancements::keep_track_scenery_requested(),
+            dkr::runtime::enhancements::keep_minigame_scenery_requested());
+    scale = std::max(scale, retention_scale);
     if (scale <= 1.0001F) {
         return;
     }

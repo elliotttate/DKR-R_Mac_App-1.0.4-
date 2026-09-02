@@ -32,6 +32,46 @@
       "destination": "extern/rt64",
       "recursive": true,
       "purpose": "Cross-platform RDP renderer and presentation backend"
+    },
+    {
+      "name": "gekkonet",
+      "repository": "https://github.com/HeatXD/GekkoNet.git",
+      "commit": "5924b5c7abb5b1156c3c5609c9c36e9bede58c1c",
+      "destination": "extern/gekkonet",
+      "recursive": false,
+      "purpose": "BSD-licensed rollback input prediction, synchronization, replay and desync coordination"
+    },
+    {
+      "name": "monocypher",
+      "repository": "https://github.com/LoupVaillant/Monocypher.git",
+      "commit": "0d85f98c9d9b0227e42cf795cb527dff372b40a4",
+      "destination": "extern/monocypher",
+      "recursive": false,
+      "purpose": "BSD-licensed authenticated encryption for private netplay datagrams"
+    },
+    {
+      "name": "libdatachannel",
+      "repository": "https://github.com/paullouisageneau/libdatachannel.git",
+      "commit": "c6696d157b5612df2a741d9a03b192b47ab6cefb",
+      "destination": "extern/libdatachannel",
+      "recursive": true,
+      "purpose": "MPL-2.0 WebRTC data channels and WebSocket signaling for optional Quick Join transport"
+    },
+    {
+      "name": "mbedtls",
+      "repository": "https://github.com/Mbed-TLS/mbedtls.git",
+      "commit": "c765c831e5c2a0971410692f92f7a81d6ec65ec2",
+      "destination": "extern/mbedtls",
+      "recursive": true,
+      "purpose": "Apache-2.0 static TLS and DTLS provider for the cross-platform Quick Join transport"
+    },
+    {
+      "name": "sdl3",
+      "repository": "https://github.com/libsdl-org/SDL.git",
+      "commit": "147a8ee32dbf9ac02f3794964490687b6bbda1bc",
+      "destination": "extern/sdl3",
+      "recursive": false,
+      "purpose": "Private native controller and Steam Deck sensor helper; never the launcher window backend"
     }
   ]
 }

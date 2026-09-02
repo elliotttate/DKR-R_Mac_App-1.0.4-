@@ -1,0 +1,73 @@
+#pragma once
+
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <deque>
+#include <string>
+#include <utility>
+
+namespace dkr::runtime::ui_notifications {
+
+enum class Kind {
+    FriendOnline,
+    LobbyInvite,
+};
+
+struct Toast {
+    Kind kind = Kind::FriendOnline;
+    std::string title;
+    std::string message;
+    std::chrono::steady_clock::time_point started{};
+    std::chrono::duration<float> duration{7.0F};
+    std::chrono::duration<float> fade_duration{1.5F};
+};
+
+class Queue {
+public:
+    explicit Queue(std::size_t capacity = 8U)
+        : capacity_(std::max<std::size_t>(capacity, 1U)) {}
+
+    void push(Kind kind, std::string title, std::string message,
+              std::chrono::steady_clock::time_point now) {
+        if (message.empty()) return;
+        if (toasts_.size() >= capacity_) toasts_.pop_back();
+        toasts_.push_back(
+            {kind, std::move(title), std::move(message), now});
+    }
+
+    const Toast* current(std::chrono::steady_clock::time_point now) {
+        discard_expired(now);
+        return toasts_.empty() ? nullptr : &toasts_.front();
+    }
+
+    std::size_t size(std::chrono::steady_clock::time_point now) {
+        discard_expired(now);
+        return toasts_.size();
+    }
+
+    static float alpha(const Toast& toast,
+                       std::chrono::steady_clock::time_point now) {
+        const auto elapsed = now - toast.started;
+        if (elapsed <= toast.duration - toast.fade_duration) return 1.0F;
+        const float remaining =
+            std::chrono::duration<float>(toast.duration - elapsed).count();
+        return std::clamp(
+            remaining / std::max(toast.fade_duration.count(), 0.001F),
+            0.0F, 1.0F);
+    }
+
+private:
+    void discard_expired(std::chrono::steady_clock::time_point now) {
+        while (!toasts_.empty() &&
+               now - toasts_.front().started >= toasts_.front().duration) {
+            toasts_.pop_front();
+            if (!toasts_.empty()) toasts_.front().started = now;
+        }
+    }
+
+    std::size_t capacity_ = 8U;
+    std::deque<Toast> toasts_;
+};
+
+} // namespace dkr::runtime::ui_notifications
