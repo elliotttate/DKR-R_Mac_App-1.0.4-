@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(DKRRuntimePreparation LANGUAGES C CXX)
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
 
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../VERSION" DKR_NETWORK_RELEASE_VERSION
      LIMIT_COUNT 1)
@@ -464,6 +467,9 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         src/game/virtual_pak.cpp
         ${DKR_GENERATED_RSP}
     )
+    if(APPLE)
+        list(APPEND DKR_GAME_SOURCES src/game/runtime_metal_layer.mm)
+    endif()
     if(DKR_RUNTIME_BUILD_RT64)
         list(APPEND DKR_GAME_SOURCES
             src/game/f3ddkr_rt64.cpp

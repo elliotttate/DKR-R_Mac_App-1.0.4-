@@ -105,3 +105,4 @@ token*.json
 runtime-recomp/RecompiledFuncs/
 runtime-recomp/RecompiledPatches/
 build/runtime-tools/
+runtime-recomp/build/
