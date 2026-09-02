@@ -1,6 +1,6 @@
 # DKR-R — Diddy Kong Racing Recompiled
 
-<img width="1774" height="887" alt="DKR-R Logo" src="https://github.com/user-attachments/assets/1c1211fc-27b7-4a4c-af01-5c20067928c2" />
+<img width="1672" height="941" alt="bb1a4a71-c0c0-4803-a31e-377e8f4bbf35" src="https://github.com/user-attachments/assets/c913bee2-029c-4e29-9921-0f6abe7a3bf1" />
 
 <p align="center">
   <a href="https://discord.com/invite/AMWfXdBjNP">
