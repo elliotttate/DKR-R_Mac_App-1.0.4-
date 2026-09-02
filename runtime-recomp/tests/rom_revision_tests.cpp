@@ -1,6 +1,7 @@
 #include "rom_revision.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -75,6 +76,32 @@ int main(int argc, char** argv) {
     assert(canonical_identity.byte_order ==
            dkr::runtime::rom::ByteOrder::BigEndian);
     std::filesystem::remove_all(canonical_cache);
+
+    const auto identity_cache = std::filesystem::temp_directory_path() /
+        ("dkr-r-rom-identity-cache-test-" + test_identity);
+    std::filesystem::remove_all(identity_cache);
+    std::filesystem::create_directories(identity_cache);
+    const auto cached_rom = identity_cache / "cached.z64";
+    write_file(cached_rom, read_file(v80_z64));
+    dkr::runtime::rom::configure_identity_cache(identity_cache);
+    const auto first_cached_identity = dkr::runtime::rom::inspect(cached_rom);
+    assert(first_cached_identity.supported());
+    // Reload from disk so this verifies the persistent parser as well as the
+    // in-process lookup populated by inspect().
+    dkr::runtime::rom::configure_identity_cache(identity_cache);
+    const auto cache_hit = dkr::runtime::rom::cached_identity(cached_rom);
+    assert(cache_hit.has_value());
+    assert(cache_hit->canonical_xxh3 == first_cached_identity.canonical_xxh3);
+
+    auto changed_bytes = read_file(cached_rom);
+    changed_bytes.front() ^= 0xFFU;
+    write_file(cached_rom, changed_bytes);
+    std::filesystem::last_write_time(
+        cached_rom, std::filesystem::file_time_type::clock::now() +
+                        std::chrono::seconds(2));
+    assert(!dkr::runtime::rom::cached_identity(cached_rom).has_value());
+    assert(!dkr::runtime::rom::inspect(cached_rom).supported());
+    std::filesystem::remove_all(identity_cache);
 
     std::cout << "[test][rom-revision] PASS: v77/v80 and all supplied byte orders\n";
     return 0;

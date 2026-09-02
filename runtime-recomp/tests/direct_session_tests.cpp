@@ -237,6 +237,28 @@ struct DirectSessionTestAccess {
             protocol::encode_input_batch(batch)};
         host.handle_host_packet(peer.address, peer.sender_id, datagram);
     }
+    static void inject_transition_acknowledgement(
+        DirectSession& host, std::uint8_t player_slot,
+        std::uint32_t scene_epoch, std::uint32_t frame,
+        std::uint8_t transition_kind) {
+        std::scoped_lock lock(host.mutex_);
+        assert(player_slot < host.peers_.size());
+        const DirectSession::PeerRecord& peer = host.peers_[player_slot];
+        assert(peer.active && peer.slot == player_slot);
+        const protocol::Datagram datagram{
+            {protocol::MessageType::TransitionBarrier, host.match_id_, 1U,
+             frame},
+            protocol::encode_transition_barrier({
+                scene_epoch, frame, transition_kind, player_slot,
+                protocol::TransitionBarrierStage::Acknowledge})};
+        host.handle_host_packet(peer.address, peer.sender_id, datagram);
+    }
+    static bool has_resumed_transition_barrier(
+        const DirectSession& session) {
+        std::scoped_lock lock(session.mutex_);
+        return session.transition_barrier_.has_value() &&
+               session.transition_barrier_->resumed;
+    }
     static bool has_frame_commit(const DirectSession& session,
                                  std::uint32_t frame) {
         std::scoped_lock lock(session.mutex_);
@@ -2033,6 +2055,27 @@ int main() {
     client.end_authoritative_phase();
     assert(host.running());
     assert(client.running());
+
+    // Race teardown must not cancel Player 1's Resume retry window. A delayed
+    // or duplicate client Acknowledge is normal for UDP and must remain
+    // idempotent instead of disconnecting the session in the results screen.
+    assert(DirectSessionTestAccess::has_resumed_transition_barrier(host));
+    const std::uint64_t packets_before_late_ack =
+        DirectSessionTestAccess::packets_sent(host);
+    DirectSessionTestAccess::inject_transition_acknowledgement(
+        host, 1U, DirectSessionTestAccess::scene_epoch(host), finish_frame, 1U);
+    DirectSessionTestAccess::inject_transition_acknowledgement(
+        host, 1U, DirectSessionTestAccess::scene_epoch(host), finish_frame, 1U);
+    const auto late_ack_reply_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (DirectSessionTestAccess::packets_sent(host) <
+               packets_before_late_ack + 2U &&
+           std::chrono::steady_clock::now() < late_ack_reply_deadline) {
+        pump_pair(host, client, 1);
+    }
+    assert(host.running());
+    assert(DirectSessionTestAccess::packets_sent(host) >=
+           packets_before_late_ack + 2U);
 
     // Results and menus continue on the same immutable input ledger, but have
     // no rollback-state contract. A temporarily parked guest reports its last

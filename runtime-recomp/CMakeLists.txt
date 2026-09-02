@@ -22,7 +22,7 @@ endif()
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" DKR_RELEASE_VERSION_NUMERIC
        "${DKR_RELEASE_VERSION}")
 if(DKR_RELEASE_VERSION_NUMERIC STREQUAL "")
-    set(DKR_RELEASE_VERSION_NUMERIC "1.0.1")
+    set(DKR_RELEASE_VERSION_NUMERIC "1.0.2")
 endif()
 string(REGEX MATCH "-rc([0-9]+)$" DKR_RELEASE_RC_MATCH
        "${DKR_RELEASE_VERSION}")
@@ -464,6 +464,7 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         src/game/runtime_stubs.cpp
         src/game/runtime_support.cpp
         src/game/runtime_telemetry.cpp
+        src/game/startup_performance.cpp
         src/game/virtual_pak.cpp
         ${DKR_GENERATED_RSP}
     )
@@ -859,6 +860,7 @@ if(BUILD_TESTING)
     add_executable(DKRRomRevisionTests
         tests/rom_revision_tests.cpp
         src/game/rom_revision.cpp
+        src/game/startup_performance.cpp
     )
     target_include_directories(DKRRomRevisionTests PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/src/game"

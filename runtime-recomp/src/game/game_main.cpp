@@ -6,6 +6,7 @@
 #include "runtime_netplay.hpp"
 #include "runtime_support.hpp"
 #include "save_manager.hpp"
+#include "startup_performance.hpp"
 #include "virtual_pak.hpp"
 #if DKR_RUNTIME_HAS_RT64
 #include "rt64_renderer.hpp"
@@ -456,6 +457,7 @@ bool RelaunchApplication(int argc, char** argv) {
 int DkrMain(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+    dkr::runtime::startup_performance::mark("process-entry");
 #if defined(_WIN32)
     SetUnhandledExceptionFilter(RuntimeCrashFilter);
 #endif
@@ -498,13 +500,24 @@ int DkrMain(int argc, char** argv) {
             dkr::runtime::platform::shutdown();
             return 1;
         };
+        const auto wait_for_backend = [](auto expected) {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            do {
+                dkr::runtime::platform::pump_input_backend_events();
+                if (dkr::runtime::platform::active_input_backend() == expected &&
+                    !dkr::runtime::platform::input_backend_switch_pending()) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            } while (std::chrono::steady_clock::now() < deadline);
+            return false;
+        };
         for (int cycle = 0; cycle < 2; ++cycle) {
             dkr::runtime::platform::set_requested_input_backend(
                 dkr::runtime::platform::InputBackend::SDL3Native);
-            dkr::runtime::platform::pump_input_backend_events();
-            if (dkr::runtime::platform::active_input_backend() !=
-                    dkr::runtime::platform::InputBackend::SDL3Native ||
-                dkr::runtime::platform::input_backend_switch_pending()) {
+            if (!wait_for_backend(
+                    dkr::runtime::platform::InputBackend::SDL3Native)) {
                 return fail("SDL2 to SDL3 handover");
             }
             if ((SDL_WasInit(kInvariantSubsystems) & kInvariantSubsystems) !=
@@ -518,10 +531,8 @@ int DkrMain(int argc, char** argv) {
 
             dkr::runtime::platform::set_requested_input_backend(
                 dkr::runtime::platform::InputBackend::SDL2Compatibility);
-            dkr::runtime::platform::pump_input_backend_events();
-            if (dkr::runtime::platform::active_input_backend() !=
-                    dkr::runtime::platform::InputBackend::SDL2Compatibility ||
-                dkr::runtime::platform::input_backend_switch_pending()) {
+            if (!wait_for_backend(
+                    dkr::runtime::platform::InputBackend::SDL2Compatibility)) {
                 return fail("SDL3 to SDL2 handover");
             }
             if ((SDL_WasInit(kInvariantSubsystems) & kInvariantSubsystems) !=
@@ -601,7 +612,22 @@ int DkrMain(int argc, char** argv) {
     const std::filesystem::path& config_directory = launch.config_directory;
     const unsigned timeout_seconds = launch.timeout_seconds;
     std::filesystem::create_directories(config_directory);
-    dkr::runtime::support::configure(config_directory);
+    {
+        dkr::runtime::startup_performance::ScopedPhase phase(
+            "support-configure");
+        dkr::runtime::support::configure(config_directory);
+    }
+    bool log_configured = ConfigurePersistentRuntimeLog(config_directory);
+    if (!log_configured) {
+        std::fprintf(stderr,
+                     "[boot][log] could not create the persistent runtime log\n");
+    }
+    dkr::runtime::startup_performance::mark("persistent-log-ready");
+    {
+        dkr::runtime::startup_performance::ScopedPhase phase(
+            "rom-identity-cache-configure");
+        dkr::runtime::rom::configure_identity_cache(config_directory);
+    }
 #if defined(_WIN32)
     g_crash_directory = dkr::runtime::support::crash_dump_directory();
     if (dkr::runtime::support::crash_dumps_enabled()) {
@@ -633,20 +659,20 @@ int DkrMain(int argc, char** argv) {
         rom_identified = true;
     }
 
-    bool log_configured = false;
-    if (rom_identified) {
-        log_configured = ConfigurePersistentRuntimeLog(config_directory);
-        if (!log_configured) {
-            std::fprintf(stderr,
-                         "[boot][log] could not create the persistent runtime log\n");
-        }
+    {
+        dkr::runtime::startup_performance::ScopedPhase phase(
+            "pak-save-input-configure");
+        dkr::runtime::pak::configure(config_directory);
+        dkr::runtime::saves::configure(config_directory);
+        dkr::runtime::platform::configure_input(config_directory);
     }
-    dkr::runtime::pak::configure(config_directory);
-    dkr::runtime::saves::configure(config_directory);
-    dkr::runtime::platform::configure_input(config_directory);
 
-    if (!dkr::runtime::platform::initialise()) {
-        return 4;
+    {
+        dkr::runtime::startup_performance::ScopedPhase phase(
+            "platform-initialise");
+        if (!dkr::runtime::platform::initialise()) {
+            return 4;
+        }
     }
     // N64ModernRuntime intentionally leaves its process-wide graphics options
     // value-initialized for applications with a settings frontend. Supply
@@ -667,9 +693,16 @@ int DkrMain(int argc, char** argv) {
     ultramodern::renderer::set_graphics_config(graphics_config);
 
 #if DKR_RUNTIME_HAS_RT64
-    dkr::runtime::ui::configure(config_directory);
+    {
+        dkr::runtime::startup_performance::ScopedPhase phase("ui-configure");
+        dkr::runtime::ui::configure(config_directory);
+    }
     dkr::runtime::ui::reset_lifecycle_request();
+    const auto window_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     auto window_handle = dkr::runtime::platform::create_window();
+    dkr::runtime::startup_performance::report("window-create",
+                                               window_started_at);
 #if defined(_WIN32) || defined(__APPLE__)
     if (window_handle.window == nullptr) {
 #else
@@ -741,6 +774,7 @@ int DkrMain(int argc, char** argv) {
         return 3;
     }
     const dkr::runtime::rom::Revision registered_revision = rom_identity.revision;
+    dkr::runtime::startup_performance::mark("game-registered");
     std::fprintf(stderr, "[boot][rom] validated and registered\n");
 
     const recomp::rsp::callbacks_t rsp_callbacks{.get_rsp_microcode = GetRspMicrocode};
@@ -819,6 +853,7 @@ int DkrMain(int argc, char** argv) {
             dkr::runtime::platform::shutdown();
             return 3;
         }
+        dkr::runtime::startup_performance::mark("runtime-rom-selected");
 
         dkr::runtime::netplay::reset_runtime_state();
         dkr::runtime::rev_a_asset_mutex::reset_statistics();
@@ -834,6 +869,7 @@ int DkrMain(int argc, char** argv) {
             }
             runtime_finished.store(true, std::memory_order_release);
         });
+        dkr::runtime::startup_performance::mark("runtime-thread-started");
 
         const auto runtime_started_at = std::chrono::steady_clock::now();
         bool timeout_requested = false;

@@ -1,4 +1,4 @@
-# DKR-R 1.0.1 release validation
+# DKR-R 1.0.2 release validation
 
 Validated on 10 August 2026 from the clean `C:\DKRPort` release tree.
 
@@ -27,7 +27,7 @@ Validated on 10 August 2026 from the clean `C:\DKRPort` release tree.
 Deliverable:
 
 ```text
-dist/DKR-R-1.0.1-Windows-x64.zip
+dist/DKR-R-1.0.2-Windows-x64.zip
 SHA-256 D7A16D53A93C5B695588804617D23CD37B279E849EB4DEEF3E8B3C4D925329FD
 ```
 
@@ -43,7 +43,7 @@ SHA-256 D7A16D53A93C5B695588804617D23CD37B279E849EB4DEEF3E8B3C4D925329FD
 Deliverable:
 
 ```text
-dist/DKR-R-1.0.1-Linux-x86_64.AppImage
+dist/DKR-R-1.0.2-Linux-x86_64.AppImage
 SHA-256 A228CC7FF5D3A84074E01CFBDE54BAE1A1EE0A93C3B94D278F59E917506E3D2F
 ```
 
@@ -51,4 +51,4 @@ SHA-256 A228CC7FF5D3A84074E01CFBDE54BAE1A1EE0A93C3B94D278F59E917506E3D2F
 
 These checks are non-interactive release gates. The confirmed gameplay,
 graphics, interpolation and audio baseline remains the user-visible acceptance
-test for DKR-R 1.0.1.
+test for DKR-R 1.0.2.

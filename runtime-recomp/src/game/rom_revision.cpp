@@ -1,11 +1,16 @@
 #include "rom_revision.hpp"
+#include "startup_performance.hpp"
 
 #define XXH_INLINE_ALL
 #include "xxHash/xxhash.h"
 
 #include <array>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <vector>
@@ -16,6 +21,115 @@ namespace {
 constexpr std::array<std::uint8_t, 4> kBigEndianMagic{0x80, 0x37, 0x12, 0x40};
 constexpr std::array<std::uint8_t, 4> kByteSwapped16Magic{0x37, 0x80, 0x40, 0x12};
 constexpr std::array<std::uint8_t, 4> kLittleEndian32Magic{0x40, 0x12, 0x37, 0x80};
+
+struct FileStamp {
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type::rep modified = 0;
+    bool valid = false;
+};
+
+struct CachedIdentity {
+    FileStamp stamp;
+    Identity identity;
+};
+
+std::mutex g_identity_cache_mutex;
+std::map<std::string, CachedIdentity> g_identity_cache;
+std::filesystem::path g_identity_cache_path;
+
+std::string PathUtf8(const std::filesystem::path& path) {
+    const std::u8string value = path.u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
+std::string CacheKey(const std::filesystem::path& path) {
+    std::error_code error;
+    const std::filesystem::path absolute =
+        std::filesystem::absolute(path, error).lexically_normal();
+    return PathUtf8(error ? path.lexically_normal() : absolute);
+}
+
+FileStamp ReadStamp(const std::filesystem::path& path) {
+    FileStamp stamp{};
+    std::error_code error;
+    stamp.size = std::filesystem::file_size(path, error);
+    if (error) return stamp;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return stamp;
+    stamp.modified = modified.time_since_epoch().count();
+    stamp.valid = true;
+    return stamp;
+}
+
+bool SameStamp(const FileStamp& left, const FileStamp& right) {
+    return left.valid && right.valid && left.size == right.size &&
+           left.modified == right.modified;
+}
+
+void SaveIdentityCacheLocked() {
+    if (g_identity_cache_path.empty()) return;
+    std::error_code error;
+    std::filesystem::create_directories(g_identity_cache_path.parent_path(),
+                                        error);
+    if (error) return;
+    const std::filesystem::path temporary =
+        std::filesystem::path(g_identity_cache_path.string() + ".tmp");
+    std::ofstream output(temporary, std::ios::trunc);
+    if (!output) return;
+    output << "# DKR-R ROM identity cache v1\n";
+    for (const auto& [key, entry] : g_identity_cache) {
+        if (!entry.stamp.valid || !entry.identity.supported()) continue;
+        output << std::quoted(key) << '\t' << entry.stamp.size << '\t'
+               << entry.stamp.modified << '\t'
+               << static_cast<unsigned>(entry.identity.revision) << '\t'
+               << static_cast<unsigned>(entry.identity.byte_order) << '\t'
+               << entry.identity.canonical_xxh3 << '\t'
+               << entry.identity.header_crc1 << '\t'
+               << entry.identity.header_crc2 << '\t'
+               << static_cast<unsigned>(entry.identity.header_revision) << '\n';
+    }
+    output.close();
+    if (!output) {
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+    std::filesystem::rename(temporary, g_identity_cache_path, error);
+    if (!error) return;
+    error.clear();
+    std::filesystem::remove(g_identity_cache_path, error);
+    error.clear();
+    std::filesystem::rename(temporary, g_identity_cache_path, error);
+    if (error) std::filesystem::remove(temporary, error);
+}
+
+std::optional<Identity> FindCachedIdentity(const std::filesystem::path& path,
+                                           const FileStamp& stamp) {
+    if (!stamp.valid) return std::nullopt;
+    const std::string key = CacheKey(path);
+    std::scoped_lock lock(g_identity_cache_mutex);
+    const auto match = g_identity_cache.find(key);
+    if (match == g_identity_cache.end() ||
+        !SameStamp(match->second.stamp, stamp) ||
+        !match->second.identity.supported()) {
+        return std::nullopt;
+    }
+    return match->second.identity;
+}
+
+void RememberIdentity(const std::filesystem::path& path,
+                      const FileStamp& stamp, const Identity& identity) {
+    if (!stamp.valid || !identity.supported()) return;
+    std::scoped_lock lock(g_identity_cache_mutex);
+    g_identity_cache[CacheKey(path)] = {stamp, identity};
+    SaveIdentityCacheLocked();
+}
+
+bool ReadExact(std::ifstream& input, std::vector<std::uint8_t>& bytes) {
+    if (bytes.empty()) return true;
+    input.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    return input.gcount() == static_cast<std::streamsize>(bytes.size());
+}
 
 std::uint32_t read_be32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
     return (static_cast<std::uint32_t>(bytes[offset]) << 24U) |
@@ -62,37 +176,62 @@ void canonicalize(std::vector<std::uint8_t>& bytes, ByteOrder byte_order) {
 } // namespace
 
 Identity inspect(const std::filesystem::path& path) {
+    const auto inspection_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     Identity identity{};
+    const FileStamp stamp = ReadStamp(path);
+    if (const auto cached = FindCachedIdentity(path, stamp)) {
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-cache-hit", inspection_started_at);
+        return *cached;
+    }
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         identity.error = InspectionError::FailedToOpen;
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-failed-open", inspection_started_at);
+        return identity;
+    }
+    identity.file_size = stamp.valid
+        ? static_cast<std::size_t>(stamp.size) : 0U;
+    if (!stamp.valid || stamp.size < 0x40U) {
+        identity.error = InspectionError::TooSmall;
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-too-small", inspection_started_at);
         return identity;
     }
 
-    std::vector<std::uint8_t> bytes{
-        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    identity.file_size = bytes.size();
-    if (bytes.size() < 0x40U) {
-        identity.error = InspectionError::TooSmall;
+    const std::size_t bytes_to_read = stamp.size == kRetailRomSize
+        ? kRetailRomSize : 0x40U;
+    std::vector<std::uint8_t> bytes(bytes_to_read);
+    if (!ReadExact(input, bytes)) {
+        identity.error = InspectionError::FailedToOpen;
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-short-read", inspection_started_at);
         return identity;
     }
 
     identity.byte_order = detect_byte_order(bytes);
     if (identity.byte_order == ByteOrder::Unknown) {
         identity.error = InspectionError::InvalidHeader;
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-invalid-header", inspection_started_at);
         return identity;
     }
 
     canonicalize(bytes, identity.byte_order);
-    identity.canonical_xxh3 = XXH3_64bits(bytes.data(), bytes.size());
     identity.header_crc1 = read_be32(bytes, 0x10U);
     identity.header_crc2 = read_be32(bytes, 0x14U);
     identity.header_revision = bytes[0x3FU];
 
     if (identity.file_size != kRetailRomSize) {
         identity.error = InspectionError::UnsupportedRevision;
+        dkr::runtime::startup_performance::report(
+            "rom-inspect-wrong-size", inspection_started_at);
         return identity;
     }
+
+    identity.canonical_xxh3 = XXH3_64bits(bytes.data(), bytes.size());
 
     if (identity.canonical_xxh3 == kUsV77Xxh3) {
         identity.revision = Revision::UsV77;
@@ -101,7 +240,59 @@ Identity inspect(const std::filesystem::path& path) {
     } else {
         identity.error = InspectionError::UnsupportedRevision;
     }
+    RememberIdentity(path, stamp, identity);
+    dkr::runtime::startup_performance::report(
+        identity.supported() ? "rom-inspect-cache-miss"
+                             : "rom-inspect-unsupported",
+        inspection_started_at);
     return identity;
+}
+
+void configure_identity_cache(const std::filesystem::path& config_directory) {
+    std::scoped_lock lock(g_identity_cache_mutex);
+    g_identity_cache.clear();
+    g_identity_cache_path = config_directory / "rom-identities-v1.txt";
+    std::ifstream input(g_identity_cache_path);
+    if (!input) return;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line.front() == '#') continue;
+        std::istringstream record(line);
+        std::string key;
+        CachedIdentity entry{};
+        unsigned revision = 0;
+        unsigned byte_order = 0;
+        unsigned header_revision = 0;
+        if (!(record >> std::quoted(key) >> entry.stamp.size >>
+              entry.stamp.modified >> revision >> byte_order >>
+              entry.identity.canonical_xxh3 >> entry.identity.header_crc1 >>
+              entry.identity.header_crc2 >> header_revision)) {
+            continue;
+        }
+        if (revision < static_cast<unsigned>(Revision::UsV77) ||
+            revision > static_cast<unsigned>(Revision::UsV80) ||
+            byte_order < static_cast<unsigned>(ByteOrder::BigEndian) ||
+            byte_order > static_cast<unsigned>(ByteOrder::LittleEndian32) ||
+            entry.stamp.size != kRetailRomSize || header_revision > 0xFFU) {
+            continue;
+        }
+        entry.stamp.valid = true;
+        entry.identity.revision = static_cast<Revision>(revision);
+        entry.identity.byte_order = static_cast<ByteOrder>(byte_order);
+        entry.identity.error = InspectionError::None;
+        entry.identity.file_size = static_cast<std::size_t>(entry.stamp.size);
+        entry.identity.header_revision =
+            static_cast<std::uint8_t>(header_revision);
+        if (entry.identity.canonical_xxh3 != kUsV77Xxh3 &&
+            entry.identity.canonical_xxh3 != kUsV80Xxh3) {
+            continue;
+        }
+        g_identity_cache.emplace(std::move(key), entry);
+    }
+}
+
+std::optional<Identity> cached_identity(const std::filesystem::path& path) {
+    return FindCachedIdentity(path, ReadStamp(path));
 }
 
 bool materialize_canonical(const std::filesystem::path& source,

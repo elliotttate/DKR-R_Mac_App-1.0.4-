@@ -18,6 +18,7 @@
 #include "netplay/netplay_build_identity.hpp"
 #include "runtime_platform.hpp"
 #include "runtime_support.hpp"
+#include "startup_performance.hpp"
 #include "runtime_telemetry.hpp"
 #include "runtime_texture_packs.hpp"
 #include "save_manager.hpp"
@@ -2122,14 +2123,16 @@ std::vector<RomCatalogEntry> LoadRomCatalog() {
             cleaned = true;
             continue;
         }
-        std::string validation_error;
-        dkr::runtime::rom::Identity identity{};
-        if (!dkr::runtime::ValidateRomForLauncher(
-                path, identity, validation_error)) {
+        std::error_code file_error;
+        if (!std::filesystem::is_regular_file(path, file_error) || file_error) {
             cleaned = true;
             continue;
         }
-        catalog.push_back({path, RomCatalogLabel(identity)});
+        const auto identity = dkr::runtime::rom::cached_identity(path);
+        const std::string label = identity.has_value()
+            ? RomCatalogLabel(*identity)
+            : "Imported Game Pak - " + PathUtf8(path.filename());
+        catalog.push_back({path, label});
     }
     if (cleaned) {
         SaveRomCatalog(catalog);
@@ -7876,6 +7879,7 @@ bool DrawTexturePackManagementModal(
 void DrawTexturePackControls(float width) {
     using namespace dkr::runtime;
     using namespace dkr::runtime::texture_browser;
+    texture_packs::request_background_refresh();
     const float available_width = std::max(
         std::min(width, ImGui::GetContentRegionAvail().x), 1.0F);
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
@@ -10333,8 +10337,11 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
     if (window == nullptr) {
         return result;
     }
+    dkr::runtime::startup_performance::mark("launcher-enter");
 
     SDL_SetWindowTitle(window, "DKR-R - Diddy Kong Racing Recompiled");
+    const auto launcher_renderer_started_at =
+        dkr::runtime::startup_performance::Clock::now();
 #if defined(__linux__)
     // The launcher and RT64 share this Vulkan-capable SDL window for the
     // complete process lifetime. An accelerated SDL renderer can replace the
@@ -10349,6 +10356,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
 #endif
+    dkr::runtime::startup_performance::report(
+        "launcher-renderer-create", launcher_renderer_started_at);
     if (renderer == nullptr) {
         std::fprintf(stderr, "[boot][launcher] SDL renderer failed: %s\n", SDL_GetError());
         return result;
@@ -10367,6 +10376,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |=
         ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    const auto launcher_assets_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     LoadLauncherFonts();
     ApplyStyle();
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
@@ -10393,6 +10404,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
 
     const LauncherBackgroundTexture launcher_background =
         LoadLauncherBackground(renderer);
+    dkr::runtime::startup_performance::report(
+        "launcher-assets-load", launcher_assets_started_at);
     const auto launcher_animation_epoch = std::chrono::steady_clock::now();
     constexpr auto kLauncherIdleInterval = std::chrono::milliseconds{100};
     constexpr auto kLauncherInteractionWindow =
@@ -10417,7 +10430,11 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
         online_manifest;
     std::string rom_status = "Choose your legally obtained Diddy Kong Racing Game Pak.";
     bool rom_ready = false;
+    const auto rom_catalog_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     std::vector<RomCatalogEntry> rom_catalog = LoadRomCatalog();
+    dkr::runtime::startup_performance::report(
+        "rom-catalog-load", rom_catalog_started_at);
     const std::optional<std::filesystem::path> initial_rom =
         !preselected_rom.empty()
             ? std::optional<std::filesystem::path>{preselected_rom}
@@ -10615,6 +10632,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
         PumpFriendPresence();
         if (rom_ready &&
             dkr::runtime::netplay::session().consume_launch_request()) {
+            dkr::runtime::startup_performance::mark(
+                "launcher-online-launch-requested");
             result.start_game = true;
             result.rom_path = selected_rom;
             running = false;
@@ -10750,6 +10769,8 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
             g_launcher_animation_seconds * kBackgroundScrollPixelsPerSecond;
 
         if (launch_requested) {
+            dkr::runtime::startup_performance::mark(
+                "launcher-local-launch-requested");
             result.start_game = true;
             result.rom_path = selected_rom;
             running = false;
@@ -11111,6 +11132,10 @@ dkr::runtime::ui::StartupResult dkr::runtime::ui::run_startup_screen(
                 std::chrono::microseconds>(launcher_present_finished -
                                            launcher_present_started).count());
         ++launcher_rendered_frames;
+        if (launcher_rendered_frames == 1U) {
+            dkr::runtime::startup_performance::mark(
+                "launcher-first-frame-presented");
+        }
         if (ImGui::IsAnyItemActive()) {
             launcher_last_activity = launcher_present_finished;
         }

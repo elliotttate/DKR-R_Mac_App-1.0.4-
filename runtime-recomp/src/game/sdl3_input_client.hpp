@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,7 @@ public:
 
     bool start(const std::filesystem::path& host,
                const std::filesystem::path& mapping_database,
-               std::string& error);
+               std::string& error, std::stop_token stop_token = {});
     void stop();
     bool healthy() const;
     std::string detail() const;

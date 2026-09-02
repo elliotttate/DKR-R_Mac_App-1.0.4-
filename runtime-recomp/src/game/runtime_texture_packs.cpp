@@ -1,4 +1,5 @@
 #include "runtime_texture_packs.hpp"
+#include "startup_performance.hpp"
 
 #include "rice_texture_pack_policy.hpp"
 #include "runtime_rice_texture_import.hpp"
@@ -11,15 +12,18 @@
 #include <json/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <system_error>
 #include <utility>
 
@@ -28,6 +32,7 @@ namespace {
 std::mutex g_mutex;
 std::filesystem::path g_pack_directory;
 std::filesystem::path g_settings_path;
+std::filesystem::path g_index_path;
 std::vector<dkr::runtime::texture_packs::PackInfo> g_packs;
 std::set<std::string> g_enabled_ids;
 std::string g_last_selected_id;
@@ -41,6 +46,15 @@ std::uint64_t g_applied_generation = 0;
 bool g_applied_modern = false;
 std::vector<RT64::ReplacementDirectory> g_applied_replacements;
 
+struct CachedPackInfo {
+    std::string fingerprint;
+    dkr::runtime::texture_packs::PackInfo info;
+};
+
+std::map<std::string, CachedPackInfo> g_pack_index;
+std::atomic<bool> g_background_refresh_started{false};
+std::mutex g_refresh_mutex;
+
 struct PendingDeletion {
     std::string id;
     std::filesystem::path path;
@@ -48,6 +62,9 @@ struct PendingDeletion {
 };
 
 std::vector<PendingDeletion> g_pending_deletions;
+// Declared after every object used by the worker so its destructor requests a
+// stop and joins before those dependencies begin static destruction.
+std::jthread g_background_refresh;
 
 bool ReportImportProgress(
     const dkr::runtime::texture_packs::ImportProgressCallback& callback,
@@ -78,6 +95,28 @@ std::string DisplayName(const std::filesystem::path& path) {
     std::string result = path.stem().string();
     std::replace(result.begin(), result.end(), '_', ' ');
     return result.empty() ? path.filename().string() : result;
+}
+
+std::string FileSignature(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return "missing";
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return "missing";
+    return std::to_string(size) + ":" +
+        std::to_string(modified.time_since_epoch().count());
+}
+
+std::string PackFingerprint(const std::filesystem::path& path,
+                            bool directory) {
+    if (!directory) return "file:" + FileSignature(path);
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    const std::string directory_time = error
+        ? "missing" : std::to_string(modified.time_since_epoch().count());
+    return "directory:" + directory_time + ":database:" +
+        FileSignature(path / "rt64.json") + ":report:" +
+        FileSignature(path / "dkr-r-rice-import.json");
 }
 
 std::uintmax_t ManagedSize(const std::filesystem::path& path) {
@@ -218,6 +257,85 @@ void SaveSettingsLocked() {
         std::filesystem::rename(temporary, g_settings_path, error);
     }
     if (error) g_status = "Texture-pack preferences could not be committed.";
+}
+
+void LoadPackIndexLocked() {
+    g_pack_index.clear();
+    std::ifstream input(g_index_path);
+    if (!input) return;
+    try {
+        const auto root = nlohmann::json::parse(input);
+        if (!root.is_object() || root.value("version", 0) != 1 ||
+            !root.contains("packs") || !root["packs"].is_array()) {
+            return;
+        }
+        for (const auto& value : root["packs"]) {
+            if (!value.is_object()) continue;
+            CachedPackInfo cached{};
+            cached.info.id = Lower(value.value("id", std::string{}));
+            cached.fingerprint = value.value("fingerprint", std::string{});
+            cached.info.name = value.value("name", std::string{});
+            cached.info.zip_base_path =
+                value.value("zipBasePath", std::string{});
+            const int format = value.value(
+                "format", static_cast<int>(
+                              dkr::runtime::texture_packs::Format::Unknown));
+            if (cached.info.id.empty() || cached.fingerprint.empty() ||
+                format < static_cast<int>(
+                             dkr::runtime::texture_packs::Format::NativeRt64) ||
+                format > static_cast<int>(
+                             dkr::runtime::texture_packs::Format::Unknown)) {
+                continue;
+            }
+            cached.info.format =
+                static_cast<dkr::runtime::texture_packs::Format>(format);
+            cached.info.compatible = value.value("compatible", false);
+            cached.info.image_count = value.value("imageCount", std::size_t{0});
+            cached.info.detail = value.value("detail", std::string{});
+            g_pack_index[cached.info.id] = std::move(cached);
+        }
+    } catch (const std::exception&) {
+        g_pack_index.clear();
+    }
+}
+
+void SavePackIndexLocked() {
+    if (g_index_path.empty()) return;
+    nlohmann::json root;
+    root["version"] = 1;
+    root["packs"] = nlohmann::json::array();
+    for (const auto& [id, cached] : g_pack_index) {
+        root["packs"].push_back({
+            {"id", id},
+            {"fingerprint", cached.fingerprint},
+            {"name", cached.info.name},
+            {"zipBasePath", cached.info.zip_base_path},
+            {"format", static_cast<int>(cached.info.format)},
+            {"compatible", cached.info.compatible},
+            {"imageCount", cached.info.image_count},
+            {"detail", cached.info.detail},
+        });
+    }
+    std::error_code error;
+    std::filesystem::create_directories(g_index_path.parent_path(), error);
+    if (error) return;
+    const std::filesystem::path temporary =
+        std::filesystem::path(g_index_path.string() + ".tmp");
+    std::ofstream output(temporary, std::ios::trunc);
+    if (!output) return;
+    output << root.dump(2) << '\n';
+    output.close();
+    if (!output) {
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+    std::filesystem::rename(temporary, g_index_path, error);
+    if (!error) return;
+    error.clear();
+    std::filesystem::remove(g_index_path, error);
+    error.clear();
+    std::filesystem::rename(temporary, g_index_path, error);
+    if (error) std::filesystem::remove(temporary, error);
 }
 
 dkr::runtime::texture_packs::PackInfo InspectArchive(
@@ -518,29 +636,36 @@ const char* format_name(Format format) {
     }
 }
 
-void configure(const std::filesystem::path& config_directory) {
-    {
-        std::scoped_lock lock(g_mutex);
-        g_pack_directory = config_directory / "texture-packs";
-        g_settings_path = config_directory / "texture-packs.ini";
-        g_applied_ids.clear();
-        g_pending_deletions.clear();
-        g_applied_replacements.clear();
-        g_applied_generation = 0;
-        g_applied_modern = false;
+namespace {
+
+PackInfo PlaceholderInfo(const std::filesystem::path& path, bool directory) {
+    PackInfo info{};
+    info.id = StableId(path);
+    info.name = DisplayName(path);
+    info.path = path;
+    if (directory) {
         std::error_code error;
-        std::filesystem::create_directories(g_pack_directory, error);
-        LoadSettingsLocked();
+        info.format = std::filesystem::is_regular_file(
+                          path / "dkr-r-rice-import.json", error)
+            ? Format::RiceRt64 : Format::NativeRt64;
+    } else if (Lower(path.extension().string()) == ".rtz") {
+        info.format = Format::NativeRt64;
     }
-    refresh();
+    info.detail = "Pack details have not been indexed yet.";
+    return info;
 }
 
-void refresh() {
+void ScanLibrary(bool cache_only, bool force_deep,
+                 std::stop_token stop_token = {}) {
+    std::scoped_lock refresh_lock(g_refresh_mutex);
+    const auto refresh_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     std::filesystem::path directory;
     std::set<std::string> enabled;
     std::set<std::string> hidden;
     std::map<std::string, std::int64_t> imported_at;
     std::map<std::string, std::uintmax_t> managed_sizes;
+    std::map<std::string, CachedPackInfo> pack_index;
     {
         std::scoped_lock lock(g_mutex);
         directory = g_pack_directory;
@@ -548,14 +673,20 @@ void refresh() {
         hidden = g_hidden_ids;
         imported_at = g_imported_at;
         managed_sizes = g_managed_sizes;
+        pack_index = g_pack_index;
     }
     std::vector<PackInfo> scanned;
+    std::map<std::string, CachedPackInfo> next_index;
     bool imported_metadata_changed = false;
-    const auto populate_metadata = [&](PackInfo& info) {
+    std::size_t cache_hits = 0U;
+    std::size_t deep_scans = 0U;
+    std::size_t placeholders = 0U;
+    const auto populate_metadata = [&](PackInfo& info, bool allow_deep_size) {
         const auto managed_size = managed_sizes.find(info.id);
         if (managed_size != managed_sizes.end()) {
             info.managed_size_bytes = managed_size->second;
-        } else {
+        } else if (allow_deep_size ||
+                   std::filesystem::is_regular_file(info.path)) {
             info.managed_size_bytes = ManagedSize(info.path);
             managed_sizes[info.id] = info.managed_size_bytes;
             imported_metadata_changed = true;
@@ -576,23 +707,53 @@ void refresh() {
     if (!directory.empty()) {
         std::filesystem::create_directories(directory, error);
         for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+            if (stop_token.stop_requested()) return;
             if (error) break;
-            if (entry.is_directory(error)) {
-                if (Lower(entry.path().extension().string()) == ".importing") continue;
-                auto info = InspectDirectory(entry.path());
-                populate_metadata(info);
-                info.hidden = hidden.contains(info.id);
-                info.enabled = !info.hidden && info.compatible && enabled.contains(info.id);
-                scanned.emplace_back(std::move(info));
+            const bool is_directory = entry.is_directory(error);
+            if (error) break;
+            if (is_directory &&
+                Lower(entry.path().extension().string()) == ".importing") {
                 continue;
             }
-            if (!entry.is_regular_file(error)) continue;
-            const std::string extension = Lower(entry.path().extension().string());
-            if (extension != ".zip" && extension != ".rtz") continue;
-            auto info = InspectArchive(entry.path());
-            populate_metadata(info);
+            if (!is_directory) {
+                if (!entry.is_regular_file(error)) continue;
+                const std::string extension =
+                    Lower(entry.path().extension().string());
+                if (extension != ".zip" && extension != ".rtz") continue;
+            }
+            const std::string id = StableId(entry.path());
+            const std::string fingerprint =
+                PackFingerprint(entry.path(), is_directory);
+            PackInfo info{};
+            bool fully_inspected = false;
+            const auto cached = pack_index.find(id);
+            if (!force_deep && cached != pack_index.end() &&
+                cached->second.fingerprint == fingerprint) {
+                info = cached->second.info;
+                info.path = entry.path();
+                fully_inspected = true;
+                ++cache_hits;
+            } else if (cache_only && !enabled.contains(id)) {
+                info = PlaceholderInfo(entry.path(), is_directory);
+                ++placeholders;
+            } else {
+                info = is_directory ? InspectDirectory(entry.path())
+                                    : InspectArchive(entry.path());
+                fully_inspected = true;
+                ++deep_scans;
+            }
+            populate_metadata(info, !cache_only);
             info.hidden = hidden.contains(info.id);
             info.enabled = !info.hidden && info.compatible && enabled.contains(info.id);
+            if (fully_inspected) {
+                PackInfo cached_info = info;
+                cached_info.path.clear();
+                cached_info.enabled = false;
+                cached_info.hidden = false;
+                cached_info.managed_size_bytes = 0U;
+                cached_info.imported_at_unix_seconds = 0;
+                next_index[id] = {fingerprint, std::move(cached_info)};
+            }
             scanned.emplace_back(std::move(info));
         }
     }
@@ -600,18 +761,82 @@ void refresh() {
               [](const PackInfo& left, const PackInfo& right) {
                   return Lower(left.name) < Lower(right.name);
               });
+    const std::size_t scanned_count = scanned.size();
     {
         std::scoped_lock lock(g_mutex);
+        for (auto& info : scanned) {
+            info.hidden = g_hidden_ids.contains(info.id);
+            info.enabled = !info.hidden && info.compatible &&
+                           g_enabled_ids.contains(info.id);
+        }
         if (imported_metadata_changed) {
             g_imported_at = std::move(imported_at);
             g_managed_sizes = std::move(managed_sizes);
             SaveSettingsLocked();
         }
+        if (!cache_only) {
+            g_pack_index = std::move(next_index);
+            SavePackIndexLocked();
+        }
         g_packs = std::move(scanned);
         ++g_generation;
         if (error) g_status = "The texture-pack folder could not be scanned: " + error.message();
         else if (g_packs.empty()) g_status = "No texture packs imported yet.";
+        else if (placeholders > 0U)
+            g_status = "Texture-pack details will be indexed when the library is opened.";
     }
+    std::fprintf(stderr,
+                 "[perf][startup] texture-pack-count=%zu cache-hits=%zu "
+                 "deep-scans=%zu deferred=%zu\n",
+                 scanned_count, cache_hits, deep_scans, placeholders);
+    dkr::runtime::startup_performance::report(
+        cache_only ? "texture-pack-index-load" : "texture-pack-refresh",
+        refresh_started_at);
+}
+
+} // namespace
+
+void configure(const std::filesystem::path& config_directory) {
+    g_background_refresh.request_stop();
+    if (g_background_refresh.joinable()) g_background_refresh.join();
+    g_background_refresh_started.store(false, std::memory_order_release);
+    {
+        std::scoped_lock lock(g_mutex);
+        g_pack_directory = config_directory / "texture-packs";
+        g_settings_path = config_directory / "texture-packs.ini";
+        g_index_path = config_directory / "texture-packs-index-v1.json";
+        g_applied_ids.clear();
+        g_pending_deletions.clear();
+        g_applied_replacements.clear();
+        g_applied_generation = 0;
+        g_applied_modern = false;
+        std::error_code error;
+        std::filesystem::create_directories(g_pack_directory, error);
+        LoadSettingsLocked();
+        LoadPackIndexLocked();
+    }
+    // The launcher's critical path inspects enabled packs and reuses cached
+    // cards, but never walks every inactive archive or directory.
+    ScanLibrary(true, false);
+}
+
+void request_background_refresh() {
+    bool expected = false;
+    if (!g_background_refresh_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (g_background_refresh.joinable()) g_background_refresh.join();
+    g_background_refresh = std::jthread([](std::stop_token stop_token) {
+        ScanLibrary(false, false, stop_token);
+    });
+}
+
+void refresh() {
+    g_background_refresh.request_stop();
+    if (g_background_refresh.joinable()) g_background_refresh.join();
+    g_background_refresh_started.store(true, std::memory_order_release);
+    ScanLibrary(false, true);
 }
 
 std::vector<PackInfo> snapshot(bool include_hidden) {

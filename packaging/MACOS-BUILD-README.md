@@ -1,4 +1,4 @@
-# DKR-R 1.0.1 macOS build handoff
+# DKR-R 1.0.2 macOS build handoff
 
 The source/build kit contains no ROM or extracted game assets. On an Apple host
 with Xcode command-line tools, CMake and Ninja, run:

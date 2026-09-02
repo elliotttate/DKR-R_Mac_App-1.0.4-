@@ -7,6 +7,7 @@
 #include "runtime_netplay.hpp"
 #include "runtime_telemetry.hpp"
 #include "runtime_texture_packs.hpp"
+#include "startup_performance.hpp"
 #include "vi_presentation_policy.hpp"
 #include "runtime_platform.hpp"
 #include "runtime_ui.hpp"
@@ -281,6 +282,8 @@ dkr::runtime::RT64Renderer::RT64Renderer(
     std::uint8_t* rdram,
     ultramodern::renderer::WindowHandle window_handle,
     bool developer_mode) {
+    const auto renderer_started_at =
+        dkr::runtime::startup_performance::Clock::now();
     // RT64Renderer can be created more than once while the DKR-R process and
     // launcher window remain alive. These bridge buffers emulate N64 graphics
     // hardware registers and therefore belong to a game session, even though
@@ -341,6 +344,8 @@ dkr::runtime::RT64Renderer::RT64Renderer(
         static_cast<std::uint32_t>(
             dkr::runtime::enhancements::anisotropy_level()));
     const auto create_application = [&] {
+        const auto application_started_at =
+            dkr::runtime::startup_performance::Clock::now();
         application_ = std::make_unique<RT64::Application>(core, application_config);
         ApplyConfig(*application_, config);
         application_->userConfig.developerMode = developer_mode;
@@ -359,6 +364,8 @@ dkr::runtime::RT64Renderer::RT64Renderer(
         // frame. PresentEarly follows the current VI buffer and remains valid both
         // before and after RT64 enables interpolation for that framebuffer.
         application_->enhancementConfig.presentation.mode = PresentationMode();
+        dkr::runtime::startup_performance::report(
+            "rt64-application-create", application_started_at);
     };
     create_application();
     // DKR presents directly from its alternating rendered color buffers.
@@ -370,7 +377,10 @@ dkr::runtime::RT64Renderer::RT64Renderer(
 #if defined(_WIN32)
     thread_id = window_handle.thread_id;
 #endif
+    auto setup_started_at = dkr::runtime::startup_performance::Clock::now();
     setup_result = MapSetupResult(application_->setup(thread_id));
+    dkr::runtime::startup_performance::report("rt64-setup",
+                                               setup_started_at);
     chosen_api = MapGraphicsAPI(application_->chosenGraphicsAPI);
     if (setup_result != ultramodern::renderer::SetupResult::Success &&
         config.api_option != ultramodern::renderer::GraphicsApi::Auto) {
@@ -385,7 +395,10 @@ dkr::runtime::RT64Renderer::RT64Renderer(
         application_.reset();
         config.api_option = ultramodern::renderer::GraphicsApi::Auto;
         create_application();
+        setup_started_at = dkr::runtime::startup_performance::Clock::now();
         setup_result = MapSetupResult(application_->setup(thread_id));
+        dkr::runtime::startup_performance::report("rt64-setup-fallback",
+                                                   setup_started_at);
         chosen_api = MapGraphicsAPI(application_->chosenGraphicsAPI);
         if (setup_result == ultramodern::renderer::SetupResult::Success) {
             dkr::runtime::ui::persist_graphics_api_fallback();
@@ -416,6 +429,8 @@ dkr::runtime::RT64Renderer::RT64Renderer(
         std::scoped_lock lock(g_active_renderer_mutex);
         g_active_renderer = this;
     }
+    dkr::runtime::startup_performance::report("renderer-ready",
+                                               renderer_started_at);
 }
 
 dkr::runtime::RT64Renderer::~RT64Renderer() {
@@ -540,6 +555,7 @@ void dkr::runtime::RT64Renderer::update_screen() {
     }
     ++present_count_;
     if (present_count_ == 1) {
+        dkr::runtime::startup_performance::mark("first-vi-received");
         std::fprintf(stderr, "[boot] VI initialized; starting recompiled DKR entrypoint\n");
         recomp::start_game(kGameId);
     }
@@ -551,6 +567,10 @@ void dkr::runtime::RT64Renderer::update_screen() {
     {
         CanonicalViPresentationScope vi_scope(*application_);
         application_->updateScreen();
+    }
+    if (present_count_ == 1) {
+        dkr::runtime::startup_performance::mark(
+            "first-game-frame-presented");
     }
     // Preserve DKR's proven VI/DP scheduling path exactly; constructing the
     // next overlay frame after the game present keeps UI work out of the

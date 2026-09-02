@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clone and verify the exact external revisions used by DKR-R 1.0.1."""
+"""Clone and verify the exact external revisions used by DKR-R 1.0.2."""
 from __future__ import annotations
 
 import argparse

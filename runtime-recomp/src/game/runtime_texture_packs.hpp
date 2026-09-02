@@ -49,6 +49,9 @@ struct ImportProgress {
 using ImportProgressCallback = std::function<bool(const ImportProgress&)>;
 
 void configure(const std::filesystem::path& config_directory);
+// Starts one non-blocking validation pass when the texture library is first
+// opened. Enabled packs are already validated synchronously by configure().
+void request_background_refresh();
 void refresh();
 // Monotonically increases whenever the library or its visible state changes.
 // UI code can use this cheap value to avoid copying and sorting an unchanged

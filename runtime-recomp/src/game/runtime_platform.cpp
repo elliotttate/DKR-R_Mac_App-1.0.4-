@@ -8,6 +8,7 @@
 #include "runtime_texture_packs.hpp"
 #include "runtime_enhancements.hpp"
 #include "runtime_netplay.hpp"
+#include "startup_performance.hpp"
 #include "runtime_telemetry.hpp"
 #include "sdl3_input_client.hpp"
 #include "ultramodern/ultramodern.hpp"
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -101,6 +103,16 @@ std::array<int, kControllerCount> g_sdl3_player_instances{-1, -1, -1, -1};
 std::array<int, kControllerCount> g_sdl3_gyro_instances{-1, -1, -1, -1};
 std::unordered_map<int, dkr::runtime::controllers::ControllerSnapshot>
     g_sdl3_previous_event_state;
+enum class Sdl3ProbeState : std::uint8_t {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+};
+std::atomic<Sdl3ProbeState> g_sdl3_probe_state{Sdl3ProbeState::Idle};
+std::mutex g_sdl3_probe_result_mutex;
+std::string g_sdl3_probe_error;
+std::jthread g_sdl3_probe_worker;
 std::string g_input_backend_detail = "Native SDL2 compatibility input.";
 bool g_sdl2_controller_subsystems_initialized = false;
 std::filesystem::path g_input_config_directory;
@@ -1026,30 +1038,24 @@ bool InitialiseSdl2ControllerBackend(bool subsystems_already_initialised) {
     return true;
 }
 
-bool StartSdl3InputBackend() {
+bool StartSdl3InputClient(std::string& error,
+                          std::stop_token stop_token = {}) {
 #if !DKR_RUNTIME_HAS_SDL3_INPUT_HOST
-    g_input_backend_detail = "This build does not contain the SDL3 input host.";
+    error = "This build does not contain the SDL3 input host.";
     return false;
 #else
     const std::filesystem::path host = RuntimeInputHostPath();
     const std::filesystem::path mappings = RuntimeAssetPath(
         "assets/controllers/gamecontrollerdb.txt");
     if (host.empty()) {
-        g_input_backend_detail =
-            "The private SDL3 input host was not found beside DKR-R.";
-        std::fprintf(stderr,
-                     "[boot][input] SDL3 native host unavailable: %s\n",
-                     g_input_backend_detail.c_str());
+        error = "The private SDL3 input host was not found beside DKR-R.";
         return false;
     }
-    std::string error;
-    if (!g_sdl3_input_client.start(host, mappings, error)) {
-        g_input_backend_detail = error;
-        std::fprintf(stderr,
-                     "[boot][input] SDL3 native host unavailable: %s\n",
-                     error.c_str());
-        return false;
-    }
+    return g_sdl3_input_client.start(host, mappings, error, stop_token);
+#endif
+}
+
+void ActivateStartedSdl3InputBackend(const char* prefix = nullptr) {
     {
         std::scoped_lock lock(g_platform_mutex);
         g_sdl3_input_state = g_sdl3_input_client.state();
@@ -1065,11 +1071,131 @@ bool StartSdl3InputBackend() {
     g_active_input_backend.store(
         dkr::runtime::platform::InputBackend::SDL3Native,
         std::memory_order_release);
-    g_input_backend_detail = g_sdl3_input_client.detail();
+    g_input_backend_detail = prefix != nullptr
+        ? std::string(prefix) + g_sdl3_input_client.detail()
+        : g_sdl3_input_client.detail();
     std::fprintf(stderr, "[boot][input] %s\n",
                  g_input_backend_detail.c_str());
+}
+
+bool StartSdl3InputBackend() {
+    std::string error;
+    if (!StartSdl3InputClient(error)) {
+        g_input_backend_detail = error;
+        std::fprintf(stderr,
+                     "[boot][input] SDL3 native host unavailable: %s\n",
+                     error.c_str());
+        return false;
+    }
+    ActivateStartedSdl3InputBackend();
+    return true;
+}
+
+void CancelSdl3InputProbe() {
+    if (g_sdl3_probe_worker.joinable()) {
+        g_sdl3_probe_worker.request_stop();
+        g_sdl3_probe_worker.join();
+    }
+    if (g_sdl3_probe_state.load(std::memory_order_acquire) ==
+        Sdl3ProbeState::Succeeded) {
+        g_sdl3_input_client.stop();
+    }
+    {
+        std::scoped_lock lock(g_sdl3_probe_result_mutex);
+        g_sdl3_probe_error.clear();
+    }
+    g_sdl3_probe_state.store(Sdl3ProbeState::Idle,
+                             std::memory_order_release);
+}
+
+bool BeginSdl3InputProbe() {
+#if !DKR_RUNTIME_HAS_SDL3_INPUT_HOST
+    g_input_backend_detail = "This build does not contain the SDL3 input host.";
+    return false;
+#else
+    if (g_sdl3_probe_state.load(std::memory_order_acquire) ==
+        Sdl3ProbeState::Running) {
+        return true;
+    }
+    if (g_sdl3_probe_worker.joinable()) g_sdl3_probe_worker.join();
+
+    const std::filesystem::path host = RuntimeInputHostPath();
+    if (host.empty()) {
+        g_input_backend_detail =
+            "The private SDL3 input host was not found beside DKR-R.";
+        return false;
+    }
+    const std::filesystem::path mappings = RuntimeAssetPath(
+        "assets/controllers/gamecontrollerdb.txt");
+    {
+        std::scoped_lock lock(g_sdl3_probe_result_mutex);
+        g_sdl3_probe_error.clear();
+    }
+    g_sdl3_probe_state.store(Sdl3ProbeState::Running,
+                             std::memory_order_release);
+    g_input_backend_switch_in_progress.store(true, std::memory_order_release);
+    g_input_backend_detail =
+        "SDL2 compatibility input is active while SDL3 initializes.";
+    g_sdl3_probe_worker = std::jthread(
+        [host, mappings](std::stop_token stop_token) {
+            dkr::runtime::startup_performance::ScopedPhase phase(
+                "SDL3 input host probe");
+            std::string error;
+            const bool started = g_sdl3_input_client.start(
+                host, mappings, error, stop_token);
+            {
+                std::scoped_lock lock(g_sdl3_probe_result_mutex);
+                g_sdl3_probe_error = std::move(error);
+            }
+            g_sdl3_probe_state.store(
+                started ? Sdl3ProbeState::Succeeded
+                        : Sdl3ProbeState::Failed,
+                std::memory_order_release);
+        });
     return true;
 #endif
+}
+
+void CompleteSdl3InputProbe() {
+    const Sdl3ProbeState state =
+        g_sdl3_probe_state.load(std::memory_order_acquire);
+    if (state == Sdl3ProbeState::Idle || state == Sdl3ProbeState::Running) {
+        return;
+    }
+    if (g_sdl3_probe_worker.joinable()) g_sdl3_probe_worker.join();
+
+    std::unique_lock transition_lock(g_input_backend_transition_mutex);
+    const auto target = dkr::runtime::platform::resolve_input_backend(
+        g_requested_input_backend.load(std::memory_order_acquire),
+        IsSteamDeckHost(), DKR_RUNTIME_HAS_SDL3_INPUT_HOST != 0);
+    if (state == Sdl3ProbeState::Succeeded &&
+        target == dkr::runtime::platform::InputBackend::SDL3Native) {
+        ClearPublishedControllerInput(true);
+        StopSdl2ControllerBackend();
+        ActivateStartedSdl3InputBackend("Live switch complete. ");
+        ClearPublishedControllerInput(true);
+        dkr::runtime::startup_performance::mark("SDL3 input active");
+    } else {
+        if (state == Sdl3ProbeState::Succeeded) {
+            g_sdl3_input_client.stop();
+        }
+        std::string error;
+        {
+            std::scoped_lock lock(g_sdl3_probe_result_mutex);
+            error = g_sdl3_probe_error;
+        }
+        if (state == Sdl3ProbeState::Failed &&
+            error != "SDL3 input initialization was cancelled.") {
+            if (error.empty()) error = "SDL3 input initialization failed.";
+            g_input_backend_detail = error +
+                " SDL2 compatibility fallback is active.";
+            std::fprintf(stderr, "[boot][input] %s\n",
+                         g_input_backend_detail.c_str());
+        }
+    }
+    g_sdl3_probe_state.store(Sdl3ProbeState::Idle,
+                             std::memory_order_release);
+    g_input_backend_switch_in_progress.store(false, std::memory_order_release);
 }
 
 void EnsureInputBackendHealthy() {
@@ -1105,7 +1231,7 @@ void EnsureInputBackendHealthy() {
 void ApplyPendingInputBackendSwitch() {
     if (!g_input_backend_switch_pending.load(std::memory_order_acquire)) return;
 
-    std::scoped_lock transition_lock(g_input_backend_transition_mutex);
+    std::unique_lock transition_lock(g_input_backend_transition_mutex);
     if (!g_input_backend_switch_pending.exchange(false,
                                                   std::memory_order_acq_rel)) {
         return;
@@ -1114,30 +1240,35 @@ void ApplyPendingInputBackendSwitch() {
         g_requested_input_backend.load(std::memory_order_acquire),
         IsSteamDeckHost(), DKR_RUNTIME_HAS_SDL3_INPUT_HOST != 0);
     const auto previous = g_active_input_backend.load(std::memory_order_acquire);
+    if (target == dkr::runtime::platform::InputBackend::SDL2Compatibility &&
+        g_sdl3_probe_state.load(std::memory_order_acquire) !=
+            Sdl3ProbeState::Idle) {
+        // Do not hold the transition mutex while joining the cancellable
+        // worker: it never touches controller state, but cancellation may
+        // briefly wait for a socket poll to finish.
+        transition_lock.unlock();
+        CancelSdl3InputProbe();
+        g_input_backend_switch_in_progress.store(false,
+                                                  std::memory_order_release);
+        return;
+    }
     if (target == previous) return;
 
-    g_input_backend_switch_in_progress.store(true, std::memory_order_release);
-    ClearPublishedControllerInput(true);
     bool switched = false;
     if (target == dkr::runtime::platform::InputBackend::SDL3Native) {
-        StopSdl2ControllerBackend();
-        switched = StartSdl3InputBackend();
-        if (!switched) {
-            const std::string activation_failure = g_input_backend_detail;
-            if (InitialiseSdl2ControllerBackend(false)) {
-                g_input_backend_detail = activation_failure +
-                    " The previous SDL2 backend was restored without "
-                    "restarting DKR-R.";
-            } else {
-                g_active_input_backend.store(
-                    dkr::runtime::platform::InputBackend::SDL2Compatibility,
-                    std::memory_order_release);
-                g_input_backend_detail = activation_failure +
-                    " SDL2 restoration also failed; controller input is "
-                    "currently unavailable.";
-            }
+        if (!BeginSdl3InputProbe()) {
+            g_input_backend_detail +=
+                " SDL2 compatibility input remains active.";
+            g_input_backend_switch_in_progress.store(
+                false, std::memory_order_release);
+            std::fprintf(stderr, "[input] %s\n",
+                         g_input_backend_detail.c_str());
         }
+        return;
     } else {
+        g_input_backend_switch_in_progress.store(true,
+                                                 std::memory_order_release);
+        ClearPublishedControllerInput(true);
         StopSdl3InputBackend();
         switched = InitialiseSdl2ControllerBackend(false);
         if (!switched) {
@@ -1246,6 +1377,8 @@ bool dkr::runtime::platform::input_backend_switch_pending() {
 
 bool dkr::runtime::platform::initialise() {
 #if DKR_RUNTIME_HAS_RT64
+    dkr::runtime::startup_performance::ScopedPhase platform_phase(
+        "SDL platform and input initialization");
     // Request SDL's direct HID paths before controller discovery. String
     // literals retain source compatibility with the bundled Windows SDL while
     // allowing newer Linux/SteamOS SDL builds to expose the built-in Deck pad.
@@ -1257,10 +1390,8 @@ bool dkr::runtime::platform::initialise() {
     // globally opting every controller into background gameplay.
     SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     const bool try_sdl3 = ShouldTrySdl3Input();
-    const Uint32 sdl_flags = try_sdl3
-        ? SDL_INIT_VIDEO | SDL_INIT_AUDIO
-        : SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER |
-              SDL_INIT_HAPTIC | SDL_INIT_SENSOR;
+    const Uint32 sdl_flags = SDL_INIT_VIDEO | SDL_INIT_AUDIO |
+        SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC | SDL_INIT_SENSOR;
     if (SDL_Init(sdl_flags) != 0) {
         std::fprintf(stderr, "[boot][platform] SDL initialization failed: %s\n", SDL_GetError());
         return false;
@@ -1274,19 +1405,15 @@ bool dkr::runtime::platform::initialise() {
     std::fprintf(stderr, "[boot][platform] SDL3 backend=%s\n",
                  sdl3_version != nullptr && *sdl3_version != '\0'
                      ? sdl3_version : "not reported");
-    if (try_sdl3) {
-        if (!StartSdl3InputBackend()) {
-            const std::string fallback_reason = g_input_backend_detail;
-            if (!InitialiseSdl2ControllerBackend(false)) {
-                SDL_Quit();
-                return false;
-            }
-            g_input_backend_detail = fallback_reason +
-                " SDL2 compatibility fallback is active.";
-        }
-    } else if (!InitialiseSdl2ControllerBackend(true)) {
+    if (!InitialiseSdl2ControllerBackend(true)) {
         SDL_Quit();
         return false;
+    }
+    if (try_sdl3 && !BeginSdl3InputProbe()) {
+        g_input_backend_detail +=
+            " SDL2 compatibility fallback is active.";
+        std::fprintf(stderr, "[boot][input] %s\n",
+                     g_input_backend_detail.c_str());
     }
 #endif
     std::fprintf(stderr,
@@ -1297,6 +1424,7 @@ bool dkr::runtime::platform::initialise() {
 
 void dkr::runtime::platform::shutdown() {
 #if DKR_RUNTIME_HAS_RT64
+    CancelSdl3InputProbe();
     g_sdl3_input_client.stop();
     std::scoped_lock lock(g_platform_mutex);
     if (g_cursor_hidden) {
@@ -1483,6 +1611,7 @@ void dkr::runtime::platform::pump_window_events(void*) {
 }
 
 void dkr::runtime::platform::pump_input_backend_events() {
+    CompleteSdl3InputProbe();
     ApplyPendingInputBackendSwitch();
     EnsureInputBackendHealthy();
     if (active_input_backend() != InputBackend::SDL3Native) return;

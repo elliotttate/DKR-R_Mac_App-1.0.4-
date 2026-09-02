@@ -1,4 +1,4 @@
-# Building DKR-R 1.0.1
+# Building DKR-R 1.0.2
 
 ## Requirements
 
@@ -62,7 +62,7 @@ runs the complete DKR-R CTest suite, executes the Controller Pak self-test,
 scans the staged package and creates:
 
 ```text
-dist/DKR-R-1.0.1-Windows-x64.zip
+dist/DKR-R-1.0.2-Windows-x64.zip
 ```
 
 ## Linux and AppImage
@@ -78,7 +78,7 @@ The build uses Vulkan through RT64, runs the complete DKR-R CTest suite and the
 packaged Controller Pak self-test, then creates:
 
 ```text
-dist/DKR-R-1.0.1-Linux-x86_64.AppImage
+dist/DKR-R-1.0.2-Linux-x86_64.AppImage
 ```
 
 An unpackaged Linux binary is not a complete release deliverable. Both Patch

@@ -9,7 +9,7 @@
 </p>
 
 
-DKR-R 1.0.1 is a cross-platform static recompilation of Diddy Kong Racing for
+DKR-R 1.0.2 is a cross-platform static recompilation of Diddy Kong Racing for
 Windows and Linux. It runs the original game from a locally selected, legally
 obtained US v1.0 or US Rev A/v1.1 Game Pak image; no ROM or extracted
 Nintendo/Rare assets are included.
@@ -92,8 +92,8 @@ a UDP port. There is no DKR-R account, gameplay backend or relay. See
 ## Release files
 
 ```text
-dist/DKR-R-1.0.1-Windows-x64.zip
-dist/DKR-R-1.0.1-Linux-x86_64.AppImage
+dist/DKR-R-1.0.2-Windows-x64.zip
+dist/DKR-R-1.0.2-Linux-x86_64.AppImage
 ```
 
 The Linux release is always distributed as an AppImage. macOS is supported by

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <stop_token>
 #include <thread>
 #include <utility>
 
@@ -102,18 +103,32 @@ bool ReceiveAll(NativeSocket socket, void* data, std::size_t size) {
     return true;
 }
 
-bool WaitReadable(NativeSocket socket, std::chrono::milliseconds timeout) {
-    fd_set readable;
-    FD_ZERO(&readable);
-    FD_SET(socket, &readable);
-    timeval value{};
-    value.tv_sec = static_cast<long>(timeout.count() / 1000);
-    value.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+bool WaitReadable(NativeSocket socket, std::chrono::milliseconds timeout,
+                  std::stop_token stop_token) {
+    constexpr auto kCancellationPoll = std::chrono::milliseconds(50);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!stop_token.stop_requested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        const auto slice = std::min(remaining, kCancellationPoll);
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(socket, &readable);
+        timeval value{};
+        value.tv_sec = static_cast<long>(slice.count() / 1000);
+        value.tv_usec = static_cast<long>((slice.count() % 1000) * 1000);
 #if defined(_WIN32)
-    return select(0, &readable, nullptr, nullptr, &value) > 0;
+        const int result = select(0, &readable, nullptr, nullptr, &value);
 #else
-    return select(socket + 1, &readable, nullptr, nullptr, &value) > 0;
+        const int result = select(socket + 1, &readable, nullptr, nullptr,
+                                  &value);
 #endif
+        if (result > 0) return true;
+        if (result < 0) return false;
+    }
+    return false;
 }
 
 std::array<std::uint8_t, kTokenBytes> RandomToken() {
@@ -355,7 +370,8 @@ dkr::runtime::sdl3_input::Client::~Client() {
 
 bool dkr::runtime::sdl3_input::Client::start(
     const std::filesystem::path& host,
-    const std::filesystem::path& mapping_database, std::string& error) {
+    const std::filesystem::path& mapping_database, std::string& error,
+    std::stop_token stop_token) {
     stop();
     if (!std::filesystem::is_regular_file(host)) {
         error = "SDL3 input host is missing: " + host.string();
@@ -402,8 +418,10 @@ bool dkr::runtime::sdl3_input::Client::start(
         impl_->stop_socket_runtime();
         return false;
     }
-    if (!WaitReadable(listener, std::chrono::milliseconds(4000))) {
-        error = "The private SDL3 input host did not connect within four seconds.";
+    if (!WaitReadable(listener, std::chrono::milliseconds(4000), stop_token)) {
+        error = stop_token.stop_requested()
+            ? "SDL3 input initialization was cancelled."
+            : "The private SDL3 input host did not connect within four seconds.";
         CloseSocket(listener);
         impl_->reap_process(true);
         impl_->stop_socket_runtime();
@@ -419,8 +437,11 @@ bool dkr::runtime::sdl3_input::Client::start(
     }
     setsockopt(impl_->socket, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&enabled), sizeof(enabled));
-    if (!WaitReadable(impl_->socket, std::chrono::milliseconds(4000))) {
-        error = "The SDL3 input host did not finish initialization.";
+    if (!WaitReadable(impl_->socket, std::chrono::milliseconds(4000),
+                      stop_token)) {
+        error = stop_token.stop_requested()
+            ? "SDL3 input initialization was cancelled."
+            : "The SDL3 input host did not finish initialization.";
         stop();
         return false;
     }

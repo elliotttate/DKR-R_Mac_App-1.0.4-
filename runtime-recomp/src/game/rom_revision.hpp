@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <optional>
 
 namespace dkr::runtime::rom {
 
@@ -49,6 +50,12 @@ inline constexpr std::uint64_t kUsV77Xxh3 = 0x68512C37A6FDA951ULL;
 inline constexpr std::uint64_t kUsV80Xxh3 = 0xB55D4348B9AB07F5ULL;
 
 [[nodiscard]] Identity inspect(const std::filesystem::path& path);
+// Loads and maintains a metadata-keyed cache of identities that DKR-R has
+// already computed. A cache hit is advisory only: librecomp remains the final
+// authoritative ROM validator immediately before runtime start.
+void configure_identity_cache(const std::filesystem::path& config_directory);
+[[nodiscard]] std::optional<Identity> cached_identity(
+    const std::filesystem::path& path);
 // N64ModernRuntime accepts every standard ROM byte order, but revision
 // dispatch must not make the selected container format part of the runtime
 // path. Non-big-endian inputs are normalised once into DKR-R's local cache and

@@ -3551,9 +3551,19 @@ void DirectSession::end_authoritative_phase() {
     recovery_acks_ = {};
     recovery_resumed_ = false;
     recovery_resume_until_ = {};
-    transition_barrier_.reset();
-    last_transition_broadcast_ = {};
-    transition_resume_until_ = {};
+    // Keep Player 1's completed finish barrier alive for its existing Resume
+    // retransmission window. Race teardown follows the first Resume
+    // immediately, so clearing the barrier here cancelled the worker's retry
+    // path precisely when a delayed/lost datagram needed it most. The next
+    // authoritative phase resets this tombstone after advancing scene_epoch_.
+    const bool preserve_finish_resume =
+        is_host_ && transition_barrier_ && transition_barrier_->resumed &&
+        std::chrono::steady_clock::now() < transition_resume_until_;
+    if (!preserve_finish_resume) {
+        transition_barrier_.reset();
+        last_transition_broadcast_ = {};
+        transition_resume_until_ = {};
+    }
     gameplay_barrier_.reset();
     last_gameplay_barrier_broadcast_ = {};
     gameplay_resume_until_ = {};
@@ -5695,14 +5705,40 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
                 protocol::TransitionBarrierStage::Acknowledge ||
             transition.player_slot != peer->slot ||
             transition.scene_epoch != scene_epoch_) return;
-        if (!transition_barrier_ ||
-            transition_barrier_->frame != transition.frame ||
+        if (!transition_barrier_) {
+            // UDP may deliver a duplicate Acknowledge after a completed
+            // transition has already entered post-race teardown. It is stale,
+            // not evidence that the live race diverged.
+            if (authority_lifecycle_ != AuthorityLifecycle::SealingFinish) return;
+            fail_locked(
+                "A racer acknowledged a transition that Player 1 did not authorize.");
+            return;
+        }
+        if (transition_barrier_->frame != transition.frame ||
             transition_barrier_->kind != transition.transition_kind) {
+            // Once Resume has been issued, late/reordered acknowledgements are
+            // idempotent control traffic. Retain strict mismatch detection only
+            // while Player 1 is still sealing the active finish boundary.
+            if (authority_lifecycle_ != AuthorityLifecycle::SealingFinish ||
+                transition_barrier_->resumed) return;
             fail_locked(
                 "A racer acknowledged a transition that Player 1 did not authorize.");
             return;
         }
         transition_barrier_->acknowledgements[peer->slot] = true;
+        if (transition_barrier_->resumed) {
+            // A client repeats Acknowledge until it sees Resume. Answer that
+            // retry directly even after the normal broadcast grace window, so
+            // losing every initial Resume cannot strand it at race teardown.
+            send_to(peer->address, protocol::MessageType::TransitionBarrier,
+                    protocol::encode_transition_barrier({
+                        transition_barrier_->scene_epoch,
+                        transition_barrier_->frame,
+                        transition_barrier_->kind,
+                        local_slot_,
+                        protocol::TransitionBarrierStage::Resume}),
+                    transition_barrier_->frame);
+        }
         state_changed_.notify_all();
     } else if (packet.header.type == protocol::MessageType::Pong) {
         std::uint64_t token = 0U;
