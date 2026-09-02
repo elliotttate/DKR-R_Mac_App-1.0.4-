@@ -1,6 +1,13 @@
 # DKR-R — Diddy Kong Racing Recompiled
 
-<img width="860" height="860" alt="DKR-R8" src="https://github.com/user-attachments/assets/a02fbcce-12b5-4f0f-bd03-d3414da53d5a" />
+<img width="1774" height="887" alt="DKR-R Logo" src="https://github.com/user-attachments/assets/1c1211fc-27b7-4a4c-af01-5c20067928c2" />
+
+<p align="center">
+  <a href="https://discord.com/invite/AMWfXdBjNP">
+    <img src="https://img.shields.io/badge/JOIN%20OUR%20DISCORD-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord">
+  </a>
+</p>
+
 
 DKR-R 1.0.1 is a cross-platform static recompilation of Diddy Kong Racing for
 Windows and Linux. It runs the original game from a locally selected, legally
