@@ -18,7 +18,7 @@ Nintendo/Rare assets are included.
 
 - Accurate presentation: original 4:3 composition, 30 FPS cadence, audio,
   object detail and game behaviour.
-- Modern presentation: widescreen, interpolated high-refresh output, FOV,
+- Modern presentation: widescreen, interpolated unlocked FPS, FOV,
   extended scenery distance, maximum vehicle detail and anisotropic filtering.
 - Controller-first launcher and transparent in-game settings overlay.
 - Four independent local-player controller assignments and binding profiles,
@@ -30,17 +30,35 @@ Nintendo/Rare assets are included.
   modes, plus a global HUD-size control for Modern presentation.
 - Native virtual EEPROM and four independent Controller Paks, available
   alongside rumble on the same controllers.
-- Encrypted two-to-four-player five-character Quick Join, host-approved
-  admission, one-click invitations for authenticated friends, synchronized
-  start barriers, connection telemetry and deterministic replay logs.
-- A host-authoritative five-second online start countdown, plus native
-  JOINTVENTURE routing that preserves DKR's shared Adventure hub while giving
-  each online racer control when the game assigns them the lead.
 - A privacy-safe support summary with exportable settings/system information,
   optional diagnostic logging and optional crash dumps.
 
 Game simulation, race timers, AI, input polling and audio remain on the original
 timeline when Modern interpolation is enabled.
+
+## Version 1.0.1 highlights
+
+- Shadows and vehicle props have been fixed and no longer pop in and out, flicker or shrink on random frames.
+- Extended Controller compatibility! SDL2 and SDL3 compatible as well as native gyro support for the steamdeck. No longer need to use Steam Input for Gyro. 
+- Overlay and Launcher Overhaul with loads of new settings added!
+- 2 Player Online Multiplayer is now Included! 2P Adventure is also working as intended.
+  (Highly dependent on a stable internet connection for the best experience. Use the built in
+  Network Tester in the Lobby before starting your match to make sure the connection is good before playing)
+- An issue with Custom Texture Alignment has been fixed.
+- The Black bar that would appear at the bottom while using Expand to Window has been fixed.
+- Performance has been fixed in many areas.
+- You can now invert controls on a Per-vehicle basis. So if you want inverted controls for Planes only, you can!
+- Fixed an issue where users would experience a crash or black screen at un-predictable intervals. This was due to an Audio Overflow and has been fixed.
+- Encrypted two-player five-character Quick Join, host-approved
+  admission, one-click invitations for authenticated friends, synchronized
+  start barriers, connection telemetry and deterministic replay logs.
+- A host-authoritative five-second online start countdown, plus native
+  JOINTVENTURE routing that preserves DKR's shared Adventure hub while giving
+  each online racer control when the game assigns them the lead.
+
+## Version 1.0.2 highlights
+
+- Stability and Performance fixes. 
 
 ## Playing
 
@@ -118,12 +136,15 @@ The Linux build uses the already generated recompilation sources:
 Dependency revisions are pinned in `dependencies.lock.json`; all dependency
 changes are reproducible patches listed in `patches/manifest.json`.
 
-## Repository rules
+## Texture Pack
 
-Never edit dependency worktrees, `runtime-recomp/RecompiledFuncs`, or
-`runtime-recomp/RecompiledPatches` directly. DKR hooks belong in
-the versioned `runtime-recomp/dkr.us.v*.recomp-policy.json` files; dependency
-changes belong in the Patch Pipeline.
+For those of you looking for the DKR-R Community Texture pack. It can be found in our Discord Server here:
+
+<p align="center">
+  <a href="https://discord.com/invite/AMWfXdBjNP">
+    <img src="https://img.shields.io/badge/JOIN%20OUR%20DISCORD-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord">
+  </a>
+</p>
 
 Before distribution, run:
 
