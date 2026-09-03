@@ -3,7 +3,7 @@
 **Unofficial macOS build of [DKR-R](https://github.com/ThatGuyMcd/DKR-R) (Diddy
 Kong Racing Recompiled).** Signed and notarized by Apple, so it installs like
 any normal Mac app. This fork exists only to build DKR-R for macOS; all game
-credit belongs to the upstream project.
+credit belongs to the upstream project. This build was put together by Claude and tested by jt87.
 
 ### [Download the latest release](../../releases/latest)
 
@@ -12,7 +12,7 @@ credit belongs to the upstream project.
 | Requires | Apple Silicon Mac (M1 or newer), macOS 12 Monterey or later |
 | Also needs | Your own legally obtained Diddy Kong Racing US ROM |
 | Does **not** need | Homebrew, Xcode, or command-line tools |
-| ROM revisions | US v1.0 and US Rev A/v1.1, both built in |
+| ROM revisions | Both US v1.0 and US Rev A/v1.1 are supported |
 
 Download the `.zip`, unzip, drag **DKR-R.app** to Applications, and open it. On
 first launch macOS asks *"DKR-R is an app downloaded from the Internet"* — click
