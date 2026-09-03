@@ -38,6 +38,7 @@ std::atomic<bool> g_extended_culling_enabled{true};
 std::atomic<int> g_frustum_guard_percent{5};
 std::atomic<bool> g_fit_to_window_enabled{false};
 std::atomic<int> g_anisotropy_level{16};
+std::atomic<int> g_texture_lod_bias_hundredths{0};
 std::atomic<bool> g_multiplayer_race_music_enabled{true};
 
 const std::uint32_t& kBlockMusicChangeAddress =
@@ -318,6 +319,23 @@ void dkr::runtime::enhancements::set_anisotropy_level(int level) {
         }
     }
     g_anisotropy_level.store(closest, std::memory_order_release);
+}
+
+float dkr::runtime::enhancements::texture_lod_bias() {
+    return static_cast<float>(texture_lod_bias_hundredths()) / 100.0F;
+}
+
+float dkr::runtime::enhancements::effective_texture_lod_bias() {
+    return modern_presentation_enabled() ? texture_lod_bias() : 0.0F;
+}
+
+int dkr::runtime::enhancements::texture_lod_bias_hundredths() {
+    return g_texture_lod_bias_hundredths.load(std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_texture_lod_bias_hundredths(int bias) {
+    g_texture_lod_bias_hundredths.store(
+        clamp_texture_lod_bias_hundredths(bias), std::memory_order_release);
 }
 
 extern "C" void dkr_character_select_music_unblock(std::uint8_t* rdram,

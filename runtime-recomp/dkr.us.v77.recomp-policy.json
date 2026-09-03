@@ -135,6 +135,12 @@
       "reason": "Merge host rumble capability into the retail accessory bitfield after four-port virtual Controller Pak discovery, allowing Memory Pak storage and rumble to coexist without changing retail save logic."
     },
     {
+      "function": "get_si_device_status",
+      "beforeVram": "0x800758DC",
+      "text": "extern int dkr_virtual_pak_preferred_status(uint8_t*, recomp_context*); int dkr_pak_status = dkr_virtual_pak_preferred_status(rdram, ctx); if (dkr_pak_status >= 0) { ctx->r2 = dkr_pak_status; return; }",
+      "reason": "Prefer the enabled host-backed Memory Pak when DKR explicitly probes an accessory, preventing its rumble-first hardware probe from asking users to physically swap mutually exclusive N64 accessories while retaining the separate host rumble path."
+    },
+    {
       "function": "rand_range",
       "beforeVram": "0x8006F94C",
       "text": "extern int dkr_netplay_presentation_random_range(uint8_t*, recomp_context*); if (dkr_netplay_presentation_random_range(rdram, ctx)) { return; }",

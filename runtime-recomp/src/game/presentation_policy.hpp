@@ -11,6 +11,8 @@ enum class PresentationProfile : std::uint8_t {
 
 inline constexpr int kMinimumPresentationRate = 30;
 inline constexpr int kMaximumPresentationRate = 500;
+inline constexpr int kMinimumTextureLodBiasHundredths = -200;
+inline constexpr int kMaximumTextureLodBiasHundredths = 200;
 inline constexpr int kCurrentSettingsVersion = 9;
 inline constexpr int kOldestCompatibleSettingsVersion = 6;
 
@@ -31,6 +33,14 @@ constexpr int clamp_presentation_rate(int rate) {
         : rate > kMaximumPresentationRate
             ? kMaximumPresentationRate
             : rate;
+}
+
+constexpr int clamp_texture_lod_bias_hundredths(int bias) {
+    return bias < kMinimumTextureLodBiasHundredths
+        ? kMinimumTextureLodBiasHundredths
+        : bias > kMaximumTextureLodBiasHundredths
+            ? kMaximumTextureLodBiasHundredths
+            : bias;
 }
 
 constexpr bool maximum_detail_effective(PresentationProfile profile,

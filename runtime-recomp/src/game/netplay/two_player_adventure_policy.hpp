@@ -6,6 +6,15 @@
 
 namespace dkr::runtime::netplay {
 
+inline constexpr int kDefaultRaceType = 0;
+inline constexpr int kHubWorldRaceType = 5;
+inline constexpr int kCutsceneRaceType1 = 6;
+inline constexpr int kCutsceneRaceType2 = 7;
+inline constexpr int kBossRaceType = 8;
+inline constexpr int kChallengeRaceTypeMask = 0x40;
+inline constexpr std::uint32_t kTwoPlayerAdventureRaceRacerCount = 6U;
+inline constexpr std::uint32_t kTwoPlayerAdventureChallengeRacerCount = 4U;
+
 // DKR's JOINTVENTURE mode uses one visible overworld racer and swaps the
 // retail controller-ID table when Player 2 becomes the lead. Online play must
 // keep its authored Player 1/Player 2 slots stable and let the retail mapping
@@ -50,17 +59,75 @@ inline constexpr bool two_player_adventure_accepts_assigned_input(
 }
 
 // JOINTVENTURE deliberately exposes one overworld racer even though two
-// network players remain assigned. Treat only that exact topology as a valid
-// synchronized gameplay scene. Races, bosses and minigames still have to pass
-// the ordinary multi-racer readiness check, so this exception cannot conceal
-// an incomplete two-player track load.
+// network players remain assigned. Limit this exception to a resolved hub
+// scene so it cannot conceal an incomplete race, boss, challenge or minigame.
 inline constexpr bool two_player_adventure_shared_hub_topology_ready(
     bool online_running, bool assigned_ports_released,
-    bool two_player_adventure, std::uint32_t active_players,
-    std::uint32_t racer_count, std::uint8_t expected_players) {
+    bool two_player_adventure, int requested_race_type,
+    int resolved_race_type,
+    std::uint32_t active_players, std::uint32_t racer_count,
+    std::uint8_t expected_players) {
+    const bool hub_scene = resolved_race_type == kHubWorldRaceType ||
+                           resolved_race_type == kCutsceneRaceType1 ||
+                           resolved_race_type == kCutsceneRaceType2;
     return online_running && assigned_ports_released &&
-           two_player_adventure && expected_players == 2U &&
+           two_player_adventure &&
+           requested_race_type == kHubWorldRaceType && hub_scene &&
+           expected_players == 2U &&
            active_players == 1U && racer_count >= 1U && racer_count <= 10U;
+}
+
+// JOINTVENTURE keeps the frontend's gNumberOfActivePlayers at one after the
+// file-select handoff. Retail promotes that value internally when loading a
+// normal race: get_active_player_count() exposes two humans and
+// track_setup_racers() creates six racers (or four for a challenge). This is a
+// distinct dual-control topology, not the shared-hub exception above. Admit
+// only an exact requested/resolved race-type match and the retail racer count,
+// so a partial load, boss introduction or unrelated cutscene cannot release
+// the two gameplay input lanes.
+inline constexpr bool two_player_adventure_dual_gameplay_topology_ready(
+    bool online_running, bool assigned_ports_released,
+    bool two_player_adventure, int requested_race_type,
+    int resolved_race_type, std::uint32_t active_players,
+    std::uint32_t racer_count, std::uint8_t expected_players) {
+    if (!online_running || !assigned_ports_released ||
+        !two_player_adventure || expected_players != 2U ||
+        active_players != 1U || requested_race_type < 0 ||
+        requested_race_type != resolved_race_type) {
+        return false;
+    }
+    if (resolved_race_type == kDefaultRaceType) {
+        return racer_count == kTwoPlayerAdventureRaceRacerCount;
+    }
+    return (resolved_race_type & kChallengeRaceTypeMask) != 0 &&
+           racer_count == kTwoPlayerAdventureChallengeRacerCount;
+}
+
+// Boss races intentionally remain a one-viewport scene in two-player
+// Adventure: retail creates one human racer plus the boss, then uses its own
+// controller-ID table to select which network player's stable input slot owns
+// the human. A genuine boss request may first resolve to a retail introduction
+// cutscene, whose temporary roster is scene-authored; the actual boss arena
+// must still expose exactly the one-human/two-racer topology. The requested
+// type prevents either exception from admitting Tracks mode or an unrelated
+// Adventure cutscene.
+inline constexpr bool two_player_adventure_boss_topology_ready(
+    bool online_running, bool assigned_ports_released,
+    bool two_player_adventure, int requested_race_type,
+    int resolved_race_type, std::uint32_t active_players,
+    std::uint32_t racer_count, std::uint8_t expected_players) {
+    if (!online_running || !assigned_ports_released ||
+        !two_player_adventure || requested_race_type != kBossRaceType ||
+        expected_players != 2U || active_players != 1U) {
+        return false;
+    }
+    if (resolved_race_type == kBossRaceType) {
+        return racer_count == 2U;
+    }
+    const bool boss_introduction =
+        resolved_race_type == kCutsceneRaceType1 ||
+        resolved_race_type == kCutsceneRaceType2;
+    return boss_introduction && racer_count >= 1U && racer_count <= 10U;
 }
 
 // On a brand-new save the first shared-hub load can finish before retail has
@@ -70,12 +137,16 @@ inline constexpr bool two_player_adventure_shared_hub_topology_ready(
 // masking an incomplete race, boss, challenge, or minigame roster.
 inline constexpr bool two_player_adventure_bootstrap_hub_topology_ready(
     bool online_running, bool assigned_ports_released,
-    bool jointventure_selected, int race_type,
+    bool jointventure_selected, int requested_race_type,
+    int resolved_race_type,
     std::uint32_t active_players, std::uint32_t racer_count,
     std::uint8_t expected_players) {
-    constexpr int kHubWorldRaceType = 5;
+    const bool hub_scene = resolved_race_type == kHubWorldRaceType ||
+                           resolved_race_type == kCutsceneRaceType1 ||
+                           resolved_race_type == kCutsceneRaceType2;
     return online_running && assigned_ports_released &&
-           jointventure_selected && race_type == kHubWorldRaceType &&
+           jointventure_selected &&
+           requested_race_type == kHubWorldRaceType && hub_scene &&
            expected_players == 2U && active_players == 1U &&
            racer_count >= 1U && racer_count <= 10U;
 }

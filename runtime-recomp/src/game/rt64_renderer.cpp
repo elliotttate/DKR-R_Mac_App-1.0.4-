@@ -343,6 +343,13 @@ dkr::runtime::RT64Renderer::RT64Renderer(
     RT64::setDefaultSamplerAnisotropy(
         static_cast<std::uint32_t>(
             dkr::runtime::enhancements::anisotropy_level()));
+    const float texture_lod_bias =
+        dkr::runtime::enhancements::effective_texture_lod_bias();
+    RT64::setDefaultSamplerMipLODBias(texture_lod_bias);
+    std::fprintf(stderr,
+                 "[boot][graphics] texture_lod_bias=%+.2f anisotropy=%d\n",
+                 static_cast<double>(texture_lod_bias),
+                 dkr::runtime::enhancements::anisotropy_level());
     const auto create_application = [&] {
         const auto application_started_at =
             dkr::runtime::startup_performance::Clock::now();

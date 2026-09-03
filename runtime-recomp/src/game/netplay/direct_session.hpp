@@ -110,6 +110,10 @@ struct SessionView {
     std::uint64_t commit_repair_requests_received = 0U;
     std::uint64_t commit_repair_batches_sent = 0U;
     std::uint64_t late_inputs_discarded = 0U;
+    std::uint64_t live_replica_requests_sent = 0U;
+    std::uint64_t live_replica_request_misses = 0U;
+    std::uint64_t live_replica_window_rejections = 0U;
+    std::uint64_t live_replica_decode_failures = 0U;
     bool recovering = false;
     std::uint32_t local_input_submitted_frame = 0U;
     PackedInput local_input_submitted{};
@@ -311,11 +315,14 @@ public:
         std::uint32_t& state_frame, std::vector<std::uint8_t>& state,
         std::string& error);
     void begin_authoritative_phase();
-    bool wait_gameplay_ready(std::uint32_t map, std::uint32_t racer_count,
+    bool wait_gameplay_ready(std::uint32_t requested_map,
+                             std::uint32_t resolved_map,
+                             std::uint32_t racer_count,
                              std::chrono::milliseconds timeout,
                              std::string& error);
     SessionPollResult poll_gameplay_ready(
-        std::uint32_t map, std::uint32_t racer_count, std::string& error);
+        std::uint32_t requested_map, std::uint32_t resolved_map,
+        std::uint32_t racer_count, std::string& error);
     bool synchronize_gameplay_resume(std::uint32_t map,
                                      std::uint32_t racer_count,
                                      std::chrono::milliseconds timeout,
@@ -866,6 +873,11 @@ private:
         last_simulation_progress_datagram_{};
     std::uint64_t simulation_wake_generation_ = 1U;
     std::uint64_t late_inputs_discarded_ = 0U;
+    std::uint64_t live_replica_requests_sent_ = 0U;
+    std::uint64_t live_replica_request_misses_ = 0U;
+    std::uint64_t live_replica_window_rejections_ = 0U;
+    std::uint64_t live_replica_decode_failures_ = 0U;
+    mutable bool host_backpressure_active_ = false;
     mutable std::uint64_t host_backpressure_events_ = 0U;
     mutable std::uint32_t maximum_peer_frame_debt_ = 0U;
     mutable std::uint32_t recovering_peer_count_ = 0U;

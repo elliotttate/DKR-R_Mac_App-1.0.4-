@@ -108,6 +108,13 @@ int main() {
         if (live_replica_correction_due(frame)) ++corrections_per_second;
     }
     assert(corrections_per_second == 5U);
+    assert(kLiveReplicaRecoveryHistoryFrames == 48U);
+    assert(live_replica_oldest_retained_frame(20U) == 0U);
+    assert(live_replica_oldest_retained_frame(80U) == 32U);
+    assert(live_replica_within_recovery_window(100U, 52U));
+    assert(live_replica_within_recovery_window(100U, 148U));
+    assert(!live_replica_within_recovery_window(100U, 51U));
+    assert(!live_replica_within_recovery_window(100U, 149U));
 
     assert(rollback_replica_target_debt(0U, 0U, 5U) == 2U);
     assert(rollback_replica_target_debt(100U, 10U, 5U) == 4U);
@@ -184,12 +191,23 @@ int main() {
     assert(!host_backpressure_required(105U, 97U, 8U));
     assert(host_backpressure_required(106U, 97U, 8U));
     assert(!host_backpressure_required(0U, 0U, 8U));
+    assert(host_backpressure_release_limit(8U) == 5U);
+    assert(host_backpressure_release_limit(3U) == 2U);
     assert(effective_host_authority_lead_limit(
                SynchronizationMode::Lockstep, 8U) == 8U);
     assert(effective_host_authority_lead_limit(
-               SynchronizationMode::Rollback, 8U) == 96U);
+               SynchronizationMode::Rollback, 8U) == 8U);
     assert(effective_host_authority_lead_limit(
-               SynchronizationMode::Rollback, 24U) == 96U);
+               SynchronizationMode::Rollback, 24U) == 24U);
+    assert(host_authoritative_input_delay_frames(
+               0.0, 0.0, 0.0F, true) == 2U);
+    assert(host_authoritative_input_delay_frames(
+               0.0, 0.0, 0.0F, false) == 3U);
+    assert(host_authoritative_input_delay_frames(
+               100.0, 10.0, 0.0F, false) == 5U);
+    assert(host_authoritative_input_delay_frames(
+               500.0, 100.0, 15.0F, false) ==
+           kMaximumInputDelayFrames);
     assert(steady_commit_history_count(false) == 3U);
     assert(steady_commit_history_count(true) == 6U);
     assert(host_may_predict_input(false, SynchronizationMode::Lockstep));
@@ -254,37 +272,121 @@ int main() {
     assert(!two_player_adventure_accepts_assigned_input(
         TwoPlayerAdventurePhase::TransitionBarrier));
     assert(two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 1U, 1U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 1U, 10U, 2U));
+        true, true, true, kHubWorldRaceType, kCutsceneRaceType1,
+        1U, 10U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        false, true, true, 1U, 1U, 2U));
+        false, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, false, true, 1U, 1U, 2U));
+        true, false, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, true, false, 1U, 1U, 2U));
+        true, true, false, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 2U, 2U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        2U, 2U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 1U, 0U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 0U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 1U, 11U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 11U, 2U));
     assert(!two_player_adventure_shared_hub_topology_ready(
-        true, true, true, 1U, 1U, 3U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 3U));
+    assert(!two_player_adventure_shared_hub_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType,
+        1U, 2U, 2U));
+    // Retail deliberately leaves gNumberOfActivePlayers at one in
+    // JOINTVENTURE, then creates two human racers inside a six-racer normal
+    // race or a four-racer challenge. The v1.0.3 hub/boss split must retain
+    // this third topology or Player 2 never reaches the gameplay input phase.
+    assert(two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kDefaultRaceType, kDefaultRaceType,
+        1U, kTwoPlayerAdventureRaceRacerCount, 2U));
+    assert(two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, 64, 64,
+        1U, kTwoPlayerAdventureChallengeRacerCount, 2U));
+    assert(two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, 65, 65,
+        1U, kTwoPlayerAdventureChallengeRacerCount, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kDefaultRaceType, kDefaultRaceType,
+        1U, 2U, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, 64, 64,
+        1U, kTwoPlayerAdventureRaceRacerCount, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kDefaultRaceType, kCutsceneRaceType1,
+        1U, kTwoPlayerAdventureRaceRacerCount, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType,
+        1U, 2U, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, false, kDefaultRaceType, kDefaultRaceType,
+        1U, kTwoPlayerAdventureRaceRacerCount, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kDefaultRaceType, kDefaultRaceType,
+        2U, kTwoPlayerAdventureRaceRacerCount, 2U));
+    assert(!two_player_adventure_dual_gameplay_topology_ready(
+        true, true, true, kDefaultRaceType, kDefaultRaceType,
+        1U, kTwoPlayerAdventureRaceRacerCount, 3U));
+    assert(two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 1U, 2U, 2U));
+    assert(two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kCutsceneRaceType1,
+        1U, 8U, 2U));
+    assert(two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kCutsceneRaceType2,
+        1U, 1U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        false, true, true, kBossRaceType, kBossRaceType, 1U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, false, true, kBossRaceType, kBossRaceType, 1U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, false, kBossRaceType, kBossRaceType, 1U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 2U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 1U, 1U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 1U, 3U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 1U, 2U, 3U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kHubWorldRaceType, kBossRaceType, 1U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kHubWorldRaceType, 1U, 2U, 2U));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kCutsceneRaceType1,
+        1U, 11U, 2U));
     assert(two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 5, 1U, 1U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 5, 1U, 10U, 2U));
+        true, true, true, kHubWorldRaceType, kCutsceneRaceType2,
+        1U, 10U, 2U));
     assert(!two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, false, 5, 1U, 1U, 2U));
+        true, true, false, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 2U));
     assert(!two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 0, 1U, 1U, 2U));
+        true, true, true, 0, kHubWorldRaceType, 1U, 1U, 2U));
     assert(!two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 8, 1U, 1U, 2U));
+        true, true, true, kBossRaceType, kCutsceneRaceType1,
+        1U, 1U, 2U));
     assert(!two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 5, 2U, 2U, 2U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        2U, 2U, 2U));
     assert(!two_player_adventure_bootstrap_hub_topology_ready(
-        true, true, true, 5, 1U, 1U, 3U));
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType,
+        1U, 1U, 3U));
 
     // Player 1's coordinator is Boolean-owned and has no Gekko pointer. Both
     // coordinator implementations must therefore count as present, and only

@@ -453,6 +453,19 @@ extern "C" void osPfsIsPlug_recomp(std::uint8_t* rdram, recomp_context* context)
     context->r2 = kPfsOk;
 }
 
+extern "C" int dkr_virtual_pak_preferred_status(std::uint8_t*,
+                                                  recomp_context* context) {
+    const int channel = static_cast<int>(context->r4);
+    if (!PortEnabled(channel)) {
+        return dkr::runtime::pak::policy::kUseRetailAccessoryProbe;
+    }
+    VirtualPak* pak = nullptr;
+    const std::int32_t status = EnsureLoaded(channel, pak);
+    return dkr::runtime::pak::policy::preferred_memory_pak_status(
+        dkr::runtime::pak::enabled(), true,
+        status == kPfsOk && pak != nullptr);
+}
+
 extern "C" void osPfsInitPak_recomp(std::uint8_t* rdram, recomp_context* context) {
     const int channel = static_cast<int>(context->r6);
     VirtualPak* pak = nullptr;

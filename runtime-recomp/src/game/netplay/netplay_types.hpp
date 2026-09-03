@@ -32,6 +32,7 @@ namespace dkr::runtime::netplay {
 // disk read-back acknowledgement and an active-runtime save hash before frame
 // zero can be released.
 inline constexpr std::uint32_t kProtocolVersion = 43U;
+inline constexpr std::uint8_t kMaximumInputDelayFrames = 9U;
 inline constexpr std::size_t kMaximumPlayers = 4U;
 // Keep the four-slot wire/storage layout intact so three- and four-racer
 // sessions can be restored after their synchronization paths are qualified.

@@ -207,10 +207,26 @@ int main() {
     constexpr std::array<bool, 4> rumble{true, true, true, true};
     static_assert(pak::policy::rumble_port_mask(all, all, rumble) == 0x0FU);
     static_assert(pak::policy::combined_rumble_mask(
-                      0x01U, all, all, rumble) == 0x0FU);
+                      true, 0x01U, all, all, rumble) == 0x0FU);
+    static_assert(pak::policy::combined_rumble_mask(
+                      false, 0x0FU, all, all, rumble) == 0U);
     constexpr std::array<bool, 4> mixed_rumble{true, false, true, false};
     static_assert(pak::policy::rumble_port_mask(
                       all, all, mixed_rumble) == 0x05U);
+    static_assert(pak::policy::preferred_memory_pak_status(
+                      true, true, true) == pak::policy::kControllerPakGood);
+    static_assert(pak::policy::preferred_memory_pak_status(
+                      true, true, false) ==
+                  pak::policy::kControllerPakBadData);
+    static_assert(pak::policy::preferred_memory_pak_status(
+                      false, true, true) ==
+                  pak::policy::kUseRetailAccessoryProbe);
+    static_assert(pak::policy::preferred_memory_pak_status(
+                      true, false, true) ==
+                  pak::policy::kUseRetailAccessoryProbe);
+    static_assert(pak::policy::expose_rumble_pak(true, true));
+    static_assert(!pak::policy::expose_rumble_pak(false, true));
+    static_assert(!pak::policy::expose_rumble_pak(true, false));
     std::puts("[test][hud-layout-policy] PASS");
     return 0;
 }

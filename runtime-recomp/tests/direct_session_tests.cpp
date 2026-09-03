@@ -1135,7 +1135,7 @@ int main() {
             ready[index] = std::async(
                 std::launch::async, [&, index] {
                     return sessions[index]->wait_gameplay_ready(
-                        73U, 4U, std::chrono::seconds(3),
+                        73U, 73U, 4U, std::chrono::seconds(3),
                         ready_errors[index]);
                 });
         }
@@ -1364,12 +1364,13 @@ int main() {
         lockstep_client.begin_authoritative_phase();
         auto host_ready = std::async(std::launch::async, [&] {
             return lockstep_host.wait_gameplay_ready(
-                81U, 2U, std::chrono::seconds(2), lockstep_error);
+                81U, 81U, 2U, std::chrono::seconds(2), lockstep_error);
         });
         std::string client_ready_error;
         auto client_ready = std::async(std::launch::async, [&] {
             return lockstep_client.wait_gameplay_ready(
-                81U, 2U, std::chrono::seconds(2), client_ready_error);
+                81U, 81U, 2U, std::chrono::seconds(2),
+                client_ready_error);
         });
         assert(host_ready.get());
         assert(client_ready.get());
@@ -1559,16 +1560,20 @@ int main() {
     client.begin_authoritative_phase();
 
     // Gameplay simulation may not start from two independently constructed
-    // levels. Both peers park at the same scene, install Player 1's portable
+    // levels. A boss request can resolve to a separate introduction scene, so
+    // the handoff must retain the requested destination while the barrier uses
+    // the resolved scene. Both peers then install Player 1's portable
     // frame-zero state, acknowledge it, and only then receive Resume.
+    constexpr std::uint32_t resolved_boss_intro_map = 142U;
     std::string host_barrier_error;
     std::string client_barrier_error;
     auto host_ready = std::async(std::launch::async, [&] {
-        return host.wait_gameplay_ready(42U, 8U, std::chrono::seconds(2),
-                                        host_barrier_error);
+        return host.wait_gameplay_ready(
+            42U, resolved_boss_intro_map, 8U, std::chrono::seconds(2),
+            host_barrier_error);
     });
     auto client_ready = std::async(std::launch::async, [&] {
-        return client.wait_gameplay_ready(42U, 8U,
+        return client.wait_gameplay_ready(42U, resolved_boss_intro_map, 8U,
                                           std::chrono::seconds(2),
                                           client_barrier_error);
     });
@@ -1595,18 +1600,22 @@ int main() {
     assert(host.wait_authoritative_acknowledgements(
         0U, std::chrono::seconds(2)));
     assert(client_baseline.get());
-    assert(host.poll_gameplay_resume(42U, 8U, host_barrier_error) ==
+    assert(host.poll_gameplay_resume(resolved_boss_intro_map, 8U,
+                                     host_barrier_error) ==
            SessionPollResult::Pending);
     pump_pair(host, client, 20);
-    assert(client.poll_gameplay_resume(42U, 8U, client_barrier_error) ==
+    assert(client.poll_gameplay_resume(resolved_boss_intro_map, 8U,
+                                       client_barrier_error) ==
            SessionPollResult::Pending);
     // Receiving Arm is not enough: both authored threads remain parked until
     // Player 1 has received every Armed acknowledgement and broadcasts Go.
     pump_pair(host, client, 20);
-    assert(host.poll_gameplay_resume(42U, 8U, host_barrier_error) ==
+    assert(host.poll_gameplay_resume(resolved_boss_intro_map, 8U,
+                                     host_barrier_error) ==
            SessionPollResult::Ready);
     pump_pair(host, client, 20);
-    assert(client.poll_gameplay_resume(42U, 8U, client_barrier_error) ==
+    assert(client.poll_gameplay_resume(resolved_boss_intro_map, 8U,
+                                       client_barrier_error) ==
            SessionPollResult::Ready);
     std::uint32_t host_resume_frame = 0U;
     std::uint32_t client_resume_frame = 0U;
@@ -1676,13 +1685,12 @@ int main() {
         pump_pair(host, client, 4);
     }
     assert(DirectSessionTestAccess::forced_prediction_frames(host) > 0U);
-    // The completed-frame watermark is distinct from commit delivery. A
-    // rollback guest inside the retained replica/commit recovery window must
-    // recover independently instead of globally halving Player 1's cadence.
-    // A dead route still reaches the emergency ceiling and parks safely.
+    // The completed-frame watermark is distinct from commit delivery. Once a
+    // rollback guest reaches the measured lead ceiling, Player 1 must park;
+    // the old 96-frame exception allowed 3.2 seconds of permanent client debt.
     client.report_simulation_progress(host_resume_frame);
     pump_pair(host, client, 20);
-    assert(!host.host_should_backpressure(
+    assert(host.host_should_backpressure(
         host_resume_frame + prediction_burst_frames, 3U));
     assert(host.view().recovering_peer_count == 1U);
     assert(host.host_should_backpressure(host_resume_frame + 100U, 3U));
@@ -2179,11 +2187,13 @@ int main() {
     std::string second_client_ready_error;
     auto second_host_ready = std::async(std::launch::async, [&] {
         return host.wait_gameplay_ready(
-            91U, 8U, std::chrono::seconds(2), second_host_ready_error);
+            91U, 91U, 8U, std::chrono::seconds(2),
+            second_host_ready_error);
     });
     auto second_client_ready = std::async(std::launch::async, [&] {
         return client.wait_gameplay_ready(
-            91U, 8U, std::chrono::seconds(2), second_client_ready_error);
+            91U, 91U, 8U, std::chrono::seconds(2),
+            second_client_ready_error);
     });
     assert(second_host_ready.get());
     assert(second_client_ready.get());
@@ -2259,4 +2269,36 @@ int main() {
     }
     assert(host.running());
     assert(client.running());
+
+    // A requested boss destination is allowed to resolve to a different scene,
+    // but both peers must still agree on that resolved scene before either can
+    // install a baseline. Conflicting resolved maps fail closed rather than
+    // starting two different simulations.
+    const std::uint32_t mismatched_scene_frame =
+        DirectSessionTestAccess::next_commit_frame(host);
+    assert(mismatched_scene_frame ==
+           DirectSessionTestAccess::next_commit_frame(client));
+    assert(client.begin_gameplay_handoff(
+        mismatched_scene_frame, 123U, error));
+    assert(host.begin_gameplay_handoff(
+        mismatched_scene_frame, 123U, error));
+    pump_pair(host, client, 40);
+    host.begin_authoritative_phase();
+    client.begin_authoritative_phase();
+    std::string mismatched_host_error;
+    std::string mismatched_client_error;
+    auto mismatched_host = std::async(std::launch::async, [&] {
+        return host.wait_gameplay_ready(
+            123U, 223U, 2U, std::chrono::milliseconds(500),
+            mismatched_host_error);
+    });
+    auto mismatched_client = std::async(std::launch::async, [&] {
+        return client.wait_gameplay_ready(
+            123U, 224U, 2U, std::chrono::milliseconds(500),
+            mismatched_client_error);
+    });
+    assert(!mismatched_host.get());
+    assert(!mismatched_client.get());
+    assert(!mismatched_host_error.empty());
+    assert(!mismatched_client_error.empty());
 }

@@ -29,5 +29,26 @@ int main() {
     queue.push(Kind::LobbyInvite, "C", "three", start + 20s);
     assert(queue.size(start + 20s) == 2U);
     assert(queue.current(start + 20s)->title == "A");
+
+    FriendOnlineTransitionGate initially_online;
+    assert(!initially_online.update(true, start));
+    assert(!initially_online.update(false, start + 1s));
+    assert(!initially_online.update(true, start + 6s));
+    assert(!initially_online.update(true, start + 7s));
+
+    FriendOnlineTransitionGate genuine_return;
+    assert(!genuine_return.update(true, start));
+    assert(!genuine_return.update(false, start + 1s));
+    assert(!genuine_return.update(false, start + 8s));
+    assert(genuine_return.update(true, start + 12s));
+    assert(!genuine_return.update(true, start + 13s));
+
+    FriendOnlineTransitionGate initially_offline;
+    assert(!initially_offline.update(false, start));
+    assert(!initially_offline.update(true, start + 5s));
+
+    FriendOnlineTransitionGate delayed_first_return;
+    assert(!delayed_first_return.update(false, start));
+    assert(delayed_first_return.update(true, start + 11s));
     return 0;
 }

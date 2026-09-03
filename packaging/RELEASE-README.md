@@ -1,4 +1,4 @@
-# DKR-R 1.0.2
+# DKR-R 1.0.4
 
 DKR-R is a native static recompilation of Diddy Kong Racing. This package does
 not include the game ROM or extracted game assets. Supply your own legally

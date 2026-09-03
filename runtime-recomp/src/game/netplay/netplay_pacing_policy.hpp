@@ -3,6 +3,7 @@
 #include "netplay_types.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -133,6 +134,29 @@ inline constexpr FrameDebtSample measure_frame_debt(
 // simulation tick and prevents correction work from pacing heavy tracks.
 inline constexpr std::uint32_t kLiveReplicaCorrectionInterval = 6U;
 static_assert(kLiveReplicaCorrectionInterval != 0U);
+
+// The ordinary host lead is capped at 24 authored frames. Retain twice that
+// span of complete live states so a guest which reaches the pacing boundary
+// can always request a still-resident correction. This also covers a complete
+// 30-frame reliable keyframe interval without reopening the old multi-second
+// authority window.
+inline constexpr std::uint32_t kLiveReplicaRecoveryHistoryFrames = 48U;
+
+inline constexpr std::uint32_t live_replica_oldest_retained_frame(
+    std::uint32_t newest_frame) {
+    return newest_frame > kLiveReplicaRecoveryHistoryFrames
+        ? newest_frame - kLiveReplicaRecoveryHistoryFrames : 0U;
+}
+
+inline constexpr bool live_replica_within_recovery_window(
+    std::uint32_t next_client_frame, std::uint32_t replica_frame) {
+    return replica_frame >= live_replica_oldest_retained_frame(
+                                next_client_frame) &&
+           (next_client_frame >
+                    UINT32_MAX - kLiveReplicaRecoveryHistoryFrames ||
+            replica_frame <= next_client_frame +
+                                 kLiveReplicaRecoveryHistoryFrames);
+}
 
 // Installing a replica one frame ahead costs more than it recovers and can
 // make harmless packet jitter visible. Two authored frames is the smallest
@@ -410,22 +434,50 @@ inline bool host_backpressure_required(
     return next_frame - peer_completed_frame > maximum_lead;
 }
 
-// Lockstep preserves its strict completed-frame watermark. Rollback guests
-// can atomically install recurring Player-1 replicas and verify every skipped
-// immutable commit, so ordinary client recovery must not globally halve the
-// host's simulation cadence. Retain a large emergency ceiling to keep a dead
-// route from consuming unbounded history while allowing roughly three seconds
-// for an unstable peer to catch up independently.
+// Once Player 1 reaches its hard lead limit, keep the soft hold active until
+// the guest has retired a small batch of commits. Releasing on the very first
+// progress acknowledgement creates an alternating run/park cadence; a
+// three-frame hysteresis window lets the existing 32-40 Hz guest catch-up
+// controller settle without changing DKR's fixed authored tick.
+inline constexpr std::uint32_t host_backpressure_release_limit(
+    std::uint32_t maximum_lead) {
+    constexpr std::uint32_t hysteresis_frames = 3U;
+    if (maximum_lead > hysteresis_frames) {
+        return maximum_lead - hysteresis_frames;
+    }
+    return maximum_lead > 1U ? maximum_lead - 1U : 0U;
+}
+
+// Both synchronization modes use the same immutable Player-1 timeline and the
+// production path does not rewind a committed frame. The measured ordinary
+// limit is therefore also the hard fairness limit in predictive mode. The old
+// 96-frame minimum explicitly allowed Player 1 to become 3.2 seconds ahead of
+// a guest and exceeded the live-replica recovery history.
 inline std::uint32_t effective_host_authority_lead_limit(
     SynchronizationMode mode, std::uint32_t ordinary_limit) {
-    if (mode != SynchronizationMode::Rollback) return ordinary_limit;
-    constexpr std::uint32_t minimum_recovery_window = 96U;
-    constexpr std::uint32_t maximum_recovery_window = 192U;
-    const std::uint32_t expanded = ordinary_limit >
-            maximum_recovery_window / 4U
-        ? maximum_recovery_window : ordinary_limit * 4U;
-    return (std::clamp)(expanded, minimum_recovery_window,
-                        maximum_recovery_window);
+    (void)mode;
+    return ordinary_limit;
+}
+
+// A guest samples against Player 1's newest received frame and then sends its
+// future input back to Player 1. Because committed predictions are immutable,
+// both predictive and lockstep sessions need runway for that complete feedback
+// RTT rather than the half-RTT budget used by genuine rollback. The result is
+// shared by every racer for the launch and cannot exceed protocol validation.
+inline std::uint8_t host_authoritative_input_delay_frames(
+    double p99_round_trip_ms, double burst_jitter_ms, float loss_percent,
+    bool local_network) {
+    const double bounded_rtt = (std::max)(0.0, p99_round_trip_ms);
+    const double bounded_jitter = (std::max)(0.0, burst_jitter_ms);
+    const double loss_headroom_ms =
+        (std::clamp)(static_cast<double>(loss_percent), 0.0, 15.0) * 2.0;
+    const double route_budget_ms = bounded_rtt +
+        bounded_jitter * 2.5 + loss_headroom_ms;
+    const int route_floor = local_network ? 2 : 3;
+    return static_cast<std::uint8_t>((std::clamp)(
+        static_cast<int>(std::ceil(
+            route_budget_ms / (1000.0 / 30.0))) + 1,
+        route_floor, static_cast<int>(kMaximumInputDelayFrames)));
 }
 
 // An unordered reliable authority stream may deliver overlapping batches in

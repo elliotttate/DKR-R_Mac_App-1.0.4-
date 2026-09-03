@@ -11,7 +11,7 @@ bool valid_launch_descriptor(const LaunchDescriptor& descriptor) {
     if (descriptor.match_id == 0U || descriptor.lobby_generation == 0U ||
         descriptor.compatibility_hash == 0U || descriptor.player_count < 2U ||
         descriptor.player_count > kSupportedOnlinePlayers ||
-        descriptor.input_delay_frames > 9U ||
+        descriptor.input_delay_frames > kMaximumInputDelayFrames ||
         descriptor.rollback_window > 20U ||
         descriptor.synchronization > SynchronizationMode::Lockstep ||
         (descriptor.synchronization == SynchronizationMode::Rollback &&
@@ -89,7 +89,7 @@ bool valid_room_name(std::string_view value) {
 
 bool valid_rules(const Rules& rules) {
     return rules.maximum_players == kSupportedOnlinePlayers &&
-           rules.manual_input_delay <= 9U &&
+           rules.manual_input_delay <= kMaximumInputDelayFrames &&
            rules.synchronization <= SynchronizationMode::Lockstep &&
            ((rules.synchronization == SynchronizationMode::Rollback &&
              rules.rollback_window >= 2U && rules.rollback_window <= 20U) ||

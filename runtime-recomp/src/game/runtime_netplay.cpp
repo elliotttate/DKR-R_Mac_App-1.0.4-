@@ -223,7 +223,9 @@ enum class GameplayStartStage : std::uint8_t {
 
 struct GameplayStartCoordinator {
     GameplayStartStage stage = GameplayStartStage::Idle;
-    std::uint32_t map = 0U;
+    std::optional<std::uint32_t> requested_map;
+    std::optional<int> requested_race_type;
+    std::uint32_t resolved_map = 0U;
     std::uint32_t racer_count = 0U;
     std::vector<std::uint8_t> local_baseline;
     std::vector<std::uint8_t> host_baseline;
@@ -232,7 +234,9 @@ struct GameplayStartCoordinator {
     bool active() const { return stage != GameplayStartStage::Idle; }
     void reset() {
         stage = GameplayStartStage::Idle;
-        map = 0U;
+        requested_map.reset();
+        requested_race_type.reset();
+        resolved_map = 0U;
         racer_count = 0U;
         local_baseline.clear();
         host_baseline.clear();
@@ -1078,6 +1082,17 @@ gpr call_payload_query(RecompiledEntrypoint function, std::uint8_t* rdram,
     return call.r2;
 }
 
+gpr call_payload_query_with_argument(RecompiledEntrypoint function,
+                                     std::uint8_t* rdram,
+                                     const recomp_context& source,
+                                     gpr argument) {
+    if (function == nullptr || rdram == nullptr) return 0;
+    recomp_context call = source;
+    call.r4 = argument;
+    function(rdram, &call);
+    return call.r2;
+}
+
 PackedInput poll_authored_local_input(const RuntimeSessionView& view) {
     if (view.launch_descriptor) {
         dkr::runtime::platform::set_online_input_routing(
@@ -1476,6 +1491,14 @@ void begin_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
     // before any track objects or racers are constructed, so frontend RNG use
     // cannot leak into the online simulation.
     const std::uint32_t level_id = static_cast<std::uint32_t>(context->r4);
+    g_gameplay_start.requested_map = level_id;
+    const GamePayload* payload = active_payload();
+    if (payload != nullptr && payload->leveltable_type != nullptr) {
+        g_gameplay_start.requested_race_type = static_cast<int>(
+            static_cast<std::int32_t>(call_payload_query_with_argument(
+                payload->leveltable_type, rdram, *context,
+                static_cast<gpr>(level_id))));
+    }
     if (g_session.running()) {
         std::string handoff_error;
         if (!g_session.begin_gameplay_handoff(
@@ -1520,6 +1543,7 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
         MEM_W(0, rdram_address(revision_addresses::NumberOfActivePlayers)));
     const std::uint32_t racer_count = static_cast<std::uint32_t>(
         MEM_W(0, rdram_address(revision_addresses::NumberOfRacers)));
+    const int race_type = current_level_race_type(rdram);
     const bool ordinary_gameplay_ready = determinism_race_ready(
         active_players, racer_count, descriptor->player_count);
     bool two_player_adventure = false;
@@ -1535,9 +1559,25 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
         two_player_adventure_shared_hub_topology_ready(
             g_session.running(),
             g_assigned_ports_released.load(std::memory_order_acquire),
-            two_player_adventure, active_players, racer_count,
+            two_player_adventure,
+            g_gameplay_start.requested_race_type.value_or(-1), race_type,
+            active_players, racer_count,
             descriptor->player_count);
-    const int race_type = current_level_race_type(rdram);
+    const bool dual_adventure_gameplay_ready =
+        two_player_adventure_dual_gameplay_topology_ready(
+            g_session.running(),
+            g_assigned_ports_released.load(std::memory_order_acquire),
+            two_player_adventure,
+            g_gameplay_start.requested_race_type.value_or(-1), race_type,
+            active_players, racer_count,
+            descriptor->player_count);
+    const bool boss_ready = two_player_adventure_boss_topology_ready(
+        g_session.running(),
+        g_assigned_ports_released.load(std::memory_order_acquire),
+        two_player_adventure,
+        g_gameplay_start.requested_race_type.value_or(-1), race_type,
+        active_players, racer_count,
+        descriptor->player_count);
     const bool jointventure_selected =
         magic_codes::magic_code_enabled(magic_codes::selected_mask(), 24U);
     const bool bootstrap_shared_hub_ready =
@@ -1545,14 +1585,18 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
         two_player_adventure_bootstrap_hub_topology_ready(
             g_session.running(),
             g_assigned_ports_released.load(std::memory_order_acquire),
-            jointventure_selected, race_type, active_players, racer_count,
+            jointventure_selected,
+            g_gameplay_start.requested_race_type.value_or(-1), race_type,
+            active_players, racer_count,
             descriptor->player_count);
     const bool shared_hub_ready = established_shared_hub_ready ||
                                   bootstrap_shared_hub_ready;
-    if (!ordinary_gameplay_ready && !shared_hub_ready) {
+    if (!ordinary_gameplay_ready && !shared_hub_ready &&
+        !dual_adventure_gameplay_ready && !boss_ready) {
         std::fprintf(stderr,
-                     "[netplay][determinism] gameplay validation remains disarmed: players=%u expected=%u racers=%u\n",
-                     active_players, descriptor->player_count, racer_count);
+                     "[netplay][determinism] gameplay validation remains disarmed: race_type=%d players=%u expected=%u racers=%u\n",
+                     race_type, active_players, descriptor->player_count,
+                     racer_count);
         return;
     }
     if (shared_hub_ready) {
@@ -1562,6 +1606,18 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
                      bootstrap_shared_hub_ready ? "fresh-save bootstrap"
                                                 : "retail state");
     }
+    if (dual_adventure_gameplay_ready) {
+        std::fprintf(stderr,
+                     "[netplay][jointventure] synchronized dual-control race ready: race_type=%d players=%u assigned=%u racers=%u\n",
+                     race_type, active_players, descriptor->player_count,
+                     racer_count);
+    }
+    if (boss_ready) {
+        std::fprintf(stderr,
+                     "[netplay][jointventure] synchronized single-viewport boss scene ready: race_type=%d players=%u assigned=%u racers=%u\n",
+                     race_type, active_players, descriptor->player_count,
+                     racer_count);
+    }
     // level_load_game has now created the racer roster and track simulation.
     // Begin a non-blocking barrier. The authored thread must return from this
     // hook immediately; sleeping here previously starved the renderer/audio
@@ -1569,13 +1625,25 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
     g_session.begin_authoritative_phase();
     g_frame_debt_phase.store(FrameDebtPhase::GameplayStartBarrier,
                              std::memory_order_release);
-    const std::uint32_t map = static_cast<std::uint32_t>(
+    const std::uint32_t resolved_map = static_cast<std::uint32_t>(
         MEM_W(0, rdram_address(revision_addresses::CurrentMapId)));
     constexpr std::uint32_t kGameplayBaselineFrame = 0U;
     std::string error;
+    const std::optional<std::uint32_t> requested_map =
+        g_gameplay_start.requested_map;
+    const std::optional<int> requested_race_type =
+        g_gameplay_start.requested_race_type;
+    if (!requested_map) {
+        g_session.fail_authoritative_state(
+            "The synchronized track-start gate lost its requested destination.");
+        halt_failed_simulation();
+        return;
+    }
     g_gameplay_start.reset();
     g_finish.reset();
-    g_gameplay_start.map = map;
+    g_gameplay_start.requested_map = requested_map;
+    g_gameplay_start.requested_race_type = requested_race_type;
+    g_gameplay_start.resolved_map = resolved_map;
     g_gameplay_start.racer_count = racer_count;
     g_gameplay_start.deadline = std::chrono::steady_clock::now() +
                                 std::chrono::seconds(45);
@@ -1623,7 +1691,9 @@ bool service_gameplay_start(std::uint8_t* rdram) {
     switch (g_gameplay_start.stage) {
     case GameplayStartStage::AwaitingPeers: {
         const SessionPollResult result = g_session.poll_gameplay_ready(
-            g_gameplay_start.map, g_gameplay_start.racer_count, error);
+            *g_gameplay_start.requested_map,
+            g_gameplay_start.resolved_map,
+            g_gameplay_start.racer_count, error);
         if (result == SessionPollResult::Failed) {
             fail(error.empty() ? "The synchronized track-start gate failed."
                                : error);
@@ -1699,7 +1769,8 @@ bool service_gameplay_start(std::uint8_t* rdram) {
     }
     case GameplayStartStage::AwaitingGo: {
         const SessionPollResult result = g_session.poll_gameplay_resume(
-            g_gameplay_start.map, g_gameplay_start.racer_count, error);
+            g_gameplay_start.resolved_map,
+            g_gameplay_start.racer_count, error);
         if (result == SessionPollResult::Failed) {
             fail(error.empty() ? "The synchronized track did not resume."
                                : error);

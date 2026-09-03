@@ -70,4 +70,44 @@ private:
     std::deque<Toast> toasts_;
 };
 
+// A friend route can be replaced while WebRTC renegotiates. Treating the
+// retiring route's close callback as a real offline event creates a false
+// offline -> online edge and repeatedly queues the same notification. Keep a
+// small second line of defence at the presentation boundary: a friend must
+// have been continuously observed offline before a later online edge is
+// eligible for a toast.
+class FriendOnlineTransitionGate {
+public:
+    explicit FriendOnlineTransitionGate(
+        std::chrono::steady_clock::duration minimum_offline =
+            std::chrono::seconds{10})
+        : minimum_offline_(minimum_offline) {}
+
+    bool update(bool online, std::chrono::steady_clock::time_point now) {
+        if (!seeded_) {
+            seeded_ = true;
+            online_ = online;
+            if (!online) offline_since_ = now;
+            return false;
+        }
+
+        if (!online) {
+            if (online_) offline_since_ = now;
+            online_ = false;
+            return false;
+        }
+
+        if (online_) return false;
+        const bool notify = now - offline_since_ >= minimum_offline_;
+        online_ = true;
+        return notify;
+    }
+
+private:
+    std::chrono::steady_clock::duration minimum_offline_{};
+    std::chrono::steady_clock::time_point offline_since_{};
+    bool seeded_ = false;
+    bool online_ = false;
+};
+
 } // namespace dkr::runtime::ui_notifications

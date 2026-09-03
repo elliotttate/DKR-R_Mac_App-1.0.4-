@@ -45,5 +45,9 @@ bool fit_to_window_enabled();
 void set_fit_to_window_enabled(bool enabled);
 int anisotropy_level();
 void set_anisotropy_level(int level);
+float texture_lod_bias();
+float effective_texture_lod_bias();
+int texture_lod_bias_hundredths();
+void set_texture_lod_bias_hundredths(int bias);
 
 } // namespace dkr::runtime::enhancements

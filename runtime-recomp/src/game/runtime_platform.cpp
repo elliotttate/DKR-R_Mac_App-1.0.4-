@@ -12,6 +12,7 @@
 #include "runtime_telemetry.hpp"
 #include "sdl3_input_client.hpp"
 #include "ultramodern/ultramodern.hpp"
+#include "virtual_pak_policy.hpp"
 
 #if DKR_RUNTIME_HAS_RT64
 #include "runtime_ui.hpp"
@@ -2439,6 +2440,9 @@ dkr::runtime::platform::get_connected_device_info(int controller) {
         return {ultramodern::input::Device::None, ultramodern::input::Pak::None};
     }
 #if DKR_RUNTIME_HAS_RT64
+    const bool expose_rumble =
+        dkr::runtime::pak::policy::expose_rumble_pak(
+            g_rumble_enabled.load(std::memory_order_acquire), true);
     const bool online_routing =
         g_online_input_routing.load(std::memory_order_acquire);
     if (dkr::runtime::netplay::online_port_occupied(
@@ -2448,7 +2452,8 @@ dkr::runtime::platform::get_connected_device_info(int controller) {
         // All peers must expose the same virtual N64 ports. Local physical
         // layout is deliberately irrelevant to game-side roster discovery.
         return {ultramodern::input::Device::Controller,
-                ultramodern::input::Pak::RumblePak};
+                expose_rumble ? ultramodern::input::Pak::RumblePak
+                              : ultramodern::input::Pak::None};
     }
     std::scoped_lock lock(g_platform_mutex);
     const bool has_gamepad = active_input_backend() == InputBackend::SDL3Native
@@ -2462,8 +2467,10 @@ dkr::runtime::platform::get_connected_device_info(int controller) {
     return {has_gamepad || owns_keyboard
                 ? ultramodern::input::Device::Controller
                 : ultramodern::input::Device::None,
-            has_gamepad ? ultramodern::input::Pak::RumblePak
-                        : ultramodern::input::Pak::None};
+            dkr::runtime::pak::policy::expose_rumble_pak(
+                expose_rumble, has_gamepad)
+                ? ultramodern::input::Pak::RumblePak
+                : ultramodern::input::Pak::None};
 #else
     return {ultramodern::input::Device::Controller, ultramodern::input::Pak::None};
 #endif

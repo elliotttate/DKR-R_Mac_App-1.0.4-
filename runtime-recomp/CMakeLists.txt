@@ -22,7 +22,7 @@ endif()
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" DKR_RELEASE_VERSION_NUMERIC
        "${DKR_RELEASE_VERSION}")
 if(DKR_RELEASE_VERSION_NUMERIC STREQUAL "")
-    set(DKR_RELEASE_VERSION_NUMERIC "1.0.2")
+    set(DKR_RELEASE_VERSION_NUMERIC "1.0.4")
 endif()
 string(REGEX MATCH "-rc([0-9]+)$" DKR_RELEASE_RC_MATCH
        "${DKR_RELEASE_VERSION}")
@@ -1194,6 +1194,7 @@ if(BUILD_TESTING)
         DKRPresentationIdentityTests
         DKRInterpolationStatePolicyTests
         DKRRiceTexturePackPolicyTests
+        DKRUiNotificationPolicyTests
         DKRIntroTailPolicyTests
         DKRControllerAssignmentPolicyTests
         DKRInputBackendPolicyTests

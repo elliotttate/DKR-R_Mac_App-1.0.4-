@@ -183,6 +183,10 @@
         {
           "path": "patches/rt64/0014-inset-full-tile-texrect-sampling.patch",
           "sha256": "a19b0e286482980724c4375433f8d0da41e45306d78bd24bf0553f42c2472bb2"
+        },
+        {
+          "path": "patches/rt64/0015-configurable-default-mip-lod-bias.patch",
+          "sha256": "65147d7d07c257936f533767de3d7cc72eb78d08e385cbf3169da2cdc7c3c92c"
         }
       ]
     },

@@ -1124,13 +1124,28 @@ struct FriendService::Impl {
             const auto locked = weak.lock();
             if (!locked) return;
             std::scoped_lock lock(mutex);
-            if (locked->remote_public != secure::Key{}) {
-                const auto found = friends.find(identity_of(locked->remote_public));
-                if (found != friends.end()) {
-                    found->second.online = false;
-                    found->second.hosting = false;
-                    found->second.lobby_code.clear();
-                }
+            // create_peer installs a replacement before retiring the old
+            // route. The old channel's close callback must not take the
+            // replacement's authenticated presence offline.
+            const auto current = peers.find(locked->remote_id);
+            if (current == peers.end() || current->second != locked) return;
+
+            if (locked->remote_public == secure::Key{}) return;
+            const bool alternate_route_online = std::any_of(
+                peers.begin(), peers.end(), [&](const auto& entry) {
+                    const auto& candidate = entry.second;
+                    return candidate && candidate != locked &&
+                           candidate->authenticated &&
+                           candidate->remote_public == locked->remote_public &&
+                           candidate->channel && candidate->channel->isOpen();
+                });
+            if (alternate_route_online) return;
+
+            const auto found = friends.find(identity_of(locked->remote_public));
+            if (found != friends.end()) {
+                found->second.online = false;
+                found->second.hosting = false;
+                found->second.lobby_code.clear();
             }
         });
     }

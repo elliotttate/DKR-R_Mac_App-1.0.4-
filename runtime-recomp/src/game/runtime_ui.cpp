@@ -332,8 +332,9 @@ int g_friend_online_notification_position = 2;
 std::string g_friend_action_identity;
 bool g_friend_remove_pending = false;
 bool g_friend_block_pending = false;
-std::map<std::string, bool> g_friend_presence_snapshot;
-bool g_friend_presence_seeded = false;
+std::map<std::string,
+         dkr::runtime::ui_notifications::FriendOnlineTransitionGate>
+    g_friend_presence_notifications;
 dkr::runtime::ui_notifications::Queue g_online_notifications;
 std::set<std::uint64_t> g_seen_friend_lobby_invites;
 bool g_open_host_friend_invites = false;
@@ -1199,6 +1200,9 @@ void SaveSettings() {
         output << "modern_downsample=" << g_modern_downsample << '\n';
         output << "modern_anisotropy="
                << dkr::runtime::enhancements::anisotropy_level() << '\n';
+        output << "modern_texture_lod_bias_hundredths="
+               << dkr::runtime::enhancements::texture_lod_bias_hundredths()
+               << '\n';
         output << "fps_overlay_enabled=" << (g_fps_overlay_enabled ? 1 : 0) << '\n';
         output << "fps_overlay_position=" << g_fps_overlay_position << '\n';
         output << "fps_overlay_detail=" << g_fps_overlay_detail << '\n';
@@ -1711,6 +1715,9 @@ void LoadSettings() {
                     number, 0, kOnlineGuideVersion);
             } else if (key == "modern_anisotropy") {
                 dkr::runtime::enhancements::set_anisotropy_level(number);
+            } else if (key == "modern_texture_lod_bias_hundredths") {
+                dkr::runtime::enhancements::set_texture_lod_bias_hundredths(
+                    number);
             } else if (key == "fps_overlay_enabled") {
                 g_fps_overlay_enabled = number != 0;
             } else if (key == "fps_overlay_position") {
@@ -4235,7 +4242,7 @@ void DrawOnlineRaceRules(float width) {
         "HOST CONTROLS SHARED MENUS\0EVERY ASSIGNED PORT\0",
         std::min(width, 620.0F));
     ImGui::TextUnformatted("Maximum racers");
-    ImGui::TextColored(kAccent, "2 RACERS - BETA 8");
+    ImGui::TextColored(kAccent, "2 RACERS");
     ImGui::TextWrapped(
         "Three- and four-racer lobbies are temporarily unavailable while "
         "their synchronization paths are being qualified.");
@@ -5568,21 +5575,30 @@ void DrawHostFriendInvites(float width,
 
 void UpdateFriendPresenceNotification() {
     const auto racers = dkr::runtime::netplay::friend_service().friends();
-    std::map<std::string, bool> current;
+    const auto now = std::chrono::steady_clock::now();
+    std::set<std::string> current;
     for (const auto& racer : racers) {
-        current[racer.identity] = racer.online;
-        const auto previous = g_friend_presence_snapshot.find(racer.identity);
-        if (g_friend_presence_seeded && previous != g_friend_presence_snapshot.end() &&
-            !previous->second && racer.online && g_friend_online_notifications) {
+        current.insert(racer.identity);
+        auto [entry, inserted] =
+            g_friend_presence_notifications.try_emplace(racer.identity);
+        (void)inserted;
+        if (entry->second.update(racer.online, now) &&
+            g_friend_online_notifications) {
             g_online_notifications.push(
                 dkr::runtime::ui_notifications::Kind::FriendOnline,
                 "FRIEND ONLINE",
                 FriendDisplayLabel(racer) + " is online and ready to race.",
-                std::chrono::steady_clock::now());
+                now);
         }
     }
-    g_friend_presence_snapshot = std::move(current);
-    g_friend_presence_seeded = true;
+    for (auto iterator = g_friend_presence_notifications.begin();
+         iterator != g_friend_presence_notifications.end();) {
+        if (!current.contains(iterator->first)) {
+            iterator = g_friend_presence_notifications.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
 }
 
 void PumpFriendPresence() {
@@ -5821,7 +5837,7 @@ void DrawOnlinePage(float width, bool launcher, bool rom_ready) {
     using namespace dkr::runtime::netplay;
     DrawPageHeading("DKR-R ONLINE");
     ImGui::TextDisabled(
-        "Secure player-hosted racing for two players in Beta 10.");
+        "Secure player-hosted racing for two players.");
     ImGui::Dummy({0.0F, 12.0F});
     DrawOnlineGuideModal();
 
@@ -6317,6 +6333,20 @@ bool DrawGraphicsSettings(bool live) {
         }
         ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
         ImGui::TextWrapped("Improves angled track textures. Samplers are rebuilt on the next game launch.");
+        ImGui::PopStyleColor();
+        float lod_bias = dkr::runtime::enhancements::texture_lod_bias();
+        ImGui::TextUnformatted("Texture LOD bias");
+        ImGui::SetNextItemWidth(setting_width);
+        if (ControlSliderFloat("##texture-lod-bias", &lod_bias, -2.0F, 2.0F,
+                               "%+.2f", ImGuiSliderFlags_AlwaysClamp)) {
+            const int bias_hundredths = static_cast<int>(
+                std::lround(static_cast<double>(lod_bias) * 100.0));
+            dkr::runtime::enhancements::set_texture_lod_bias_hundredths(
+                bias_hundredths);
+            changed = true;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped("0.00 is the unbiased default. Negative values sharpen distant textures and may shimmer; positive values soften them. Applied on the next game launch.");
         ImGui::PopStyleColor();
         ImGui::TextUnformatted("High precision framebuffer");
         ImGui::SetNextItemWidth(setting_width);
@@ -6999,6 +7029,13 @@ void DrawNetworkOverlay() {
             static_cast<unsigned long long>(view.commit_repair_requests_received),
             static_cast<unsigned long long>(view.commit_repair_batches_sent),
             static_cast<unsigned long long>(view.late_inputs_discarded));
+        fields.emplace_back(buffer);
+        std::snprintf(buffer, sizeof(buffer),
+            "REPLICA REQUEST/MISS/WINDOW/DECODE %llu/%llu/%llu/%llu",
+            static_cast<unsigned long long>(view.live_replica_requests_sent),
+            static_cast<unsigned long long>(view.live_replica_request_misses),
+            static_cast<unsigned long long>(view.live_replica_window_rejections),
+            static_cast<unsigned long long>(view.live_replica_decode_failures));
         fields.emplace_back(buffer);
         std::snprintf(buffer, sizeof(buffer), "PACKETS %llu / %llu",
             static_cast<unsigned long long>(view.packets_sent),
@@ -9579,6 +9616,39 @@ void DrawControlsReference(bool live) {
         ImGui::GetContentRegionAvail().x - kControlsRightPadding, 1.0F);
     if (g_controls_section == 0) {
         DrawLocalPlayers();
+        ImGui::Dummy({0.0F, 12.0F});
+        ImGui::SeparatorText("CONTROLLER PAKS");
+        bool memory_pak = dkr::runtime::pak::enabled();
+        if (ImGui::Checkbox("Enable Mem Pak", &memory_pak)) {
+            dkr::runtime::pak::set_enabled(memory_pak);
+            SaveSettings();
+        }
+        bool rumble_pak = dkr::runtime::platform::rumble_enabled();
+        if (ImGui::Checkbox("Enable Rumble Pak", &rumble_pak)) {
+            dkr::runtime::platform::set_rumble_enabled(rumble_pak);
+            SaveSettings();
+        }
+        if (rumble_pak &&
+            dkr::runtime::enhancements::modern_options_visible(
+                dkr::runtime::enhancements::presentation_profile())) {
+            float rumble_percent =
+                dkr::runtime::platform::rumble_strength() * 100.0F;
+            ImGui::TextUnformatted("Rumble strength");
+            ImGui::SetNextItemWidth(available_width);
+            if (ControlSliderFloat("##rumble-strength", &rumble_percent,
+                                   0.0F, 100.0F, "%.0f%%",
+                                   ImGuiSliderFlags_AlwaysClamp)) {
+                dkr::runtime::platform::set_rumble_strength(
+                    rumble_percent / 100.0F);
+                SaveSettings();
+            }
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
+        ImGui::TextWrapped(
+            "Both options can remain enabled. DKR-R gives the virtual Mem Pak "
+            "priority whenever the game requests storage, while compatible "
+            "controllers can still rumble independently.");
+        ImGui::PopStyleColor();
     }
     if (g_controls_section == 1) {
     ImGui::TextUnformatted("DRIVER BINDINGS");
@@ -10220,33 +10290,6 @@ void DrawOverlayContent(float content_width) {
         DrawPageHeading("CONTROLS");
         ImGui::Separator();
         DrawControlsReference(true);
-        ImGui::Spacing();
-        ImGui::SeparatorText("Controller and Pak");
-        bool rumble = dkr::runtime::platform::rumble_enabled();
-        if (ImGui::Checkbox("Controller rumble", &rumble)) {
-            dkr::runtime::platform::set_rumble_enabled(rumble);
-            SaveSettings();
-        }
-        if (rumble && dkr::runtime::enhancements::modern_options_visible(
-                          dkr::runtime::enhancements::presentation_profile())) {
-            float rumble_percent = dkr::runtime::platform::rumble_strength() * 100.0F;
-            ImGui::TextUnformatted("Rumble strength");
-            ImGui::SetNextItemWidth(std::min(content_width, 720.0F));
-            if (ControlSliderFloat("##rumble-strength", &rumble_percent,
-                                   0.0F, 100.0F, "%.0f%%",
-                                   ImGuiSliderFlags_AlwaysClamp)) {
-                dkr::runtime::platform::set_rumble_strength(rumble_percent / 100.0F);
-                SaveSettings();
-            }
-        }
-        bool memory_pak = dkr::runtime::pak::enabled();
-        if (ImGui::Checkbox("Virtual Controller Paks", &memory_pak)) {
-            dkr::runtime::pak::set_enabled(memory_pak);
-            SaveSettings();
-        }
-        ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-        ImGui::TextWrapped("Creates a separate Controller Pak for every connected local racer while keeping rumble available at the same time. T.T. stores each Pak safely in your DKR-R settings folder with a recovery backup after every successful write.");
-        ImGui::PopStyleColor();
     } else if (g_overlay_page == kPageSaveManager) {
         DrawPageHeading("SAVE MANAGER");
         ImGui::TextDisabled("Save transfers are locked while the game owns the EEPROM.");

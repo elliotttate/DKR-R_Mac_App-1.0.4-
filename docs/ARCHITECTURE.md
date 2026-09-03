@@ -90,12 +90,12 @@ without requiring a user's physical pad to occupy that local index.
 
 Shared menu ownership is released by a revision-specific named hook at
 character select. Gameplay scenes enter a synchronized baseline barrier before
-simulation, and the rollback driver restores local deterministic checkpoints
-at the authored `main_game_loop` boundary when late input differs from a
-prediction. Historical replay suppresses graphics, audio, rumble, telemetry,
-save writes and lifecycle barriers. Portable host checkpoints remain the
-fail-safe recovery and finish-seal path; they exclude raw host pointers, audio,
-OS queues and renderer memory.
+simulation. The default predictive mode lets Player 1 commit hold-last input
+inside a measured, bounded lead window; a published commit is immutable and a
+late sample is diagnostic rather than a partial rewind. Guests install compact
+portable Player-1 replicas when real frame debt develops. Exact portable host
+checkpoints remain the fail-safe recovery and finish-seal path; they exclude raw
+host pointers, audio, OS queues and renderer memory.
 
 ## Preset boundary
 

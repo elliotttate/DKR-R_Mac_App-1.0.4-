@@ -1,4 +1,4 @@
-# Troubleshooting DKR-R 1.0.2
+# Troubleshooting DKR-R 1.0.4
 
 ## ROM rejected
 

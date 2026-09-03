@@ -70,12 +70,16 @@ ready controls, while detailed telemetry is isolated under **CONNECTION**.
 ### Two-player Adventure
 
 The `JOINTVENTURE` Magic Code keeps the retail game's shared-hub design: the
-hub intentionally has one viewport and one visible racer, while races, bosses
-and minigames use both gameplay slots. DKR-R observes which native player the
-game currently owns as the shared-hub lead and routes that online racer's
-authenticated input to the active local port. Online player identities never
+hub intentionally has one viewport and one visible racer. Standard races and
+minigames use both gameplay slots, but boss races retain the original game's
+single viewport, one human racer and one boss. DKR-R keeps both authenticated
+online input slots stable and lets the game's native controller-ID table select
+which player owns the shared hub or boss racer. Online player identities never
 swap. Inputs are neutralized across hub/race transition barriers, preventing a
-held direction or button from leaking into the newly assigned owner.
+held direction or button from leaking into the newly assigned owner. Boss
+introductions may resolve through a separate cutscene map; the synchronized
+handoff tracks that requested destination separately from the resolved scene
+used by the gameplay barrier.
 
 Quick Join codes expire after six hours and become useless when the host closes the
 lobby. **REKEY CODE** or **REVOKE AND REPLACE** invalidates the current admission capability immediately
@@ -139,47 +143,46 @@ WebRTC data channel protected by DTLS. Invalid, replayed, tampered or
 unapproved traffic is discarded.
 
 Ready, load and start state is repeated until observed. Automatic input delay
-derives a one-way route budget from the slowest measured guest, adds
-jitter/loss headroom, and freezes that value in the launch descriptor. Hosts
-may select zero-to-nine frames manually when automatic delay is unsuitable.
+derives the complete host-feedback round-trip budget from the slowest measured
+guest, adds jitter/loss headroom, and freezes that value in the launch
+descriptor. That full route matters because an already published Player-1
+commit is immutable. Automatic and manual values are both constrained to the
+same zero-to-nine-frame protocol range.
 
-Player 1 is the only race-state authority in both synchronization modes. After
-each authored 30 Hz gameplay update, Player 1 publishes a compact portable
-state for the next simulation boundary containing the simulation RNG, race
-lifecycle, roster and all racer physics/progress fields. A guest installs a
-complete sample only when it matches that guest's current authored boundary.
-The sample corrects local prediction without advancing the simulation clock.
+Player 1 is the only race-state authority in both synchronization modes. Five
+times per authored second, Player 1 publishes a compact portable state for a
+future simulation boundary containing the simulation RNG, race lifecycle,
+roster and racer/actor physics fields. A delayed guest installs the newest
+usable complete sample and then resumes the authenticated commit chain. The
+sample retires real frame debt without advancing DKR's 30 Hz authority clock.
 Graphics, audio and other presentation-only state remain local and are not
 copied across machines.
 
 The live state stream uses a bounded latest-frame-wins lane. A slow route
 cannot accumulate seconds of obsolete checkpoints; missing fragments are
-requested selectively from Player 1's short retained history. A damaged or
-late live sample is disposable and is superseded by a later host sample rather
-than halting or parking the game. Track start, synchronized recovery and finish
-remain separate reliable, exact barriers. At 30 simulation frames per second
-this is a few kilobytes per frame rather than an 8 MiB RDRAM or video stream,
-which keeps online play practical.
+requested selectively from a 48-frame retained history that covers twice the
+maximum 24-frame host lead. A damaged or late live sample is disposable and is
+superseded by a later host sample rather than halting the game. Track start,
+synchronized recovery and finish remain separate reliable, exact barriers.
 
 The host chooses one input synchronization mode before creating the lobby:
 
-- **Rollback** is the default and recommended internet mode. Player 1 may
-  predict missing remote input inside a bounded two-to-twenty-frame window.
-  When a late input differs, Player 1 restores its local checkpoint and
-  deterministically replays only the affected authored simulation frames, then
-  publishes the corrected live state. Replayed frames cannot submit graphics,
-  audio, rumble, telemetry or save-device writes; only the final corrected
-  frame is presented.
+- **Rollback** is the default user-facing internet mode. Its active production
+  coordinator is host-authoritative prediction: Player 1 may commit hold-last
+  input within the configured prediction runway, but the measured guest lead
+  remains hard-bounded to 8-24 frames. Player 1 parks briefly at that boundary
+  until the guest clears a three-frame hysteresis band. Late input never rewrites
+  an already published commit; live replicas and explicit shared recovery
+  repair the guest instead.
 - **Lockstep** waits for the authenticated input set selected by Player 1 before
   every simulation frame. It avoids prediction and replay but directly exposes
   latency and packet variation as input delay or stalls. It is intended for
   exceptionally stable, low-latency peer connections.
 
-The mode, input delay and rollback window are immutable launch rules and are
+The mode, input delay and prediction window are immutable launch rules and are
 validated by every peer. Gameplay packets use the existing per-peer encrypted
-channels. In rollback mode, GekkoNet packets are carried inside that channel
-and routed through the player-hosted lobby transport; no second socket, public
-service or unauthenticated data path is opened.
+channels. The retired GekkoNet coordinator is not on the production execution
+path; no second socket, public service or unauthenticated data path is opened.
 
 Before controller initialization, DKR-R installs the same four-port virtual
 controller topology on every peer. The host is always virtual Player 1 and each
@@ -200,9 +203,8 @@ worker remain responsive while another racer is loading. The host publishes
 one portable frame-zero gameplay state, waits for every occupied peer to
 install and acknowledge the exact bytes, and only then broadcasts the shared
 resume command. Race-finish and recovery barriers use the same non-blocking
-model. Rollback gameplay uses local checkpoints at the repeatable authored
-`main_game_loop` boundary. Host pointers and renderer/audio sidecars never
-enter the portable network state. Confirmed-state hashes remain diagnostic:
+model. Host pointers and renderer/audio sidecars never enter the portable
+network state. Confirmed-state hashes remain diagnostic:
 an ordinary racer/RNG difference is repaired by the next live Player 1 frame,
 while a guest that cannot install that stream requests the existing explicit
 shared recovery transaction.
@@ -223,23 +225,17 @@ be read and acknowledged. When recording is enabled, confirmed four-player
 inputs are written to `netplay/replays` below the local DKR-R configuration
 directory.
 
-Protocol 40 negotiates rollback or lockstep explicitly, carries the live
+Protocol 43 negotiates predictive rollback or lockstep explicitly, carries the live
 Player 1 replica stream, losslessly compresses portable authoritative state,
 supports Quick Join transport bootstrap and the synchronized launch countdown,
 and scopes gameplay packets
 to the active scene epoch. Delayed packets from a retired scene cannot enter
-the next one. Rollback is driven at
-the generated thread-3 call boundary before the ordinary `main_game_loop`
-call, so a replay returns normally through the same recompiled C++ stack; it
-does not jump out of an active native frame. Historical replay advances only
-deterministic simulation: physical input polling, renderer and audio task
-submission, live audio-buffer feedback, rumble, save writes, and gameplay
-lifecycle barriers remain suppressed until the final presented frame. The
-Online MP page reports the current rollback frame, correction count, replayed
-frames, largest correction and prediction lead for testing.
+the next one. The detailed network overlay reports frame debt, pacing, progress
+age, host holds, late inputs, commit repairs, and live-replica request/miss/
+window/decode counts for route diagnosis.
 
 Encrypted traffic is scheduled in independent lanes. Lifecycle and recovery
-control is reliable and bounded; authored input and rollback packets have a
+control is reliable and bounded; authored input and recovery packets have a
 dedicated real-time lane; recovery checkpoints have a separate non-evicting
 lane; and live replicas use a latest-frame-wins lane. State hashes and lobby
 telemetry cannot displace live racer input. Receive replay protection tracks

@@ -4,6 +4,7 @@
 
 using dkr::runtime::enhancements::PresentationProfile;
 using dkr::runtime::enhancements::clamp_presentation_rate;
+using dkr::runtime::enhancements::clamp_texture_lod_bias_hundredths;
 using dkr::runtime::enhancements::interpolation_allowed;
 using dkr::runtime::enhancements::interpolation_allowed_for_camera;
 using dkr::runtime::enhancements::is_finish_camera_mode;
@@ -24,6 +25,11 @@ static_assert(normalise_presentation_profile(2) == PresentationProfile::Accurate
 static_assert(clamp_presentation_rate(1) == 30);
 static_assert(clamp_presentation_rate(120) == 120);
 static_assert(clamp_presentation_rate(1000) == 500);
+static_assert(clamp_texture_lod_bias_hundredths(-201) == -200);
+static_assert(clamp_texture_lod_bias_hundredths(-125) == -125);
+static_assert(clamp_texture_lod_bias_hundredths(0) == 0);
+static_assert(clamp_texture_lod_bias_hundredths(175) == 175);
+static_assert(clamp_texture_lod_bias_hundredths(201) == 200);
 static_assert(!maximum_detail_effective(PresentationProfile::Accurate, true));
 static_assert(maximum_detail_effective(PresentationProfile::Modern, true));
 static_assert(!maximum_detail_effective(PresentationProfile::Modern, false));

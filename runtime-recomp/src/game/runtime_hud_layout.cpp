@@ -507,5 +507,6 @@ extern "C" void dkr_refresh_combined_accessories(std::uint8_t* rdram,
         0, RdramAddress(dkr::runtime::revision_addresses::RumblePresent));
     MEM_B(0, RdramAddress(dkr::runtime::revision_addresses::RumblePresent)) =
         dkr::runtime::pak::policy::combined_rumble_mask(
-            retail, assigned, connected, rumble_capable);
+            dkr::runtime::platform::rumble_enabled(), retail,
+            assigned, connected, rumble_capable);
 }
