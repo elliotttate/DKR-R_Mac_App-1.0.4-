@@ -1,3 +1,95 @@
+# DKR-R for macOS — Apple Silicon
+
+**Unofficial macOS build of [DKR-R](https://github.com/ThatGuyMcd/DKR-R) (Diddy
+Kong Racing Recompiled).** Signed and notarized by Apple, so it installs like
+any normal Mac app. This fork exists only to build DKR-R for macOS; all game
+credit belongs to the upstream project.
+
+### [Download the latest release](../../releases/latest)
+
+| | |
+|---|---|
+| Requires | Apple Silicon Mac (M1 or newer), macOS 12 Monterey or later |
+| Also needs | Your own legally obtained Diddy Kong Racing US ROM |
+| Does **not** need | Homebrew, Xcode, or command-line tools |
+| ROM revisions | US v1.0 and US Rev A/v1.1, both built in |
+
+Download the `.zip`, unzip, drag **DKR-R.app** to Applications, and open it. On
+first launch macOS asks *"DKR-R is an app downloaded from the Internet"* — click
+**Open**. Every notarized app asks this once. Full instructions are in the
+`README.md` attached to the release.
+
+Intel Macs cannot run this build.
+
+## Why this fork exists
+
+The DKR-R project releases Windows and Linux binaries. macOS ships as a source
+kit that had not been built to completion, so building it required fixes that
+are not in any upstream release:
+
+- **Build tooling** — the dependency patch script tested `.git` with `is_dir()`,
+  which is false for a git submodule, so N64Recomp's patches were silently
+  skipped and recompilation failed. The macOS prep script also expanded an empty
+  array under `set -u`, which the bash 3.2 that macOS ships rejects.
+- **Missing platform support** — `runtime_platform.cpp` had no `__APPLE__`
+  branch for the window handle. RT64 needs the `CAMetalLayer`, not the `NSView`,
+  and the layer has to be rebuilt at launcher handoff or the launcher's last
+  frame re-composites over the running game.
+- **Retina** — RT64 forces `PLUME_APPLE_RETINA_ENABLED` off on Apple, which
+  rendered the game at half resolution and drew the settings overlay at twice
+  its size.
+- **libc++ differences** — `__int128` file timestamps, and
+  `std::atomic<std::shared_ptr<T>>`, which libc++ does not implement.
+- **A latent bug on every platform** — a mutex locked after its own destruction
+  at `exit()`. Undefined behavior on Windows and Linux too; libc++ is just the
+  one that reports it.
+
+Four of these are upstream bugs and have been reported to the relevant projects.
+
+The full set is in [`macos-patches/`](macos-patches/) as a standalone series,
+and applied to the source in this fork. `scripts/Bundle-macOS-Redistributable.sh`
+vendors SDL into the app bundle so it runs without Homebrew.
+
+## Support
+
+**Please do not report problems with this build to the DKR-R project or their
+Discord** unless you can reproduce the same issue on an official Windows or
+Linux release. Bugs specific to macOS belong here.
+
+## Building it yourself
+
+```bash
+./Setup-macOS.sh
+./scripts/Prepare-DKR-Runtime-macOS.sh          # prompts for your ROM
+# re-apply the RT64 Retina patch, which dependency prep resets:
+(cd extern/rt64 && git apply ../../macos-patches/extern/rt64-enable-retina.patch)
+DKR_MAC_V80_GENERATED_SOURCE=<v80-generated-dir> ./Build-macOS.sh
+./scripts/Bundle-macOS-Redistributable.sh dist/*/DKR-R.app "Developer ID Application: ..."
+```
+
+`Build-macOS.sh` requires generated sources for **both** ROM revisions. The prep
+script produces the v1.0 (v77) payload; the Rev A (v80) payload is generated
+separately from a v1.1 ROM with `scripts/generate_recomp_config.py` and
+N64Recomp.
+
+## Licence
+
+This fork is MIT, matching upstream. The runtime links **GPL-3.0**
+N64ModernRuntime, so the distributed binary carries GPL-3.0 terms — the
+corresponding source for each release is this repository at the matching commit.
+See `LICENSE.md`, `THIRD_PARTY.md`, and `runtime-recomp/COPYING-NOTICE.md`.
+
+Not affiliated with, endorsed by, or supported by Nintendo or Rare. No
+copyrighted game data is included or distributed here.
+
+---
+
+# Upstream project README
+
+Everything below is the original DKR-R README, unchanged. Note that it describes
+the Windows and Linux releases; the download links and platform notes there do
+not apply to this macOS fork.
+
 # DKR-R — Diddy Kong Racing Recompiled
 
 <img width="1672" height="941" alt="bb1a4a71-c0c0-4803-a31e-377e8f4bbf35" src="https://github.com/user-attachments/assets/c913bee2-029c-4e29-9921-0f6abe7a3bf1" />
