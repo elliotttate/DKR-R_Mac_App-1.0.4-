@@ -1,0 +1,16 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -77,7 +77,12 @@
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+     set(PLUME_SDL_VULKAN_ENABLED TRUE)
+ elseif (APPLE)
+-    set(PLUME_APPLE_RETINA_ENABLED OFF)
++    # Plume defaults this ON for Apple; RT64 forced it OFF, which makes
++    # getScaleFactor() return 1.0 so every window dimension is computed in
++    # points. The swapchain then comes out at half the real drawable size, the
++    # game renders upscaled, and ImGui's DisplaySize*FramebufferScale viewport
++    # is twice the render target, drawing the overlay oversized and clipped.
++    set(PLUME_APPLE_RETINA_ENABLED ON)
+ endif()
+ 
+ add_subdirectory(src/contrib/plume)

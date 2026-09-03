@@ -1,0 +1,11 @@
+--- a/scripts/apply-dependency-patches.sh
++++ b/scripts/apply-dependency-patches.sh
+@@ -19,7 +19,7 @@
+ 
+ for dependency in data["dependencies"]:
+     repo = root / dependency["repositoryPath"]
+-    if not (repo / ".git").is_dir():
++    if not (repo / ".git").exists():  # submodules use a .git *file*, not a dir
+         print(f"[SKIP] {dependency['name']}: checkout not present at {repo}")
+         continue
+     commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()

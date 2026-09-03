@@ -1,0 +1,36 @@
+--- a/runtime-recomp/src/game/runtime_ui.cpp
++++ b/runtime-recomp/src/game/runtime_ui.cpp
+@@ -10798,6 +10798,33 @@
+ 
+         const auto launcher_ui_build_started =
+             std::chrono::steady_clock::now();
++#if defined(__APPLE__)
++        // On a Retina display SDL_Renderer's output is in pixels while ImGui
++        // emits vertices in points. Without a matching render scale the
++        // launcher draws at 1/backingScaleFactor into the top-left corner of
++        // the window and the pointer no longer lands on what is drawn.
++        // ImGui_ImplSDLRenderer2_RenderDrawData detects a non-unit renderer
++        // scale and defers the scaling to SDL, so setting it here is enough.
++        // Re-checked every frame so moving between displays is handled.
++        {
++            int renderer_output_width = 0;
++            int renderer_output_height = 0;
++            int window_point_width = 0;
++            int window_point_height = 0;
++            SDL_GetRendererOutputSize(renderer, &renderer_output_width,
++                                      &renderer_output_height);
++            SDL_GetWindowSize(window, &window_point_width, &window_point_height);
++            if (window_point_width > 0 && window_point_height > 0 &&
++                renderer_output_width > 0 && renderer_output_height > 0) {
++                SDL_RenderSetScale(
++                    renderer,
++                    static_cast<float>(renderer_output_width) /
++                        static_cast<float>(window_point_width),
++                    static_cast<float>(renderer_output_height) /
++                        static_cast<float>(window_point_height));
++            }
++        }
++#endif
+         ImGui_ImplSDLRenderer2_NewFrame();
+         ImGui_ImplSDL2_NewFrame();
+         dkr::runtime::platform::update_ui_gamepad_navigation();

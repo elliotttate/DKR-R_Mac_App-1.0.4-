@@ -1,0 +1,28 @@
+--- a/runtime-recomp/src/game/rom_revision.cpp
++++ b/runtime-recomp/src/game/rom_revision.cpp
+@@ -80,7 +80,7 @@
+     for (const auto& [key, entry] : g_identity_cache) {
+         if (!entry.stamp.valid || !entry.identity.supported()) continue;
+         output << std::quoted(key) << '\t' << entry.stamp.size << '\t'
+-               << entry.stamp.modified << '\t'
++               << static_cast<long long>(entry.stamp.modified) << '\t'
+                << static_cast<unsigned>(entry.identity.revision) << '\t'
+                << static_cast<unsigned>(entry.identity.byte_order) << '\t'
+                << entry.identity.canonical_xxh3 << '\t'
+@@ -263,12 +263,15 @@
+         unsigned revision = 0;
+         unsigned byte_order = 0;
+         unsigned header_revision = 0;
++        long long modified_raw = 0;
+         if (!(record >> std::quoted(key) >> entry.stamp.size >>
+-              entry.stamp.modified >> revision >> byte_order >>
++              modified_raw >> revision >> byte_order >>
+               entry.identity.canonical_xxh3 >> entry.identity.header_crc1 >>
+               entry.identity.header_crc2 >> header_revision)) {
+             continue;
+         }
++        entry.stamp.modified =
++            static_cast<std::filesystem::file_time_type::rep>(modified_raw);
+         if (revision < static_cast<unsigned>(Revision::UsV77) ||
+             revision > static_cast<unsigned>(Revision::UsV80) ||
+             byte_order < static_cast<unsigned>(ByteOrder::BigEndian) ||

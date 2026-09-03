@@ -1,0 +1,32 @@
+--- a/runtime-recomp/src/game/runtime_hud_layout.cpp
++++ b/runtime-recomp/src/game/runtime_hud_layout.cpp
+@@ -45,7 +45,29 @@
+ float g_scale = 1.0F;
+ int g_viewport_width = 640;
+ int g_viewport_height = 480;
++#if defined(_LIBCPP_VERSION)
++// libc++ (Apple clang) does not implement the C++20 std::atomic<std::shared_ptr<T>>
++// specialization, so the primary template is selected and its trivially-copyable
++// static_assert fires. Provide a mutex-guarded equivalent with the same API.
++class AtomicPublishedState {
++public:
++    void store(std::shared_ptr<const PublishedState> value, std::memory_order) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        value_ = std::move(value);
++    }
++    std::shared_ptr<const PublishedState> load(std::memory_order) const {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return value_;
++    }
++
++private:
++    mutable std::mutex mutex_;
++    std::shared_ptr<const PublishedState> value_;
++};
++AtomicPublishedState g_published;
++#else
+ std::atomic<std::shared_ptr<const PublishedState>> g_published;
++#endif
+ thread_local SavedElement g_saved_element;
+ thread_local SavedElement g_saved_minimap;
+ thread_local bool g_player_pass_active = false;

@@ -6,7 +6,16 @@
 namespace dkr::runtime::netplay {
 namespace {
 
-std::mutex g_adapter_mutex;
+// Intentionally immortal: ~GekkoDirectAdapter runs at exit() from a global in
+// another translation unit (runtime_netplay.cpp's g_rollback), and cross-TU
+// destruction order is link-order dependent. A plain global mutex is destroyed
+// first, so deactivate() would lock freed storage. libc++ diagnoses that and
+// throws; glibc silently tolerates it. Leaking keeps the mutex valid for the
+// whole process lifetime.
+std::mutex& adapter_mutex() {
+    static std::mutex* mutex = new std::mutex();
+    return *mutex;
+}
 GekkoDirectAdapter* g_active_adapter = nullptr;
 std::vector<RollbackPacket> g_receive_packets;
 struct ReceiveSlot {
@@ -30,7 +39,7 @@ void adapter_send(GekkoNetAddress* address, const char* data, int length) {
         data == nullptr || length <= 0) {
         return;
     }
-    std::scoped_lock lock(g_adapter_mutex);
+    std::scoped_lock lock(adapter_mutex());
     if (g_active_adapter == nullptr || !g_active_adapter->active()) return;
     const auto target = *static_cast<const std::uint8_t*>(address->data);
     g_active_adapter->session()->send_rollback_packet(
@@ -41,7 +50,7 @@ void adapter_send(GekkoNetAddress* address, const char* data, int length) {
 GekkoNetResult** adapter_receive(int* length) {
     if (length == nullptr) return nullptr;
     *length = 0;
-    std::scoped_lock lock(g_adapter_mutex);
+    std::scoped_lock lock(adapter_mutex());
     g_receive_results.clear();
     if (g_active_adapter == nullptr || !g_active_adapter->active()) return nullptr;
 
@@ -72,7 +81,7 @@ GekkoNetAdapter g_adapter{adapter_send, adapter_receive, adapter_free};
 GekkoDirectAdapter::~GekkoDirectAdapter() { deactivate(); }
 
 bool GekkoDirectAdapter::activate(DirectSession& session) {
-    std::scoped_lock lock(g_adapter_mutex);
+    std::scoped_lock lock(adapter_mutex());
     if (g_active_adapter != nullptr && g_active_adapter != this) return false;
     session_ = &session;
     g_active_adapter = this;
@@ -80,7 +89,7 @@ bool GekkoDirectAdapter::activate(DirectSession& session) {
 }
 
 void GekkoDirectAdapter::deactivate() {
-    std::scoped_lock lock(g_adapter_mutex);
+    std::scoped_lock lock(adapter_mutex());
     if (g_active_adapter == this) g_active_adapter = nullptr;
     session_ = nullptr;
     g_receive_packets.clear();

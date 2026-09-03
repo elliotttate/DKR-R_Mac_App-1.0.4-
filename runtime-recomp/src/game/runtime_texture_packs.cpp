@@ -104,7 +104,7 @@ std::string FileSignature(const std::filesystem::path& path) {
     const auto modified = std::filesystem::last_write_time(path, error);
     if (error) return "missing";
     return std::to_string(size) + ":" +
-        std::to_string(modified.time_since_epoch().count());
+        std::to_string(static_cast<long long>(modified.time_since_epoch().count()));
 }
 
 std::string PackFingerprint(const std::filesystem::path& path,
@@ -113,7 +113,8 @@ std::string PackFingerprint(const std::filesystem::path& path,
     std::error_code error;
     const auto modified = std::filesystem::last_write_time(path, error);
     const std::string directory_time = error
-        ? "missing" : std::to_string(modified.time_since_epoch().count());
+        ? "missing"
+        : std::to_string(static_cast<long long>(modified.time_since_epoch().count()));
     return "directory:" + directory_time + ":database:" +
         FileSignature(path / "rt64.json") + ":report:" +
         FileSignature(path / "dkr-r-rice-import.json");

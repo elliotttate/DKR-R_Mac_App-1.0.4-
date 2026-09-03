@@ -18,8 +18,21 @@
 #include "runtime_ui.hpp"
 #include "imgui/imgui.h"
 #include <SDL.h>
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
 #include <SDL_syswm.h>
+#endif
+#if defined(__APPLE__)
+// Implemented in runtime_metal_layer.mm. RT64/Plume casts RenderWindow::view
+// straight to CA::MetalLayer* (plume_metal.cpp:1909), so the handle's `view`
+// must be the CAMetalLayer itself - not the NSView that contains it. The
+// helper also applies the window's backingScaleFactor, without which the
+// layer renders at 1x on a Retina display and pointer coordinates no longer
+// line up with what is drawn.
+extern "C" void* dkr_create_metal_layer(void* ns_window_ptr);
+extern "C" void dkr_destroy_metal_layer(void* layer_ptr);
+// File scope so the launcher/game handoff below can invalidate the layer.
+static void* g_metal_layer = nullptr;
+static void* g_metal_layer_window = nullptr;
 #endif
 #endif
 
@@ -1490,6 +1503,24 @@ ultramodern::renderer::WindowHandle dkr::runtime::platform::create_window() {
         return {};
     }
     return {.window = info.info.win.window, .thread_id = GetCurrentThreadId()};
+#elif defined(__APPLE__)
+    // ultramodern's Apple WindowHandle carries the NSWindow and its NSView;
+    // RT64's Metal backend consumes both. SDL exposes the NSWindow, and the
+    // content view is fetched through the Objective-C helper.
+    SDL_SysWMinfo info{};
+    SDL_VERSION(&info.version);
+    if (g_window == nullptr || SDL_GetWindowWMInfo(g_window, &info) != SDL_TRUE) {
+        std::fprintf(stderr, "[boot][window] native handle failed: %s\n", SDL_GetError());
+        return {};
+    }
+    void* ns_window = static_cast<void*>(info.info.cocoa.window);
+    // Create the layer once per window; each call would otherwise add another
+    // sublayer to the content view.
+    if (g_metal_layer == nullptr || g_metal_layer_window != ns_window) {
+        g_metal_layer = dkr_create_metal_layer(ns_window);
+        g_metal_layer_window = ns_window;
+    }
+    return {.window = ns_window, .view = g_metal_layer};
 #else
     return g_window;
 #endif
@@ -1546,6 +1577,19 @@ ultramodern::renderer::WindowHandle dkr::runtime::platform::prepare_window_for_g
                          "flags=0x%08X\n",
                          static_cast<unsigned>(SDL_GetWindowFlags(g_window)));
         }
+    }
+#endif
+#if defined(__APPLE__)
+    // create_window() ran before the launcher, which then attached its own
+    // SDL_Renderer to this window; on macOS that installs a Metal layer on the
+    // same content view and displaces the one built for RT64. The launcher has
+    // since destroyed its renderer, so drop the stale layer and rebuild it here
+    // to make sure RT64 draws into a live, topmost layer instead of leaving the
+    // launcher's final frame on screen.
+    if (g_metal_layer != nullptr) {
+        dkr_destroy_metal_layer(g_metal_layer);
+        g_metal_layer = nullptr;
+        g_metal_layer_window = nullptr;
     }
 #endif
     return create_window();

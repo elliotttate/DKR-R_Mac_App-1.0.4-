@@ -1,0 +1,22 @@
+--- a/scripts/Prepare-DKR-Runtime-macOS.sh
++++ b/scripts/Prepare-DKR-Runtime-macOS.sh
+@@ -83,7 +83,7 @@
+ [[ -x "$SOURCE_SCRIPT" ]] || fail "Missing executable: $SOURCE_SCRIPT"
+ args=()
+ [[ "$FORCE" -eq 1 ]] && args+=(--force)
+-"$SOURCE_SCRIPT" "${args[@]}"
++"$SOURCE_SCRIPT" ${args[@]+"${args[@]}"}
+ 
+ DKR_SOURCE="$PROJECT_ROOT/extern/dkr-decomp"
+ [[ -d "$DKR_SOURCE/.git" ]] || fail "DKR source checkout was not prepared."
+@@ -202,8 +202,8 @@
+         --with-sysroot=/usr/mips64-elf --with-gnu-as --with-gnu-ld \
+         --enable-64-bit-bfd --enable-multilib --enable-plugins \
+         --disable-gold --disable-nls --disable-shared --disable-werror \
+-        "${_ar_flags[@]}"
+-      make -j"$JOBS" "${_ar_flags[@]}"
++        ${_ar_flags[@]+"${_ar_flags[@]}"}
++      make -j"$JOBS" ${_ar_flags[@]+"${_ar_flags[@]}"}
+       cp binutils/ar          "$_bu_dest/mips64-elf-ar"
+       cp binutils/objcopy     "$_bu_dest/mips64-elf-objcopy"
+       cp binutils/objdump     "$_bu_dest/mips64-elf-objdump"

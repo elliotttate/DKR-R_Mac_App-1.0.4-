@@ -20,7 +20,11 @@
 #include <dxgi1_6.h>
 #include <winioctl.h>
 #else
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#else
 #include <sys/sysinfo.h>
+#endif
 #include <sys/utsname.h>
 #include <unistd.h>
 #endif
@@ -332,6 +336,28 @@ SystemSummary collect_system_summary() {
                        static_cast<DWORD>(std::size(executable)));
     result.application_drive = WindowsDriveKind(executable);
 #else
+#if defined(__APPLE__)
+    // macOS has no /proc or <sys/sysinfo.h>; query sysctl instead.
+    struct utsname system_name{};
+    result.operating_system = uname(&system_name) == 0
+        ? std::string("macOS (Darwin ") + system_name.release + ")"
+        : "macOS";
+    char cpu_brand[256] = {};
+    std::size_t cpu_brand_size = sizeof(cpu_brand);
+    result.cpu = sysctlbyname("machdep.cpu.brand_string", cpu_brand,
+                              &cpu_brand_size, nullptr, 0) == 0
+        ? std::string(cpu_brand)
+        : "Unknown CPU";
+    std::uint64_t memory_bytes = 0;
+    std::size_t memory_bytes_size = sizeof(memory_bytes);
+    result.memory = sysctlbyname("hw.memsize", &memory_bytes,
+                                 &memory_bytes_size, nullptr, 0) == 0
+        ? FormatBytes(memory_bytes)
+        : "Unknown memory";
+    result.gpu = "Unknown GPU";
+    result.boot_drive = "Unknown";
+    result.application_drive = "Unknown";
+#else
     struct utsname system_name{};
     result.operating_system = uname(&system_name) == 0
         ? std::string("Linux ") + system_name.release : "Linux";
@@ -347,6 +373,7 @@ SystemSummary collect_system_summary() {
     result.gpu = LinuxGpuName();
     result.boot_drive = LinuxDriveKind("/");
     result.application_drive = LinuxDriveKind(".");
+#endif
 #endif
     return result;
 }
