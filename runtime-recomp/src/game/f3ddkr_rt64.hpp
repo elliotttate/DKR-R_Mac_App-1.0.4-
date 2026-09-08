@@ -44,6 +44,7 @@ private:
                                        std::uint16_t token,
                                        std::uint8_t variant);
     static void FinishShadowScope(RT64::State* state);
+    static bool DrawPalmReplacement(RT64::State* state);
     static void AdjustSplitViewportCommand(RT64::State* state,
                                            RT64::DisplayList* command,
                                            std::uint8_t opcode);

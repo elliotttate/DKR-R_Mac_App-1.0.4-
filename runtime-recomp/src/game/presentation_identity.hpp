@@ -1,5 +1,7 @@
 #pragma once
 
+#include "palm_model.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -2368,6 +2370,7 @@ struct PresentationMarker {
     std::uint8_t mode = 0U;
     std::uint16_t token = 0U;
     std::uint8_t variant = 0U;
+    dkr::runtime::palm::Sample palm{};
 };
 
 inline constexpr std::size_t kMaximumMarkersPerCommand = 8U;
@@ -2398,6 +2401,7 @@ bool record_presentation_marker(std::uint32_t command_address,
                                 std::uint8_t mode,
                                 std::uint16_t token,
                                 std::uint8_t variant);
+void capture_palm_marker(std::uint8_t* rdram, std::uint32_t command_address);
 PresentationMarkerList active_presentation_markers(
     std::uint32_t command_address);
 

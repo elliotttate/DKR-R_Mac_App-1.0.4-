@@ -854,6 +854,10 @@ extern "C" void dkr_billboard_interpolation_begin(
     g_billboard_interpolation_active = AppendPresentationGroupCommand(
         rdram, context->r17, PresentationGroupMode::DynamicBillboard,
         token, variant);
+    if (g_billboard_interpolation_active) {
+        dkr::runtime::presentation::capture_palm_marker(
+            rdram, static_cast<std::uint32_t>(MEM_W(0, context->r17)));
+    }
     dkr::runtime::presentation::interpolation_trace_billboard(
         true, true, g_billboard_interpolation_active);
 #else

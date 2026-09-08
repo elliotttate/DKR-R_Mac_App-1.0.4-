@@ -1,0 +1,93 @@
+{
+  "source": "repaired.glb",
+  "original_source": "Meshy_AI_Tropical_Palm_Haven_0908164622_texture.usdz",
+  "original_source_sha256": "37e0bcfefcf54c51c7659ea1a24e1f9d95197563daaf0e884945e072ea5fb635",
+  "original_source_triangles": 5197,
+  "repair": {
+    "removed_flap_faces": 17,
+    "fruit_smoothing_max_displacement": 0.012,
+    "surface_voxel_size": 0.0015,
+    "surface_components": 1,
+    "surface_boundary_edges": 0,
+    "surface_overconnected_edges": 0,
+    "surface_inconsistent_winding": 0,
+    "texture_reprojected": true
+  },
+  "source_sha256": "ff2f6ca65fc0751a8e21ea9aecf83653063d003a092ee3934d3ea4cba8167047",
+  "source_triangles": 16000,
+  "vertices_before_weld": 17179,
+  "vertices_after_weld": 7986,
+  "texture": "50414c4d33440001.png",
+  "source_boundary_edges": 0,
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "coordinate_system": "Y-up, ground pivot, height 1",
+  "preserve_topology": false,
+  "baked_lighting": true,
+  "lods": [
+    {
+      "file": "near.dkrmesh",
+      "vertices": 17179,
+      "triangles": 16000,
+      "bytes": 741744
+    },
+    {
+      "file": "far.dkrmesh",
+      "vertices": 6922,
+      "triangles": 5000,
+      "bytes": 281520
+    }
+  ],
+  "baked_lighting_profile": "haven-palm-repaired-gloss-v1",
+  "canopy_alignment": [
+    {
+      "lod": "near",
+      "cut_center_before": [
+        -0.006,
+        0.61,
+        0.008
+      ],
+      "translation": [
+        -0.004,
+        -0.10999999999999999,
+        -0.0055
+      ],
+      "cut_center_after": [
+        -0.01,
+        0.5,
+        0.0025
+      ],
+      "recess_radius": 0.035,
+      "recess_base_radius": 0.06,
+      "recess_faces": 43,
+      "closed_surface": true,
+      "triangles": 15982
+    },
+    {
+      "lod": "far",
+      "cut_center_before": [
+        -0.006,
+        0.61,
+        0.008
+      ],
+      "translation": [
+        -0.004,
+        -0.10999999999999999,
+        -0.0055
+      ],
+      "cut_center_after": [
+        -0.01,
+        0.5,
+        0.0025
+      ],
+      "recess_radius": 0.035,
+      "recess_base_radius": 0.06,
+      "recess_faces": 43,
+      "closed_surface": true,
+      "triangles": 5150
+    }
+  ],
+  "canopy_preparation": "haven-shaped-stem-recess-v1"
+}

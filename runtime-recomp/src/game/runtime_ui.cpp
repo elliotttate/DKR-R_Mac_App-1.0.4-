@@ -1,4 +1,5 @@
 #include "runtime_ui.hpp"
+#include "palm_model.hpp"
 
 #include "game_registration.hpp"
 #include "generated/jumpman_font.h"
@@ -8340,6 +8341,14 @@ void DrawModsHacks(float width) {
                              texture_packs_expanded, width)) {
         ImGui::Dummy({0.0F, 6.0F});
         if (dkr::runtime::enhancements::modern_presentation_enabled()) {
+            if (dkr::runtime::palm::available()) {
+                bool palms = dkr::runtime::palm::enabled();
+                if (ImGui::Checkbox("3D plants: palms, blueberries, rubber/beach trees (F8)", &palms)) {
+                    dkr::runtime::palm::set_enabled(palms);
+                }
+                ImGui::TextWrapped("3D full palms and palm canopies; existing level trunks and collision are preserved.");
+                ImGui::Dummy({0.0F, 6.0F});
+            }
             DrawTexturePackControls(width);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, kMuted);

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <cmath>
 #include <mutex>
@@ -88,6 +89,9 @@ struct Lifetime {
     ShadowGeometrySnapshot shadow_geometry{};
     bool shadow_topology_valid = false;
     bool alive = false;
+    bool palm_attachment_checked = false;
+    bool palm_attachment_valid = false;
+    std::array<float, 3> palm_attachment{};
 };
 
 struct ObjectCapture {
@@ -324,6 +328,59 @@ bool ValidRange(std::uint32_t address, std::uint32_t size) {
     const std::uint32_t physical = Physical(address);
     return address >= 0x80000000U && address <= 0x807FFFFFU &&
         physical <= kRdramMask && size <= kRdramMask + 1U - physical;
+}
+
+bool CapturePalmAttachment(std::uint8_t* rdram, dkr::runtime::palm::Sample& sample) {
+    using namespace dkr::runtime;
+    const auto model = ReadU32(rdram, revision_addresses::CurrentLevelModel);
+    if (!ValidRange(model, 0x1CU)) return false;
+    const auto textures = ReadU32(rdram, model);
+    const auto segments = ReadU32(rdram, model + 4U);
+    const auto nt = ReadU16(rdram, model + 0x18U);
+    const auto ns = ReadU16(rdram, model + 0x1AU);
+    const auto cache = ReadU32(rdram, revision_addresses::TextureCache);
+    const auto nc = ReadU32(rdram, revision_addresses::NumberOfLoadedTextures);
+    if (nt > 255U || ns > 1024U || nc > 700U ||
+        !ValidRange(textures, nt * 8U) || !ValidRange(segments, ns * 0x44U) ||
+        !ValidRange(cache, nc * 8U)) return false;
+    std::unordered_set<std::uint32_t> bark;
+    for (unsigned i = 0; i < nc; ++i) {
+        const auto id = ReadU32(rdram, cache + i * 8U);
+        // Verified 3D texture IDs in both supported retail revisions.
+        if (id == (0x8000U | 236U) || id == (0x8000U | 238U) ||
+            id == (0x8000U | 240U) || id == (0x8000U | 1046U))
+            bark.insert(ReadU32(rdram, cache + i * 8U + 4U));
+    }
+    std::vector<std::array<float, 3>> vertices;
+    unsigned scanned = 0;
+    for (unsigned si = 0; si < ns; ++si) {
+        const auto segment = segments + si * 0x44U;
+        const auto v = ReadU32(rdram, segment);
+        const auto batches = ReadU32(rdram, segment + 12U);
+        const auto nv = ReadU16(rdram, segment + 0x1CU);
+        const auto nb = ReadU16(rdram, segment + 0x20U);
+        if (nv > 8192U || nb > 4096U || !ValidRange(v, nv * 10U) ||
+            !ValidRange(batches, (nb + 1U) * 12U)) return false;
+        for (unsigned bi = 0; bi < nb; ++bi) {
+            const auto batch = batches + bi * 12U;
+            const auto ti = ReadU8(rdram, batch);
+            if (ti >= nt || !bark.contains(ReadU32(rdram, textures + ti * 8U))) continue;
+            const auto begin = ReadU16(rdram, batch + 2U);
+            const auto end = ReadU16(rdram, batch + 14U);
+            if (begin > end || end > nv || (scanned += end - begin) > 100000U) return false;
+            for (unsigned vi = begin; vi < end; ++vi) {
+                const auto address = v + vi * 10U;
+                vertices.push_back({float(ReadS16(rdram, address)),
+                    float(ReadS16(rdram, address + 2U)), float(ReadS16(rdram, address + 4U))});
+            }
+        }
+    }
+    sample.attachment_valid = palm::find_trunk_tip(vertices, sample.position, sample.attachment);
+    if (std::getenv("DKR_TRACE_PALM_3D"))
+        std::fprintf(stderr, "[palm3d] attachment sprite=%u anchor=(%.1f,%.1f,%.1f) tip=(%.1f,%.1f,%.1f) valid=%d barkVertices=%zu\n",
+            sample.sprite_id, sample.position[0], sample.position[1], sample.position[2],
+            sample.attachment[0], sample.attachment[1], sample.attachment[2], sample.attachment_valid, vertices.size());
+    return true;
 }
 
 int ActiveSceneCameraMode(std::uint8_t* rdram) {
@@ -1106,6 +1163,77 @@ bool dkr::runtime::presentation::record_presentation_marker(
     markers.push_back(PresentationMarker{mode, token,
                                          static_cast<std::uint8_t>(variant & 0x1FU)});
     return true;
+}
+
+void dkr::runtime::presentation::capture_palm_marker(
+    std::uint8_t* rdram, std::uint32_t command_address) {
+    if (!rdram || !palm::enabled() || !g_capture_depth || g_capture_overflow_depth) return;
+    const auto& capture = g_capture_stack[g_capture_depth - 1U];
+    const auto object = capture.object;
+    if (!ValidRange(object, 0x58U)) return;
+    const auto read_word = [&](std::uint32_t address) {
+        std::uint32_t value;
+        std::memcpy(&value, rdram + Physical(address), sizeof(value));
+        return value;
+    };
+    const auto byte = [&](std::uint32_t address) { return rdram[Physical(address) ^ 3U]; };
+    const auto half = [&](std::uint32_t address) {
+        std::int16_t value;
+        std::memcpy(&value, rdram + (Physical(address) ^ 2U), sizeof(value));
+        return value;
+    };
+    const auto header = read_word(object + kObjectHeaderOffset);
+    static unsigned capture_trace = 0;
+    if (std::getenv("DKR_TRACE_PALM_3D") && capture_trace++ < 12) {
+        std::fprintf(stderr, "[palm3d] capture object=%08X header=%08X behaviour=%d headerType=%u headerBehaviour=%u\n",
+            object, header, half(object + kObjectBehaviourOffset),
+            ValidRange(header, 0x56U) ? byte(header + 0x53U) : 255,
+            ValidRange(header, 0x56U) ? byte(header + 0x54U) : 255);
+    }
+    if (!ValidRange(header, 0x56U) || byte(header + 0x53U) != 1U ||
+        byte(header + 0x54U) != 2U || half(object + kObjectBehaviourOffset) != 2)
+        return;
+    const auto models = read_word(header + 0x10U);
+    const auto model_index = byte(object + 0x3AU);
+    static unsigned trace_count = 0;
+    if (std::getenv("DKR_TRACE_PALM_3D") && trace_count < 16 && ValidRange(models, 4U)) {
+        std::fprintf(stderr, "[palm3d] scenery candidate object=%08X sprite=%u camera=%08X\n",
+                     object, read_word(models), capture.camera_identity);
+        ++trace_count;
+    }
+    if (model_index >= byte(header + 0x55U) || !ValidRange(models + model_index * 4U, 4U) ||
+        !palm::supported_sprite(read_word(models + model_index * 4U))) return;
+    palm::Sample sample;
+    sample.sprite_id = static_cast<std::uint16_t>(read_word(models + model_index * 4U));
+    sample.position = {std::bit_cast<float>(read_word(object + 0x0CU)),
+                       std::bit_cast<float>(read_word(object + 0x10U)),
+                       std::bit_cast<float>(read_word(object + 0x14U))};
+    sample.scale = std::bit_cast<float>(read_word(object + 8U));
+    sample.yaw = half(object);
+    sample.pitch = half(object + 2U);
+    sample.roll = half(object + 4U);
+    sample.identity = with_camera_continuity(capture.identity, capture.camera_identity);
+    sample.valid = true;
+    if (!palm::valid_sample(sample)) return;
+    std::scoped_lock lock(g_identity_mutex);
+    if (sample.sprite_id == 114 || sample.sprite_id == 116) {
+        auto lifetime = g_lifetimes.find(object);
+        if (lifetime != g_lifetimes.end()) {
+            auto& cached = lifetime->second;
+            if (!cached.palm_attachment_checked) {
+                cached.palm_attachment_checked = CapturePalmAttachment(rdram, sample);
+                cached.palm_attachment = sample.attachment;
+                cached.palm_attachment_valid = sample.attachment_valid;
+            }
+            sample.attachment = cached.palm_attachment;
+            sample.attachment_valid = cached.palm_attachment_valid;
+        }
+    }
+    auto found = g_marker_maps[g_recording_buffer & 1U].find(Physical(command_address));
+    if (found != g_marker_maps[g_recording_buffer & 1U].end() && !found->second.empty()) {
+        auto& marker = found->second.back();
+        if (marker.token == capture.presentation_token) marker.palm = sample;
+    }
 }
 
 dkr::runtime::presentation::PresentationMarkerList

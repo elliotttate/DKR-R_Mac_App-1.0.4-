@@ -13,6 +13,7 @@
 #include "hle/rt64_application.h"
 #include "hle/rt64_rsp.h"
 #include "hle/rt64_state.h"
+#include "render/rt64_texture_cache.h"
 
 #include <algorithm>
 #include <array>
@@ -327,6 +328,10 @@ struct dkr::runtime::F3DDKRRT64Bridge::StateData {
     std::uint32_t vertex_cursor = 0;
     std::uint32_t selected_matrix = 0;
     bool billboard = false;
+    palm::Sample palm_sample{};
+    hlslpp::float4x4 palm_world_matrix{};
+    bool palm_attempted = false;
+    bool palm_drawn = false;
     std::uint32_t nested_depth = 0;
     std::uint64_t task_count = 0;
     std::uint32_t presentation_group_begins = 0;
@@ -1701,6 +1706,25 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
     RT64::State* state = application.state.get();
     RT64::RSP& rsp = *state->rsp;
     rsp.reset();
+    // The private virtual tiles must be resident even while a plant is off
+    // camera. RT64 otherwise ages out the tile (despite a preloaded atlas),
+    // forcing an asynchronous re-upload and a sprite frame when it returns.
+    // Warm all private placeholders during the boot/menu frames and touch
+    // their access records each task. Do not pin or mutate any retail textures.
+    if (palm::enabled() && enhancements::modern_presentation_enabled() &&
+        state->ext.textureCache && state->ext.workloadQueue) {
+        auto* cache = state->ext.textureCache;
+        const auto& workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+        for (const auto sprite : {palm::kSpriteId, palm::kBlueberrySpriteId,
+                                  palm::kRubberTreeSpriteId, palm::kBeachTreeSpriteId}) {
+            const auto hash = palm::texture_hash(sprite);
+            if (!palm::select_mesh(palm::assets(), sprite, false) || !cache->hasReplacement(hash)) continue;
+            state->textureManager.uploadEmpty(state, cache, workload.submissionFrame,
+                palm::kTextureSize, palm::kTextureSize, hash);
+            std::uint32_t unused_index = 0;
+            cache->useTexture(hash, workload.submissionFrame, unused_index);
+        }
+    }
 
     application.interpreter->hleGBI = gbi_;
     application.interpreter->UCode.textAddress = task.t.ucode & 0x00FFFFF8U;
@@ -1901,6 +1925,13 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationMarkers(
         const auto& marker = markers.markers[index];
         ApplyPresentationGroup(state, marker.mode, marker.token,
                                marker.variant);
+        if (marker.mode == kPresentationGroupBillboardMode) {
+            auto& data = *active_->data_;
+            data.palm_sample = marker.palm;
+            data.palm_world_matrix = state->rsp->modelMatrixStack[data.selected_matrix];
+            data.palm_attempted = false;
+            data.palm_drawn = false;
+        }
     }
 }
 
@@ -1934,7 +1965,8 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
         state->rsp->modelViewProjChanged = true;
     };
 
-    if (presentation_variant == kSplitViewportMarkerVariant) {
+    const bool layout_marker = interpolation::is_layout_marker(mode, presentation_variant);
+    if (layout_marker && presentation_variant == kSplitViewportMarkerVariant) {
         data.split_viewport_fill_pending = true;
         data.split_viewport_scissor_adjusted = false;
         data.split_viewport_rsp_adjusted = false;
@@ -1947,10 +1979,10 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
         return;
     }
 
-    if (presentation_variant == kFramedResultsMarkerVariant ||
+    if (layout_marker && (presentation_variant == kFramedResultsMarkerVariant ||
         presentation_variant == kFixedUiMarkerVariant ||
         presentation_variant == kBackgroundAspectMarkerVariant ||
-        presentation_variant == kTrackSelectLensFlareMarkerVariant) {
+        presentation_variant == kTrackSelectLensFlareMarkerVariant)) {
         state->flush();
         if (mode == kHudPassMarkerBeginMode) {
             if (data.aspect_scope_depth >= data.aspect_scopes.size()) {
@@ -2008,7 +2040,7 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
         return;
     }
 
-    if (presentation_variant == kHudPassMarkerVariant) {
+    if (layout_marker && presentation_variant == kHudPassMarkerVariant) {
         state->flush();
         if (mode == kHudPassMarkerBeginMode) {
             if (data.hud_alignment_depth >=
@@ -2107,6 +2139,12 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
     }
 
     const bool presentation_scoped = mode != 0U;
+    if (!presentation_scoped && data.interpolation_groups.active_group().mode ==
+        kPresentationGroupBillboardMode) {
+        data.palm_sample = {};
+        data.palm_attempted = false;
+        data.palm_drawn = false;
+    }
 
     // Pad while the shadow identity is still selected. Once the scope is
     // popped these samples would belong to the world matrix and could not keep
@@ -2415,6 +2453,158 @@ void dkr::runtime::F3DDKRRT64Bridge::Vertex(
     }
 }
 
+bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
+    auto& data = *active_->data_;
+    auto& rsp = *state->rsp;
+    auto& rdp = *state->rdp;
+    auto* cache = state->ext.textureCache;
+    const auto hash = palm::texture_hash(data.palm_sample.sprite_id);
+    const auto fallback = [&](const char* reason) {
+        static unsigned logged = 0;
+        if (std::getenv("DKR_TRACE_PALM_3D") && palm::enabled() &&
+            palm::valid_sample(data.palm_sample) && logged++ < 32)
+            std::fprintf(stderr, "[plant3d] sprite fallback task=%llu sprite=%u reason=%s\n",
+                static_cast<unsigned long long>(data.task_count), data.palm_sample.sprite_id, reason);
+        return false;
+    };
+    if (!palm::enabled() || !palm::valid_sample(data.palm_sample) || !cache ||
+        !cache->hasReplacement(hash)) return fallback("disabled-invalid-or-atlas-missing");
+    auto& workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+    // The placeholder owns a private hash, never a retail Rice texture. Do not
+    // hide the sprite until the asynchronous atlas upload has really completed.
+    state->textureManager.uploadEmpty(state, cache, workload.submissionFrame,
+        palm::kTextureSize, palm::kTextureSize, hash);
+    std::uint32_t texture_index = 0;
+    interop::float2 texture_scale{};
+    interop::float3 texture_dimensions{};
+    bool replaced = false, mipmaps = false, shifted = false;
+    if (!cache->useTexture(hash, workload.submissionFrame, texture_index,
+                          texture_scale, texture_dimensions, replaced, mipmaps, shifted) || !replaced)
+        return fallback("atlas-not-yet-gpu-ready");
+
+    const auto& sample = data.palm_sample;
+    const auto anchor = hlslpp::mul(hlslpp::float4(sample.position[0], sample.position[1],
+                                                sample.position[2], 1.0F), data.palm_world_matrix);
+    // The combined DKR camera matrix carries camera distance in clip W.
+    // LOD affects geometry only, never the object's transform identity.
+    const bool far = std::abs(static_cast<float>(anchor.w)) > 1800.0F;
+    if (std::getenv("DKR_TRACE_PALM_3D")) {
+        static std::unordered_map<std::uint32_t, bool> previous_lods;
+        static unsigned logged_switches = 0;
+        if (logged_switches < 32U) {
+            const auto key = presentation::normalise_identity(palm::model_interpolation_key(sample));
+            const auto previous = previous_lods.find(key);
+            if (previous != previous_lods.end() && previous->second != far) {
+                std::fprintf(stderr, "[plant3d] lod-switch task=%llu sprite=%u transform=%08X %s->%s vertexInterpolation=0\n",
+                    static_cast<unsigned long long>(data.task_count), sample.sprite_id, key,
+                    previous->second ? "far" : "near", far ? "far" : "near");
+                ++logged_switches;
+            }
+            if (previous_lods.size() >= 4096U) previous_lods.clear();
+            previous_lods[key] = far;
+        }
+    }
+    const auto* selected_mesh = palm::select_mesh(palm::assets(), sample.sprite_id, far);
+    if (!selected_mesh) return fallback("family-mesh-unavailable");
+    const auto& mesh = *selected_mesh;
+    // A rigid local mesh plus a stable model-to-clip transform keeps camera
+    // interpolation continuous across LOD switches. The old world-space
+    // vertex stream changed identity with LOD, leaving a one-frame camera
+    // snap; matching those streams instead would morph unrelated vertices.
+    const auto transform = palm::model_transform(sample);
+    hlslpp::float4x4 model_to_world;
+    for (std::size_t row = 0; row < 4; ++row)
+        model_to_world[row] = hlslpp::float4(transform[row][0], transform[row][1],
+                                           transform[row][2], transform[row][3]);
+    static thread_local std::vector<RT64::RSP::Vertex> vertices;
+    vertices.clear();
+    vertices.reserve(mesh.vertices.size());
+    for (const auto& source : mesh.vertices) {
+        const auto local = palm::local_position(source);
+        std::array<float, 3> position{transform[3][0], transform[3][1], transform[3][2]};
+        for (std::size_t component = 0; component < 3; ++component)
+            for (std::size_t axis = 0; axis < 3; ++axis)
+                position[component] += transform[axis][component] * local[axis];
+        if (std::any_of(position.begin(), position.end(), [](float v) {
+                return !std::isfinite(v) || std::abs(v) > 32760.0F;
+            })) return fallback("world-position-out-of-range");
+        RT64::RSP::Vertex vertex{};
+        vertex.x = local[0];
+        vertex.y = local[1];
+        vertex.z = local[2];
+        vertex.s = static_cast<std::int16_t>(std::lround(std::clamp(source.uv[0], 0.0F, 1.0F) * palm::kTextureSize * 32.0F));
+        vertex.t = static_cast<std::int16_t>(std::lround(std::clamp(source.uv[1], 0.0F, 1.0F) * palm::kTextureSize * 32.0F));
+        vertex.color.r = vertex.color.g = vertex.color.b = vertex.color.a = 255;
+        vertices.push_back(vertex);
+    }
+
+    // All validation is complete. Keep the same world pass, fog, opacity,
+    // combiner, scissor and depth target as the authored object.
+    state->flush();
+    const auto saved_tile = rdp.tiles[0];
+    const auto saved_hash = rdp.tileReplacementHashes[0];
+    const auto saved_texture = rsp.textureState;
+    const auto saved_geometry = rsp.geometryModeStack[rsp.geometryModeStackSize - 1];
+    const auto saved_other_mode = rdp.otherMode;
+    const auto saved_matrix = rsp.modelMatrixStack[data.selected_matrix];
+    const auto saved_stack_size = rsp.modelMatrixStackSize;
+    const auto saved_indices = rsp.indices;
+    const auto saved_used = rsp.used;
+    const auto saved_vertices = rsp.vertices;
+    rsp.modelMatrixStack[data.selected_matrix] = hlslpp::mul(model_to_world, data.palm_world_matrix);
+    rsp.modelMatrixStackSize = static_cast<int>(data.selected_matrix + 1);
+    rsp.modelViewProjChanged = true;
+    SelectInterpolationGroup(rsp, presentation::normalise_identity(palm::model_interpolation_key(sample)),
+        palm::kInterpolateMeshVertices, false, false,
+        ActiveAspectMode(data.interpolation_groups, data.matrix_aspect_override_active,
+                         data.matrix_aspect_override));
+    rsp.clearGeometryMode(rsp.cullBothMask | G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+    rdp.setOtherMode(saved_other_mode.H, saved_other_mode.L | Z_CMP | Z_UPD);
+    rsp.setTexture(0, 0, 1, 0xFFFFU, 0xFFFFU);
+    rdp.setTile(0, G_IM_FMT_RGBA, G_IM_SIZ_16b, palm::kTextureSize / 4U, 0, 0,
+                G_TX_CLAMP, G_TX_CLAMP, 9, 9, 0, 0);
+    rdp.setTileSize(0, 0, 0, (palm::kTextureSize - 1U) * 4U, (palm::kTextureSize - 1U) * 4U);
+    rdp.setTileReplacementHash(0, hash);
+    const auto first_vertex = workload.drawData.vertexCount();
+    for (std::size_t offset = 0; offset < vertices.size(); offset += 128U) {
+        const auto count = std::min<std::size_t>(128U, vertices.size() - offset);
+        std::memcpy(state->RDRAM + kScratchVertexAddress, vertices.data() + offset,
+                    count * sizeof(RT64::RSP::Vertex));
+        rsp.setVertex(kScratchVertexAddress, static_cast<std::uint32_t>(count), 0);
+    }
+    for (std::size_t i = 0; i < mesh.indices.size(); i += 3) {
+        rsp.drawIndexedTri(first_vertex + mesh.indices[i], first_vertex + mesh.indices[i + 1],
+                           first_vertex + mesh.indices[i + 2], true);
+    }
+    state->flush();
+    rdp.tiles[0] = saved_tile;
+    rdp.setTileReplacementHash(0, saved_hash);
+    rsp.textureState = saved_texture;
+    rsp.geometryModeStack[rsp.geometryModeStackSize - 1] = saved_geometry;
+    rdp.setOtherMode(saved_other_mode.H, saved_other_mode.L);
+    rsp.modelMatrixStack[data.selected_matrix] = saved_matrix;
+    rsp.modelMatrixStackSize = saved_stack_size;
+    rsp.indices = saved_indices;
+    rsp.used = saved_used;
+    rsp.vertices = saved_vertices;
+    rsp.modelViewProjChanged = true;
+    const auto group = data.interpolation_groups.active_group();
+    SelectInterpolationGroup(rsp, group.identity, group.interpolate_vertices,
+                             group.interpolate_texcoords, group.interpolate_tiles,
+        ActiveAspectMode(data.interpolation_groups, data.matrix_aspect_override_active,
+                         data.matrix_aspect_override));
+    static std::array<std::uint32_t, 6> logged{};
+    const auto trace_slot = sample.sprite_id == palm::kBeachTreeSpriteId ? 5U :
+        sample.sprite_id == palm::kBlueberrySpriteId ? 0U : sample.sprite_id - 112U;
+    if (std::getenv("DKR_TRACE_PALM_3D") && logged[trace_slot]++ < 16) {
+        std::fprintf(stderr, "[palm3d] draw task=%llu sprite=%u id=%08X pos=(%.1f,%.1f,%.1f) scale=%.3f lod=%s triangles=%zu clipw=%.1f\n",
+                     static_cast<unsigned long long>(data.task_count), sample.sprite_id, sample.identity,
+                     sample.position[0], sample.position[1], sample.position[2], sample.scale,
+                     far ? "far" : "near", mesh.indices.size() / 3, static_cast<float>(anchor.w));
+    }
+    return true;
+}
+
 void dkr::runtime::F3DDKRRT64Bridge::Triangle(RT64::State* state,
                                               RT64::DisplayList** display_list) {
     assert(active_ != nullptr);
@@ -2422,6 +2612,15 @@ void dkr::runtime::F3DDKRRT64Bridge::Triangle(RT64::State* state,
     RT64::RSP& rsp = *state->rsp;
     const std::uint32_t w0 = (*display_list)->w0;
     const std::uint32_t count = ((w0 >> 20U) & 0xFU) + 1U;
+    if (data.palm_sample.valid && data.billboard &&
+        data.interpolation_groups.active_group().mode == kPresentationGroupBillboardMode) {
+        if (!data.palm_attempted) {
+            data.palm_attempted = true;
+            data.palm_drawn = DrawPalmReplacement(state);
+        }
+        // Drop every tile in this one sprite, never just its first quad.
+        if (data.palm_drawn) { data.vertex_cursor = 0U; return; }
+    }
     rsp.textureState.on = static_cast<std::uint8_t>((w0 >> 16U) & 0xFU);
     const std::uint32_t source = PhysicalAddress(rsp, (*display_list)->w1);
     const std::uint64_t source_end = static_cast<std::uint64_t>(source) +

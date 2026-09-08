@@ -1,4 +1,5 @@
 #include "runtime_platform.hpp"
+#include "palm_model.hpp"
 #include "audio_equalizer.hpp"
 #include "controller_snapshot.hpp"
 #include "controller_mapping_policy.hpp"
@@ -1400,6 +1401,10 @@ bool dkr::runtime::platform::input_backend_switch_pending() {
            g_input_backend_switch_in_progress.load(std::memory_order_acquire);
 }
 
+std::filesystem::path dkr::runtime::platform::asset_path(const std::filesystem::path& relative) {
+    return RuntimeAssetPath(relative);
+}
+
 bool dkr::runtime::platform::initialise() {
 #if DKR_RUNTIME_HAS_RT64
     dkr::runtime::startup_performance::ScopedPhase platform_phase(
@@ -1687,6 +1692,13 @@ bool dkr::runtime::platform::handle_window_shortcut(
     }
 
     const bool f11 = event->key.keysym.scancode == SDL_SCANCODE_F11;
+    if (renderer_active && event->key.keysym.scancode == SDL_SCANCODE_F8 &&
+        dkr::runtime::enhancements::modern_presentation_enabled() && palm::available()) {
+        const bool enabled = !palm::enabled();
+        palm::set_enabled(enabled);
+        std::fprintf(stderr, "[palm3d] F8: %s\n", enabled ? "3D models" : "original sprites");
+        return true;
+    }
     const bool alt_enter = event->key.keysym.scancode == SDL_SCANCODE_RETURN &&
         (event->key.keysym.mod & KMOD_ALT) != 0;
     if (!f11 && !alt_enter) {

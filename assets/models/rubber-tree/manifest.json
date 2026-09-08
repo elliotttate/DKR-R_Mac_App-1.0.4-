@@ -1,0 +1,31 @@
+{
+  "source": "Meshy_AI_Emerald_Umbrella_Tree_0908134447_texture.usdz",
+  "source_sha256": "0d5a71277f969a21efb8c73ad3386677908d2bea9a3ed3e59e167a381bd9248f",
+  "source_triangles": 5101,
+  "vertices_before_weld": 8387,
+  "vertices_after_weld": 2463,
+  "texture": "5255424252330001.png",
+  "source_boundary_edges": 8,
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "coordinate_system": "Y-up, ground pivot, height 1",
+  "preserve_topology": true,
+  "baked_lighting": true,
+  "baked_lighting_profile": "bright-sprite-wrap-gloss-v2",
+  "lods": [
+    {
+      "file": "near.dkrmesh",
+      "vertices": 8376,
+      "triangles": 5101,
+      "bytes": 329260
+    },
+    {
+      "file": "far.dkrmesh",
+      "vertices": 8376,
+      "triangles": 5101,
+      "bytes": 329260
+    }
+  ]
+}

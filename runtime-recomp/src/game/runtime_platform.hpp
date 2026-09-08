@@ -15,6 +15,7 @@
 namespace dkr::runtime::platform {
 
 bool initialise();
+std::filesystem::path asset_path(const std::filesystem::path& relative);
 void shutdown();
 void configure_input(const std::filesystem::path& config_directory);
 InputBackend requested_input_backend();

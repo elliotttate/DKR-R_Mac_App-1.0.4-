@@ -1,4 +1,6 @@
 #include "runtime_texture_packs.hpp"
+#include "runtime_platform.hpp"
+#include "palm_model.hpp"
 #include "startup_performance.hpp"
 
 #include "rice_texture_pack_policy.hpp"
@@ -1172,6 +1174,14 @@ void request_reload() {
 }
 
 void apply_pending(RT64::Application& application, bool modern_profile) {
+    // A private model atlas, independent of the user's enabled HD packs. Never
+    // write it into their managed library or match any retail texture hashes.
+    static const auto palm_path = dkr::runtime::platform::asset_path("assets/models/palm/near.dkrmesh");
+    static const auto blueberry_path = dkr::runtime::platform::asset_path("assets/models/blueberry/near.dkrmesh");
+    static const auto rubber_path = dkr::runtime::platform::asset_path("assets/models/rubber-tree/near.dkrmesh");
+    static const auto beach_path = dkr::runtime::platform::asset_path("assets/models/beach-tree/near.dkrmesh");
+    dkr::runtime::palm::initialise(palm_path.parent_path(), blueberry_path.parent_path(),
+                                 rubber_path.parent_path(), beach_path.parent_path());
     std::vector<RT64::ReplacementDirectory> replacements;
     std::vector<RT64::ReplacementDirectory> previous_replacements;
     std::set<std::string> replacement_ids;
@@ -1193,6 +1203,13 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
     }
 
     const bool cache_available = application.textureCache != nullptr;
+    if (modern_profile && dkr::runtime::palm::available()) {
+        const auto& models = dkr::runtime::palm::assets();
+        if (models.ready) replacements.emplace_back(models.directory);
+        if (models.blueberry_ready) replacements.emplace_back(models.blueberry_directory);
+        if (models.rubber_tree_ready) replacements.emplace_back(models.rubber_tree_directory);
+        if (models.beach_tree_ready) replacements.emplace_back(models.beach_tree_directory);
+    }
     bool success = cache_available &&
         application.textureCache->loadReplacementDirectories(replacements);
     bool restored = false;

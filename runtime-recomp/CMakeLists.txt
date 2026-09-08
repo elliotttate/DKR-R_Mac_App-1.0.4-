@@ -455,6 +455,7 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         src/game/game_main.cpp
         src/game/game_registration.cpp
         src/game/null_renderer.cpp
+        src/game/palm_model.cpp
         src/game/presentation_identity.cpp
         src/game/rev_a_asset_mutex.cpp
         src/game/rom_revision.cpp
@@ -618,6 +619,17 @@ if(DKR_RUNTIME_BUILD_GENERATED)
             COMMENT "Staging the DKR-R launcher, graphics and controller assets"
             VERBATIM
         )
+        foreach(plant IN ITEMS palm blueberry rubber-tree beach-tree)
+            if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/${plant}/near.dkrmesh")
+                add_custom_command(TARGET DKRPortGame POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/${plant}"
+                        "$<TARGET_FILE_DIR:DKRPortGame>/assets/models/${plant}"
+                    COMMENT "Staging the optional 3D ${plant} assets"
+                    VERBATIM
+                )
+            endif()
+        endforeach()
     endif()
     if(WIN32)
         target_link_libraries(DKRPortGame PRIVATE user32 shell32 dbghelp bcrypt dxgi)
@@ -1070,6 +1082,37 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_LIST_DIR}/src/game"
     )
     add_test(NAME DKRPresentationIdentity COMMAND DKRPresentationIdentityTests)
+
+    add_executable(DKRPalmModelTests tests/palm_model_tests.cpp src/game/palm_model.cpp)
+    target_include_directories(DKRPalmModelTests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/game")
+    add_test(NAME DKRPalmModel COMMAND DKRPalmModelTests
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm"
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/blueberry"
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/rubber-tree"
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree")
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree/manifest.json")
+        add_test(NAME DKRBeachTreeMeshSeams COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_static_plant.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree")
+    endif()
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/rubber-tree/manifest.json")
+        add_test(NAME DKRRubberTreeMeshSeams COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_static_plant.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/rubber-tree")
+    endif()
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/blueberry/manifest.json")
+        add_test(NAME DKRBlueberryMeshSeams COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_static_plant.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/blueberry")
+    endif()
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/canopy-near.dkrmesh")
+        add_test(NAME DKRPalmMeshSeams COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_palm_mesh.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/near.dkrmesh"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/far.dkrmesh"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/canopy-near.dkrmesh"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/canopy-far.dkrmesh")
+    endif()
 
     add_executable(DKRInterpolationStatePolicyTests
         tests/interpolation_state_policy_tests.cpp

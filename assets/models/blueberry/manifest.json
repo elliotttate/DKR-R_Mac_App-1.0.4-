@@ -1,0 +1,31 @@
+{
+  "source": "Meshy_AI_Blueberry_Verdant_Blo_0908131752_texture.usdz",
+  "source_sha256": "741441cf931cb30ed04df269ac5d78b86e0a54eb2a31e5f31abbee7a205a5b72",
+  "source_triangles": 3107,
+  "vertices_before_weld": 4854,
+  "vertices_after_weld": 1531,
+  "texture": "424c554542330001.png",
+  "source_boundary_edges": 8,
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "coordinate_system": "Y-up, ground pivot, height 1",
+  "preserve_topology": true,
+  "baked_lighting": true,
+  "lods": [
+    {
+      "file": "near.dkrmesh",
+      "vertices": 4836,
+      "triangles": 3107,
+      "bytes": 192052
+    },
+    {
+      "file": "far.dkrmesh",
+      "vertices": 4836,
+      "triangles": 3107,
+      "bytes": 192052
+    }
+  ],
+  "baked_lighting_profile": "blueberry-gloss-wrap-v2"
+}

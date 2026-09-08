@@ -1,0 +1,19 @@
+{
+  "configuration": {
+    "configurationVersion": 3,
+    "hashVersion": 5,
+    "autoPath": "rt64",
+    "defaultOperation": "preload",
+    "defaultShift": "none"
+  },
+  "textures": [
+    {
+      "hashes": {
+        "rt64": "4245414348330001"
+      },
+      "path": "4245414348330001.png",
+      "operation": "preload",
+      "shift": "none"
+    }
+  ]
+}

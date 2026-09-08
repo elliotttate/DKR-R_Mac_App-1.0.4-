@@ -28,6 +28,13 @@ inline constexpr std::uint8_t kAspectOriginalScopeMode = 8U;
 // segment occupied the same linear position in the preceding authored frame.
 inline constexpr std::uint8_t kLevelSegmentScopeMode = 9U;
 
+// Variant bits are shared by sprite/frame identities and layout markers.
+// A billboard whose address hashes to 26..31 is not a UI command. Layout
+// markers use only World (0) and StaticAuto (1), including their closes.
+constexpr bool is_layout_marker(std::uint32_t mode, std::uint8_t variant) {
+    return mode <= 1U && variant >= 26U && variant <= 31U;
+}
+
 constexpr bool is_aspect_policy_scope(std::uint8_t mode) {
     return mode == kAspectAdjustScopeMode ||
            mode == kAspectOriginalScopeMode;

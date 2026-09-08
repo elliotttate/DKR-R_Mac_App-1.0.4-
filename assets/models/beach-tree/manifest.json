@@ -1,0 +1,31 @@
+{
+  "source": "Meshy_AI_Neon_Palm_0908154715_texture.usdz",
+  "source_sha256": "9c03c3b08cadd9646a04ca571ad4e5697536e1d2fb16a781e28a98333ca345cd",
+  "source_triangles": 8090,
+  "vertices_before_weld": 14769,
+  "vertices_after_weld": 3978,
+  "texture": "4245414348330001.png",
+  "source_boundary_edges": 12,
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "coordinate_system": "Y-up, ground pivot, height 1",
+  "preserve_topology": true,
+  "baked_lighting": true,
+  "lods": [
+    {
+      "file": "near.dkrmesh",
+      "vertices": 14758,
+      "triangles": 8090,
+      "bytes": 569352
+    },
+    {
+      "file": "far.dkrmesh",
+      "vertices": 14758,
+      "triangles": 8090,
+      "bytes": 569352
+    }
+  ],
+  "baked_lighting_profile": "beach-tree-gold-gloss-v2"
+}
