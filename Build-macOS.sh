@@ -7,7 +7,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   exit 1
 }
 
-for tool in cmake ninja ditto codesign; do
+for tool in cmake ninja ditto codesign file install_name_tool otool; do
   command -v "${tool}" >/dev/null 2>&1 || {
     echo "Missing required macOS build tool: ${tool}" >&2
     exit 1
@@ -25,6 +25,11 @@ generated_source="${DKR_MAC_GENERATED_SOURCE:-${project_root}/runtime-recomp/Rec
 }
 [[ -d "${project_root}/extern/rt64" ]] || {
   echo 'RT64 is missing. Prepare the pinned renderer dependency first.' >&2
+  exit 1
+}
+grep -Eq 'set\(PLUME_APPLE_RETINA_ENABLED ON\)' \
+  "${project_root}/extern/rt64/CMakeLists.txt" || {
+  echo 'Apply macos-patches/extern/rt64-enable-retina.patch before building; otherwise the in-game menu scales incorrectly.' >&2
   exit 1
 }
 
@@ -81,6 +86,62 @@ trap cleanup EXIT
 
 mkdir -p "${stage}"
 ditto "${built_app}" "${stage}/DKR-R.app"
+app="${stage}/DKR-R.app"
+app_executable="${app}/Contents/MacOS/DKR-R"
+
+# Bundle SDL2 instead of retaining the build machine's absolute package-manager
+# path. DKR_MAC_SDL2_DYLIB can point at a deployment-target-compatible build.
+sdl2_dependency="$(otool -L "${app_executable}" | awk '
+  NR > 1 && $1 ~ /libSDL2-2[.]0[.]0[.]dylib$/ { print $1; exit }
+')"
+[[ -n "${sdl2_dependency}" ]] || {
+  echo 'The built application does not declare its SDL2 dependency.' >&2
+  exit 1
+}
+sdl2_source="${DKR_MAC_SDL2_DYLIB:-${sdl2_dependency}}"
+[[ -f "${sdl2_source}" ]] || {
+  echo "SDL2 runtime library not found: ${sdl2_source}" >&2
+  exit 1
+}
+frameworks="${app}/Contents/Frameworks"
+mkdir -p "${frameworks}"
+sdl2_bundled="${frameworks}/libSDL2-2.0.0.dylib"
+ditto "${sdl2_source}" "${sdl2_bundled}"
+chmod u+w "${sdl2_bundled}"
+install_name_tool -id '@rpath/libSDL2-2.0.0.dylib' "${sdl2_bundled}"
+install_name_tool -change "${sdl2_dependency}" \
+  '@executable_path/../Frameworks/libSDL2-2.0.0.dylib' "${app_executable}"
+
+# The SDL3 controller host is a separate process by design. Keep it next to
+# its private dylib at the location searched by the runtime.
+input_host_source="$(dirname "${built_app}")/libexec/dkr-r"
+[[ -x "${input_host_source}/DKR-R-InputHost" && \
+   -f "${input_host_source}/libSDL3.0.dylib" ]] || {
+  echo "The SDL3 input host was not produced under ${input_host_source}." >&2
+  exit 1
+}
+input_host_bundled="${app}/Contents/MacOS/libexec/dkr-r"
+mkdir -p "${input_host_bundled}"
+ditto "${input_host_source}/DKR-R-InputHost" \
+  "${input_host_bundled}/DKR-R-InputHost"
+ditto "${input_host_source}/libSDL3.0.dylib" \
+  "${input_host_bundled}/libSDL3.0.dylib"
+
+# Reject release artifacts that would still depend on a package manager or
+# another absolute, non-system path on the build machine.
+while IFS= read -r -d '' file_to_check; do
+  file "${file_to_check}" | grep -q 'Mach-O' || continue
+  while IFS= read -r dependency; do
+    case "${dependency}" in
+      /System/*|/usr/lib/*|@*) ;;
+      /*)
+        echo "macOS release contains an external dylib reference: ${file_to_check}: ${dependency}" >&2
+        exit 1
+        ;;
+    esac
+  done < <(otool -L "${file_to_check}" | awk 'NR > 1 { print $1 }')
+done < <(find "${app}" -type f -print0)
+
 mkdir -p "${stage}/DKR-R.app/Contents/Resources/ThirdPartyLicenses"
 install -m 0644 "${project_root}/assets/ui/Icons/DKR-R-Logo.bmp" \
   "${stage}/DKR-R.app/Contents/MacOS/assets/ui/Icons/DKR-R-Logo.bmp"
@@ -106,6 +167,12 @@ install -m 0644 "${project_root}/packaging/licenses/GEKKONET-LICENSE.txt" \
   "${notices}/GEKKONET-LICENSE.txt"
 install -m 0644 "${project_root}/packaging/licenses/MONOCYPHER-LICENSE.txt" \
   "${notices}/MONOCYPHER-LICENSE.txt"
+install -m 0644 "${project_root}/packaging/licenses/SDL2-LICENSE.txt" \
+  "${notices}/SDL2-LICENSE.txt"
+install -m 0644 "${project_root}/packaging/licenses/SDL3-LICENSE.txt" \
+  "${notices}/SDL3-LICENSE.txt"
+install -m 0644 "${project_root}/packaging/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt" \
+  "${notices}/SDL-GAMECONTROLLERDB-LICENSE.txt"
 
 # Generate a native icon from the approved DKR-R artwork when the standard
 # macOS image utilities are available. The app remains valid without it.

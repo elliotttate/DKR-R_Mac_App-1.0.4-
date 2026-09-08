@@ -280,9 +280,18 @@ if(DKR_RUNTIME_BUILD_RT64 AND DKR_RUNTIME_BUILD_SDL3_INPUT_HOST)
     set_target_properties(DKRSdl3InputHost PROPERTIES
         OUTPUT_NAME "DKR-R-InputHost"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/libexec/dkr-r"
-        BUILD_RPATH "$ORIGIN"
-        INSTALL_RPATH "$ORIGIN"
     )
+    if(APPLE)
+        set_target_properties(DKRSdl3InputHost PROPERTIES
+            BUILD_RPATH "@loader_path"
+            INSTALL_RPATH "@loader_path"
+        )
+    else()
+        set_target_properties(DKRSdl3InputHost PROPERTIES
+            BUILD_RPATH "$ORIGIN"
+            INSTALL_RPATH "$ORIGIN"
+        )
+    endif()
     foreach(config Debug Release RelWithDebInfo MinSizeRel)
         string(TOUPPER "${config}" config_upper)
         set_target_properties(DKRSdl3InputHost PROPERTIES

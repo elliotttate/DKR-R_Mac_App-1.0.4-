@@ -281,13 +281,20 @@ std::string PathUtf8(const std::filesystem::path& path) {
 
 std::filesystem::path RuntimeAssetPath(const std::filesystem::path& relative) {
     if (char* base = SDL_GetBasePath(); base != nullptr) {
+        const std::filesystem::path directory(base);
         const std::filesystem::path candidate =
-            std::filesystem::path(base) / relative;
+            directory / relative;
         SDL_free(base);
         std::error_code error;
         if (std::filesystem::is_regular_file(candidate, error)) {
             return candidate;
         }
+#if defined(__APPLE__)
+        const auto bundled = directory / ".." / "MacOS" / relative;
+        if (std::filesystem::is_regular_file(bundled, error)) {
+            return bundled.lexically_normal();
+        }
+#endif
     }
     const std::filesystem::path candidate =
         std::filesystem::current_path() / relative;
@@ -366,6 +373,10 @@ std::filesystem::path RuntimeInputHostPath() {
     if (char* base = SDL_GetBasePath(); base != nullptr) {
         const std::filesystem::path directory(base);
         SDL_free(base);
+#if defined(__APPLE__)
+        candidates.push_back(directory / ".." / "MacOS" / "libexec" /
+                             "dkr-r" / kHostName);
+#endif
         candidates.push_back(directory / "libexec" / "dkr-r" / kHostName);
         candidates.push_back(directory / ".." / "libexec" / "dkr-r" /
                              kHostName);
