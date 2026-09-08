@@ -1,4 +1,5 @@
 #include "f3ddkr_rt64.hpp"
+#include "terrain_detail.hpp"
 
 #include "interpolation_state_policy.hpp"
 #include "hud_layout_policy.hpp"
@@ -19,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -84,6 +86,8 @@ constexpr std::uint32_t kMaxNestedDisplayLists = 32;
 constexpr float kRigidActorShadowBaseLift = 0.025F;
 std::atomic<std::uint64_t> g_completed_tasks{0};
 std::uint32_t g_logged_counted_errors = 0;
+// Owned by the serialized F3DDKR decoder; source data comes from its snapshot.
+dkr::runtime::terrain::Cache g_terrain_cache;
 
 struct CanonicalShadowSlotHistory {
     dkr::runtime::presentation::ShadowTexcoordSample texcoord{};
@@ -328,6 +332,10 @@ struct dkr::runtime::F3DDKRRT64Bridge::StateData {
     std::uint32_t vertex_cursor = 0;
     std::uint32_t selected_matrix = 0;
     bool billboard = false;
+    terrain::Settings terrain_settings{};
+    bool terrain_ready = false;
+    std::uint32_t terrain_patches = 0, terrain_triangles = 0;
+    double terrain_submit_ms = 0;
     palm::Sample palm_sample{};
     hlslpp::float4x4 palm_world_matrix{};
     bool palm_attempted = false;
@@ -1706,6 +1714,18 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
     RT64::State* state = application.state.get();
     RT64::RSP& rsp = *state->rsp;
     rsp.reset();
+    data_->terrain_settings = terrain::settings();
+    if (enhancements::modern_presentation_enabled() &&
+        data_->terrain_settings.mode != terrain::Mode::Original) {
+        data_->terrain_ready = g_terrain_cache.prepare(
+            std::span<const std::uint8_t>(state->RDRAM, kRDRAMSize),
+            ReadU32(state->RDRAM, revision_addresses::CurrentLevelModel),
+            ReadU32(state->RDRAM, revision_addresses::TextureCache),
+            ReadU32(state->RDRAM, revision_addresses::NumberOfLoadedTextures),
+            presentation::task_scene_generation(), data_->terrain_settings,
+            ReadU32(state->RDRAM, revision_addresses::CurrentMapId));
+    }
+
     // The private virtual tiles must be resident even while a plant is off
     // camera. RT64 otherwise ages out the tile (despite a preloaded atlas),
     // forcing an asynchronous re-upload and a sprite frame when it returns.
@@ -1804,6 +1824,12 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
                      data_->interpolation_groups.scope_depth(),
                      data_->interpolation_groups.rejected_scope_begins());
     }
+    terrain::publish_draw_statistics(data_->terrain_patches, data_->terrain_triangles,
+                                    data_->terrain_submit_ms);
+    if (std::getenv("DKR_TRACE_TERRAIN") && data_->task_count % 300 == 0)
+        std::fprintf(stderr, "[terrain-draw] task=%llu mode=%s patches=%u triangles=%u cpu=%.3fms\n",
+            static_cast<unsigned long long>(data_->task_count), terrain::mode_name(data_->terrain_settings.mode),
+            data_->terrain_patches, data_->terrain_triangles, data_->terrain_submit_ms);
     g_completed_tasks.store(data_->task_count, std::memory_order_release);
 }
 
@@ -2605,6 +2631,145 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
     return true;
 }
 
+bool dkr::runtime::F3DDKRRT64Bridge::DrawTerrainTriangle(RT64::State* state, std::uint32_t address,
+                                                         const std::array<std::uint8_t, 3>& original_vertices) {
+    auto& data = *active_->data_;
+    if (!data.terrain_ready || data.interpolation_groups.active_group().mode != kPresentationGroupLevelSegmentMode)
+        return false;
+    const auto* patch = g_terrain_cache.find(address);
+    const auto* source = g_terrain_cache.source(address);
+    if (!patch || !source || patch->vertices.empty())
+        return false;
+    auto& rsp = *state->rsp;
+    // Animated or repurposed source memory cannot reuse a static terrain patch.
+    for (unsigned c = 0; c < 3; ++c) {
+        const auto& v = rsp.vertices[original_vertices[c]];
+        if (v.x != source->vertices[c].position[0] || v.y != source->vertices[c].position[1] ||
+            v.z != source->vertices[c].position[2])
+            return false;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    auto& rdp = *state->rdp;
+    auto& workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
+    const auto first = workload.drawData.vertexCount();
+    const auto saved_geometry = rsp.geometryModeStack[rsp.geometryModeStackSize - 1];
+    const auto saved_texture = rsp.textureState;
+    const auto saved_combiner = rdp.colorCombinerStack[rdp.colorCombinerStackSize - 1];
+    const auto saved_position_enabled = rsp.extended.vertexSegmentEnabled[G_EX_VERTEX_POSITION];
+    const auto saved_position_address = rsp.extended.vertexAddresses[G_EX_VERTEX_POSITION];
+    const auto saved_position_base = rsp.extended.baseSegmentAddresses[G_EX_VERTEX_POSITION];
+    // Preserve fractional subdivision positions on sloped ground and at fixed
+    // joins. RT64's extended position stream also updates CPU clipping data.
+    constexpr auto float_positions_address = kScratchVertexAddress + 0x1000;
+    rsp.setVertexSegmentV1(true, G_EX_VERTEX_POSITION, float_positions_address, kScratchVertexAddress);
+    // G_CC_SHADE in both RDP cycles. RT64 stores command word 0 in the
+    // low half and word 1 in the high half (opposite display-list notation).
+    constexpr std::uint64_t shade_combiner = 0xfffe793c00ffffffULL;
+    static_assert(((shade_combiner >> (32 + 15)) & 7) == 4 &&
+                  ((shade_combiner >> (32 + 6)) & 7) == 4 &&
+                  ((shade_combiner >> (32 + 9)) & 7) == 4 &&
+                  ((shade_combiner >> 32) & 7) == 4, "Both cycles must output SHADE RGB and alpha");
+    const bool debug = data.terrain_settings.mode == terrain::Mode::Materials ||
+                       data.terrain_settings.mode == terrain::Mode::Boundaries;
+    if (debug) {
+        rsp.textureState.on = 0;
+        rdp.setCombine(shade_combiner);
+    }
+    rsp.clearGeometryMode(G_LIGHTING | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+    // RT64's legacy front-cull path narrows a swapped raw index to uint8_t.
+    // Normalize winding here before submitting a large global terrain index.
+    const bool reverse = (saved_geometry & rsp.cullBothMask) == rsp.cullFrontMask;
+    if (reverse) {
+        rsp.clearGeometryMode(rsp.cullBothMask);
+        rsp.setGeometryMode(active_->gbi_->constants[F3DENUM::G_CULL_BACK]);
+    }
+    std::array<RT64::RSP::Vertex, 128> output;
+    std::array<terrain::Vec3, 128> float_positions;
+    for (std::size_t offset = 0; offset < patch->vertices.size(); offset += output.size()) {
+        const auto count = std::min(output.size(), patch->vertices.size() - offset);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& source_vertex = patch->vertices[offset + i];
+            const auto& position =
+                data.terrain_settings.mode == terrain::Mode::Surface ? source_vertex.base : source_vertex.position;
+            float_positions[i] = position;
+            auto& v = output[i];
+            v = {};
+            v.x = static_cast<std::int16_t>(std::lround(std::clamp(position[0], -32760.F, 32760.F)));
+            v.y = static_cast<std::int16_t>(std::lround(std::clamp(position[1], -32760.F, 32760.F)));
+            v.z = static_cast<std::int16_t>(std::lround(std::clamp(position[2], -32760.F, 32760.F)));
+            v.s = static_cast<std::int16_t>(std::lround(source_vertex.uv[0]));
+            v.t = static_cast<std::int16_t>(std::lround(source_vertex.uv[1]));
+            v.color.r = source_vertex.color[0];
+            v.color.g = source_vertex.color[1];
+            v.color.b = source_vertex.color[2];
+            v.color.a = source_vertex.color[3];
+        }
+        std::memcpy(state->RDRAM + kScratchVertexAddress, output.data(), count * sizeof(output[0]));
+        std::memcpy(state->RDRAM + float_positions_address, float_positions.data(), count * sizeof(float_positions[0]));
+        // Retail DKR uses only slots 0..31. Extra terrain uses private slots,
+        // preserving source vertices for the rest of this command/batch.
+        rsp.setVertex(kScratchVertexAddress, static_cast<std::uint32_t>(count), 32);
+        // DKR supplies UVs through G_MWO_POINT_ST, bypassing the RSP texture
+        // scale (which can be zero). Match that exact 10.5 -> float contract.
+        for (std::size_t i = 0; i < count; ++i) {
+            workload.drawData.tcFloats[(first + offset + i) * 2] = patch->vertices[offset + i].uv[0] / 32.F;
+            workload.drawData.tcFloats[(first + offset + i) * 2 + 1] = patch->vertices[offset + i].uv[1] / 32.F;
+        }
+    }
+    for (std::size_t i = 0; i < patch->indices.size(); i += 3)
+        rsp.drawIndexedTri(first + patch->indices[i + (reverse ? 2 : 0)], first + patch->indices[i + 1],
+                           first + patch->indices[i + (reverse ? 0 : 2)], true);
+    if (data.terrain_settings.mode == terrain::Mode::Geometry && !patch->decoration_vertices.empty()) {
+        rsp.textureState.on = 0;
+        rdp.setCombine(shade_combiner);
+        rsp.clearGeometryMode(rsp.cullBothMask);
+        const auto decoration_first = workload.drawData.vertexCount();
+        for (std::size_t offset = 0; offset < patch->decoration_vertices.size(); offset += output.size()) {
+            const auto count = std::min(output.size(), patch->decoration_vertices.size() - offset);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& source_vertex = patch->decoration_vertices[offset + i];
+                const auto& anchor = source_vertex.base;
+                const auto clip = hlslpp::mul(hlslpp::float4(anchor[0], anchor[1], anchor[2], 1),
+                                              rsp.modelMatrixStack[data.selected_matrix]);
+                float fade = std::clamp((2000.F - std::abs(static_cast<float>(clip.w))) / 800.F, 0.F, 1.F);
+                fade = fade * fade * (3.F - 2.F * fade);
+                auto& v = output[i];
+                v = {};
+                const auto component = [&](unsigned axis) {
+                    float_positions[i][axis] = std::clamp(
+                        anchor[axis] + (source_vertex.position[axis] - anchor[axis]) * fade, -32760.F, 32760.F);
+                    return static_cast<std::int16_t>(std::lround(float_positions[i][axis]));
+                };
+                v.x = component(0);
+                v.y = component(1);
+                v.z = component(2);
+                v.color.r = source_vertex.color[0];
+                v.color.g = source_vertex.color[1];
+                v.color.b = source_vertex.color[2];
+                v.color.a = 255;
+            }
+            std::memcpy(state->RDRAM + kScratchVertexAddress, output.data(), count * sizeof(output[0]));
+            std::memcpy(state->RDRAM + float_positions_address, float_positions.data(),
+                        count * sizeof(float_positions[0]));
+            rsp.setVertex(kScratchVertexAddress, static_cast<std::uint32_t>(count), 32);
+        }
+        for (std::size_t i = 0; i < patch->decoration_indices.size(); i += 3)
+            rsp.drawIndexedTri(decoration_first + patch->decoration_indices[i],
+                               decoration_first + patch->decoration_indices[i + 1],
+                               decoration_first + patch->decoration_indices[i + 2], true);
+        data.terrain_triangles += patch->decoration_indices.size() / 3;
+    }
+    rsp.textureState = saved_texture;
+    rsp.setVertexSegmentV1(saved_position_enabled, G_EX_VERTEX_POSITION, saved_position_address, saved_position_base);
+    rdp.setCombine((std::uint64_t(saved_combiner.H) << 32) | saved_combiner.L);
+    rsp.geometryModeStack[rsp.geometryModeStackSize - 1] = saved_geometry;
+    ++data.terrain_patches;
+    data.terrain_triangles += patch->indices.size() / 3;
+    data.terrain_submit_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    return true;
+}
+
 void dkr::runtime::F3DDKRRT64Bridge::Triangle(RT64::State* state,
                                               RT64::DisplayList** display_list) {
     assert(active_ != nullptr);
@@ -2810,7 +2975,8 @@ void dkr::runtime::F3DDKRRT64Bridge::Triangle(RT64::State* state,
                 static_cast<std::uint16_t>(t[corner]);
             rsp.modifyVertex(vertices[corner], G_MWO_POINT_ST, texcoord);
         }
-        rsp.drawIndexedTri(vertices[0], vertices[1], vertices[2]);
+        if (!DrawTerrainTriangle(state, address, vertices))
+            rsp.drawIndexedTri(vertices[0], vertices[1], vertices[2]);
     }
     data.vertex_cursor = 0U;
 }

@@ -16,6 +16,8 @@ struct Metrics {
 };
 
 void record_simulation_tick();
+// Process-monotonic host counter, including frontend/menu ticks.
+std::uint64_t simulation_tick_sequence();
 void record_audio_buffer(std::size_t interleaved_sample_count);
 void record_graphics_task();
 void record_vi_present();

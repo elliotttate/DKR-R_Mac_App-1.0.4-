@@ -61,6 +61,10 @@ void dkr::runtime::telemetry::record_simulation_tick() {
     g_counters.simulation_ticks.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t dkr::runtime::telemetry::simulation_tick_sequence() {
+    return g_counters.simulation_ticks.load(std::memory_order_relaxed);
+}
+
 void dkr::runtime::telemetry::record_audio_buffer(
     std::size_t interleaved_sample_count) {
     g_counters.audio_frames.fetch_add(interleaved_sample_count / 2U,

@@ -45,6 +45,8 @@ private:
                                        std::uint8_t variant);
     static void FinishShadowScope(RT64::State* state);
     static bool DrawPalmReplacement(RT64::State* state);
+    static bool DrawTerrainTriangle(RT64::State* state, std::uint32_t address,
+                                    const std::array<std::uint8_t, 3>& vertices);
     static void AdjustSplitViewportCommand(RT64::State* state,
                                            RT64::DisplayList* command,
                                            std::uint8_t opcode);

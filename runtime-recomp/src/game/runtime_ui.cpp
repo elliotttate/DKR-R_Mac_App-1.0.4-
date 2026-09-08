@@ -1,5 +1,6 @@
 #include "runtime_ui.hpp"
 #include "palm_model.hpp"
+#include "terrain_detail.hpp"
 
 #include "game_registration.hpp"
 #include "generated/jumpman_font.h"
@@ -1209,6 +1210,11 @@ void SaveSettings() {
         output << "modern_downsample=" << g_modern_downsample << '\n';
         output << "modern_anisotropy="
                << dkr::runtime::enhancements::anisotropy_level() << '\n';
+        const auto terrain_config = dkr::runtime::terrain::settings();
+        output << "terrain_mode=" << static_cast<int>(terrain_config.mode) << '\n';
+        output << "terrain_strength=" << terrain_config.strength << '\n';
+        output << "terrain_quality=" << terrain_config.quality << '\n';
+        output << "terrain_vegetation=" << terrain_config.vegetation << '\n';
         output << "modern_texture_lod_bias_hundredths="
                << dkr::runtime::enhancements::texture_lod_bias_hundredths()
                << '\n';
@@ -1722,6 +1728,13 @@ void LoadSettings() {
             } else if (key == "online_guide_acknowledged_version") {
                 g_online_guide_acknowledged_version = std::clamp(
                     number, 0, kOnlineGuideVersion);
+            } else if (key.starts_with("terrain_")) {
+                auto terrain_config = dkr::runtime::terrain::settings();
+                if (key == "terrain_mode") terrain_config.mode = static_cast<dkr::runtime::terrain::Mode>(number);
+                else if (key == "terrain_strength") terrain_config.strength = number;
+                else if (key == "terrain_quality") terrain_config.quality = number;
+                else if (key == "terrain_vegetation") terrain_config.vegetation = number != 0;
+                dkr::runtime::terrain::set_settings(terrain_config);
             } else if (key == "modern_anisotropy") {
                 dkr::runtime::enhancements::set_anisotropy_level(number);
             } else if (key == "modern_texture_lod_bias_hundredths") {
@@ -8337,6 +8350,31 @@ void DrawModsHacks(float width) {
     ImGui::Dummy({0.0F, 10.0F});
 
     static bool texture_packs_expanded = true;
+    static bool terrain_expanded = true;
+    if (DrawDisclosureButton("TERRAIN DETAIL", "terrain-detail", terrain_expanded, width)) {
+        ImGui::Dummy({0.0F, 6.0F});
+        if (dkr::runtime::enhancements::modern_presentation_enabled()) {
+            auto terrain_config = dkr::runtime::terrain::settings();
+            int mode = static_cast<int>(terrain_config.mode);
+            bool changed = ImGui::Combo("Terrain (F7)", &mode,
+                "Original\0Surface detail\0Surface + geometry\0Material debug\0Boundary debug\0");
+            terrain_config.mode = static_cast<dkr::runtime::terrain::Mode>(mode);
+            changed |= ImGui::SliderInt("Terrain strength", &terrain_config.strength, 0, 150, "%d%%");
+            changed |= ImGui::Combo("Terrain quality", &terrain_config.quality, "Low\0Balanced\0High\0");
+            changed |= ImGui::Checkbox("Grass tufts and stones", &terrain_config.vegetation);
+            if (changed) {
+                dkr::runtime::terrain::set_settings(terrain_config);
+                dkr::runtime::ui::persist_settings();
+            }
+            ImGui::TextWrapped("Natural surface detail and sculpted cliffs. F7 compares original, shading, and geometry. Shift+F7 inspects materials and protected joins.");
+            if (mode >= 3) ImGui::TextWrapped("Grass: green. Rock: orange. Sand: tan. Snow: pale blue. Earth: brown. Ice: cyan. Paving: grey. Water: blue. Path: yellow. Excluded: purple. Boundary view: red joins stay fixed.");
+            const auto stats = dkr::runtime::terrain::statistics();
+            ImGui::Text("%u patches / %u triangles visible; CPU %.2f ms", stats.drawn_patches, stats.drawn_triangles, stats.submit_ms);
+        } else {
+            ImGui::TextWrapped("Terrain detail is available in the Modern presentation profile.");
+        }
+        ImGui::Dummy({0.0F, 10.0F});
+    }
     if (DrawDisclosureButton("TEXTURE PACKS", "texture-packs",
                              texture_packs_expanded, width)) {
         ImGui::Dummy({0.0F, 6.0F});

@@ -1,11 +1,33 @@
-# DKR-R for macOS — Apple Silicon
+# DKR-R for macOS — 3D plants and terrain preview
+
+This experimental Apple Silicon fork builds on
+[jt87's macOS port](https://github.com/jt87/DKR-R_Mac_App-1.0.4-) of
+[DKR-R](https://github.com/ThatGuyMcd/DKR-R). It adds optional Modern-profile
+3D plant replacements and procedural terrain detail while preserving the
+original game simulation and collision.
+
+- **3D plants (F8):** repaired [palms and attached canopies](HAVEN-PALM-3D-PREVIEW.md),
+  [blueberries](BLUEBERRY-3D-PREVIEW.md), [rubber trees](RUBBER-TREE-3D-PREVIEW.md),
+  and [beach trees](BEACH-TREE-3D-PREVIEW.md), with stable rigid-model interpolation.
+- **Terrain detail (F7):** material-specific shading, refined cliffs, and restrained
+  decorations across playable levels and startup demonstrations. See
+  [coverage, controls, and validation limits](TERRAIN-DETAIL.md).
+- **Native packaging:** bundled SDL runtimes and Finder-safe asset discovery.
+  See [local build instructions](LOCAL-MAC-BUILD.md).
+
+These development previews are ad-hoc signed, **not notarized**. No binary
+release is published by this source update. ROMs, saves, external HD packs,
+and ROM-derived audit fixtures are not included. The original release and
+its installation instructions below describe jt87's build, not these previews.
+
+## Original macOS release (jt87)
 
 **Unofficial macOS build of [DKR-R](https://github.com/ThatGuyMcd/DKR-R) (Diddy
 Kong Racing Recompiled).** Signed and notarized by Apple, so it installs like
-any normal Mac app. This fork exists only to build DKR-R for macOS; all game
+any normal Mac app. That original fork was created to build DKR-R for macOS; all game
 credit belongs to the upstream project. This build was put together by Claude and tested by jt87.
 
-### [Download the latest release](../../releases/latest)
+### [Download jt87's original macOS release](https://github.com/jt87/DKR-R_Mac_App-1.0.4-/releases/latest)
 
 | | |
 |---|---|

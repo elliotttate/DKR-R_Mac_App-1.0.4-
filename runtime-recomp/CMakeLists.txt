@@ -456,6 +456,7 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         src/game/game_registration.cpp
         src/game/null_renderer.cpp
         src/game/palm_model.cpp
+        src/game/terrain_detail.cpp
         src/game/presentation_identity.cpp
         src/game/rev_a_asset_mutex.cpp
         src/game/rom_revision.cpp
@@ -1084,6 +1085,9 @@ if(BUILD_TESTING)
     add_test(NAME DKRPresentationIdentity COMMAND DKRPresentationIdentityTests)
 
     add_executable(DKRPalmModelTests tests/palm_model_tests.cpp src/game/palm_model.cpp)
+    add_executable(DKRTerrainDetailTests tests/terrain_detail_tests.cpp src/game/terrain_detail.cpp)
+    target_include_directories(DKRTerrainDetailTests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/game")
+    add_test(NAME DKRTerrainDetail COMMAND DKRTerrainDetailTests)
     target_include_directories(DKRPalmModelTests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/game")
     add_test(NAME DKRPalmModel COMMAND DKRPalmModelTests
         "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm"

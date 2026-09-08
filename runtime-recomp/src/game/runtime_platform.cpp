@@ -1,5 +1,7 @@
 #include "runtime_platform.hpp"
 #include "palm_model.hpp"
+#include "terrain_detail.hpp"
+#include "terrain_qa.hpp"
 #include "audio_equalizer.hpp"
 #include "controller_snapshot.hpp"
 #include "controller_mapping_policy.hpp"
@@ -1692,6 +1694,25 @@ bool dkr::runtime::platform::handle_window_shortcut(
     }
 
     const bool f11 = event->key.keysym.scancode == SDL_SCANCODE_F11;
+    if (renderer_active && event->key.keysym.scancode == SDL_SCANCODE_F6 &&
+        !g_online_input_routing.load(std::memory_order_acquire) &&
+        std::getenv("DKR_TERRAIN_QA_ROUTE")) {
+        if (!terrain::qa::load(std::getenv("DKR_TERRAIN_QA_ROUTE")))
+            std::fprintf(stderr, "[terrain-qa] invalid or empty route\n");
+        return true;
+    }
+    if (renderer_active && event->key.keysym.scancode == SDL_SCANCODE_F7 &&
+        dkr::runtime::enhancements::modern_presentation_enabled()) {
+        auto config = terrain::settings();
+        const bool debug = (event->key.keysym.mod & KMOD_SHIFT) != 0;
+        config.mode = debug
+            ? (config.mode == terrain::Mode::Materials ? terrain::Mode::Boundaries : terrain::Mode::Materials)
+            : static_cast<terrain::Mode>((static_cast<int>(config.mode) + 1) % 3);
+        terrain::set_settings(config);
+        dkr::runtime::ui::persist_settings();
+        std::fprintf(stderr, "[terrain] F7: %s\n", terrain::mode_name(config.mode));
+        return true;
+    }
     if (renderer_active && event->key.keysym.scancode == SDL_SCANCODE_F8 &&
         dkr::runtime::enhancements::modern_presentation_enabled() && palm::available()) {
         const bool enabled = !palm::enabled();
@@ -2361,6 +2382,8 @@ bool dkr::runtime::platform::get_input(int controller, std::uint16_t* buttons,
     *buttons = g_buttons[index].load(std::memory_order_acquire);
     *x = g_stick_x[index].load(std::memory_order_acquire);
     *y = g_stick_y[index].load(std::memory_order_acquire);
+    if (std::getenv("DKR_TERRAIN_QA_ROUTE"))
+        terrain::qa::input(static_cast<unsigned>(controller), telemetry::simulation_tick_sequence(), buttons, x, y);
     return true;
 }
 
@@ -2512,6 +2535,8 @@ dkr::runtime::platform::get_connected_device_info(int controller) {
             g_rumble_enabled.load(std::memory_order_acquire), true);
     const bool online_routing =
         g_online_input_routing.load(std::memory_order_acquire);
+    if (!online_routing && terrain::qa::virtual_port(controller))
+        return {ultramodern::input::Device::Controller, ultramodern::input::Pak::None};
     if (dkr::runtime::netplay::online_port_occupied(
             online_routing,
             g_online_occupied_mask.load(std::memory_order_acquire),
