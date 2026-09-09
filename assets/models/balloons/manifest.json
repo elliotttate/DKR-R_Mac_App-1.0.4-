@@ -1,0 +1,175 @@
+{
+  "source": "Meshy_AI_Starry_Red_Balloon_0908130421_texture (2).usdz",
+  "source_sha256": "adaa2d690ae752f8eb92b0acd58b09114ec89021c1202d33b6734294ebd3c720",
+  "source_triangles": 3148,
+  "source_boundary_edges": 0,
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "material_profile": "reference-guided-gloss-wrap-v2",
+  "source_textures_used": false,
+  "reference": "balloons-combined.png",
+  "reference_sha256": "74d31ab60f214cc48d66a8550c60aaaf3a391c90ce9cae85f4cf385396e18242",
+  "reference_mappings": [
+    {
+      "sprite_id": 147,
+      "source_wrap": "blue.png",
+      "sha256": "c340c4ba40d490ac5554db6f3e4604ac599fd07c41ed4e4797d223aaba6cab19",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 148,
+      "source_wrap": "red.png",
+      "sha256": "9bbbd53273c800ce03817673dc2b2a94244586567a8bd3cb8ccf28b3ee169b5d",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 149,
+      "source_wrap": "green.png",
+      "sha256": "440ddc688d85798949c32cf75ba7bdb13cf62905a29f24c6085ad99488304576",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 150,
+      "source_wrap": "shield.png",
+      "sha256": "75012c9c3e11bda3bb6468ea470617c912f6e95a4390d5bd1eb680dfda9ec99f",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 151,
+      "source_wrap": "rainbow.png",
+      "sha256": "dccbeb36ce76f09d6f7f68823c1f7c69410b05d6349f25006d12c4d0b8af7c17",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 154,
+      "source_wrap": "gold.png",
+      "sha256": "a9b2678716952a2bc0102c4a8ce4f23c3c7cf21a5e416c2f17b55d982efb3e3c",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    },
+    {
+      "sprite_id": 155,
+      "source_wrap": "silver.png",
+      "sha256": "9d04c0bbfacbcfd886fc08309b10ec0645215c3f4eff1f427fbf4e4d8f501a8d",
+      "mapping": "full-circumference latitude/longitude; repaired periodic map with locked outer edges",
+      "source_wrap_size": [
+        1774,
+        887
+      ]
+    }
+  ],
+  "uv_layout": "new non-overlapping smart unwrap with 12px bake gutter",
+  "variants": [
+    {
+      "name": "boost-blue",
+      "sprite_id": 147,
+      "hash": "42414c4c33440093",
+      "texture": "42414c4c33440093.png"
+    },
+    {
+      "name": "missile-red",
+      "sprite_id": 148,
+      "hash": "42414c4c33440094",
+      "texture": "42414c4c33440094.png"
+    },
+    {
+      "name": "trap-green",
+      "sprite_id": 149,
+      "hash": "42414c4c33440095",
+      "texture": "42414c4c33440095.png"
+    },
+    {
+      "name": "shield-yellow",
+      "sprite_id": 150,
+      "hash": "42414c4c33440096",
+      "texture": "42414c4c33440096.png"
+    },
+    {
+      "name": "magnet-rainbow",
+      "sprite_id": 151,
+      "hash": "42414c4c33440097",
+      "texture": "42414c4c33440097.png"
+    },
+    {
+      "name": "collectible-gold",
+      "sprite_id": 154,
+      "hash": "42414c4c3344009a",
+      "texture": "42414c4c3344009a.png"
+    },
+    {
+      "name": "collectible-silver",
+      "sprite_id": 155,
+      "hash": "42414c4c3344009b",
+      "texture": "42414c4c3344009b.png"
+    }
+  ],
+  "meshes": [
+    {
+      "file": "near.dkrmesh",
+      "triangles": 3148,
+      "vertices": 2107
+    },
+    {
+      "file": "far.dkrmesh",
+      "triangles": 3148,
+      "vertices": 2107
+    },
+    {
+      "file": "collectible-near.dkrmesh",
+      "triangles": 2842,
+      "vertices": 1819
+    },
+    {
+      "file": "collectible-far.dkrmesh",
+      "triangles": 2842,
+      "vertices": 1819
+    }
+  ],
+  "runtime_placement": {
+    "147": {
+      "height": 66,
+      "bottom": 4,
+      "width": 43
+    },
+    "148-151": {
+      "height": 66,
+      "bottom": 6,
+      "width": 43
+    },
+    "154": {
+      "height": 48,
+      "bottom": 22,
+      "width": 43
+    },
+    "155": {
+      "height": 50,
+      "bottom": 21,
+      "width": 43
+    }
+  }
+}

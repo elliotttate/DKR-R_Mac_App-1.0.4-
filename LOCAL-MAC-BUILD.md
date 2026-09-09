@@ -28,6 +28,7 @@ export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
 export CMAKE_PREFIX_PATH=/path/to/sdl2-2.32.10/install
 export DKR_MAC_SDL2_DYLIB=/path/to/sdl2-2.32.10/build/libSDL2-2.0.0.dylib
 export DKR_MAC_V80_GENERATED_SOURCE="$PWD/build/recomp-v80/RecompiledFuncs"
+export DKR_RELEASE_VERSION=1.0.4-macos.1
 bash Build-macOS.sh
 ```
 

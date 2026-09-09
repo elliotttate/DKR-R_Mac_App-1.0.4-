@@ -1736,7 +1736,8 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
         auto* cache = state->ext.textureCache;
         const auto& workload = state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
         for (const auto sprite : {palm::kSpriteId, palm::kBlueberrySpriteId,
-                                  palm::kRubberTreeSpriteId, palm::kBeachTreeSpriteId}) {
+                                  palm::kRubberTreeSpriteId, palm::kBeachTreeSpriteId, palm::kBananaSpriteId,
+                                  147U,148U,149U,150U,151U,154U,155U}) {
             const auto hash = palm::texture_hash(sprite);
             if (!palm::select_mesh(palm::assets(), sprite, false) || !cache->hasReplacement(hash)) continue;
             state->textureManager.uploadEmpty(state, cache, workload.submissionFrame,
@@ -2513,7 +2514,8 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
                                                 sample.position[2], 1.0F), data.palm_world_matrix);
     // The combined DKR camera matrix carries camera distance in clip W.
     // LOD affects geometry only, never the object's transform identity.
-    const bool far = std::abs(static_cast<float>(anchor.w)) > 1800.0F;
+    const bool far = std::abs(static_cast<float>(anchor.w)) >
+        (sample.sprite_id == palm::kBananaSpriteId ? 650.0F : 1800.0F);
     if (std::getenv("DKR_TRACE_PALM_3D")) {
         static std::unordered_map<std::uint32_t, bool> previous_lods;
         static unsigned logged_switches = 0;
@@ -2619,14 +2621,13 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
                              group.interpolate_texcoords, group.interpolate_tiles,
         ActiveAspectMode(data.interpolation_groups, data.matrix_aspect_override_active,
                          data.matrix_aspect_override));
-    static std::array<std::uint32_t, 6> logged{};
-    const auto trace_slot = sample.sprite_id == palm::kBeachTreeSpriteId ? 5U :
-        sample.sprite_id == palm::kBlueberrySpriteId ? 0U : sample.sprite_id - 112U;
+    static std::array<std::uint32_t, 15> logged{};
+    const auto trace_slot = palm::trace_slot(sample.sprite_id);
     if (std::getenv("DKR_TRACE_PALM_3D") && logged[trace_slot]++ < 16) {
-        std::fprintf(stderr, "[palm3d] draw task=%llu sprite=%u id=%08X pos=(%.1f,%.1f,%.1f) scale=%.3f lod=%s triangles=%zu clipw=%.1f\n",
+        std::fprintf(stderr, "[palm3d] draw task=%llu sprite=%u id=%08X pos=(%.1f,%.1f,%.1f) scale=%.3f lod=%s triangles=%zu clipw=%.1f phase=%u\n",
                      static_cast<unsigned long long>(data.task_count), sample.sprite_id, sample.identity,
                      sample.position[0], sample.position[1], sample.position[2], sample.scale,
-                     far ? "far" : "near", mesh.indices.size() / 3, static_cast<float>(anchor.w));
+                     far ? "far" : "near", mesh.indices.size() / 3, static_cast<float>(anchor.w), sample.animation_phase);
     }
     return true;
 }

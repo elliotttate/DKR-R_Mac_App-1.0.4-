@@ -117,7 +117,22 @@ std::array<float, 3> world_position(const Vertex& vertex, const Sample& sample) 
     float x = vertex.position[0] * 66.0F;
     float y = vertex.position[1] * 66.0F + 2.0F;
     float z = vertex.position[2] * 66.0F;
-    if (sample.sprite_id == kBeachTreeSpriteId) {
+    if (balloon_sprite(sample.sprite_id)) {
+        // USA 1.0/1.1 decoded sprite quads: blue y=4..70, other weapon
+        // colors 6..72, gold 22..70, silver 21..71. Mesh X/Z width is 1.
+        const bool gold = sample.sprite_id == 154, silver = sample.sprite_id == 155;
+        const float height = gold ? 48.F : silver ? 50.F : 66.F;
+        const float bottom = gold ? 22.F : silver ? 21.F : sample.sprite_id == 147 ? 4.F : 6.F;
+        x = vertex.position[0] * 43.F;
+        y = vertex.position[1] * height + bottom;
+        z = vertex.position[2] * 43.F;
+    } else if (sample.sprite_id == kBananaSpriteId) {
+        // USA 1.0/1.1 sprite 156: anchor (36,66), tile y=6, height=51.
+        // The quad spans y=9..59; keep that authored floating offset.
+        x = vertex.position[0] * 50.0F;
+        y = vertex.position[1] * 50.0F + 9.0F;
+        z = vertex.position[2] * 50.0F;
+    } else if (sample.sprite_id == kBeachTreeSpriteId) {
         // USA 1.0/1.1 BeachTree: anchor 122; tile vertices span -6..116.
         // Preserve that authored foot offset and full 122-unit height.
         x = vertex.position[0] * 122.0F;
@@ -152,7 +167,12 @@ std::array<float, 3> world_position(const Vertex& vertex, const Sample& sample) 
         x += .010F * width;
         z -= .0025F * width;
     }
-    const float cy = std::cos(sample.yaw * radians), sy = std::sin(sample.yaw * radians);
+    // One mesh covers all eight original frames. Use all 256 phase values so
+    // each simulation update advances smoothly; RT64 interpolates the rigid
+    // transform between updates, including the 255->0 phase wrap.
+    const float yaw = (sample.yaw + (sample.sprite_id == kBananaSpriteId ?
+        static_cast<int>(sample.animation_phase) * 256 : 0)) * radians;
+    const float cy = std::cos(yaw), sy = std::sin(yaw);
     const float cp = std::cos(sample.pitch * radians), sp = std::sin(sample.pitch * radians);
     const float cr = std::cos(sample.roll * radians), sr = std::sin(sample.roll * radians);
     const float pitched_y = y * cp - z * sp;
@@ -196,6 +216,13 @@ std::array<std::int16_t, 3> local_position(const Vertex& vertex) {
 }
 
 const Mesh* select_mesh(const Assets& loaded, std::uint32_t sprite, bool far) {
+    if (balloon_sprite(sprite)) {
+        if (!loaded.balloon_ready) return nullptr;
+        if (collectible_balloon(sprite)) return far ? &loaded.collectible_far : &loaded.collectible_near;
+        return far ? &loaded.balloon_far : &loaded.balloon_near;
+    }
+    if (sprite == kBananaSpriteId)
+        return loaded.banana_ready ? (far ? &loaded.banana_far : &loaded.banana_near) : nullptr;
     if (sprite == kBeachTreeSpriteId)
         return loaded.beach_tree_ready ? (far ? &loaded.beach_tree_far : &loaded.beach_tree_near) : nullptr;
     if (sprite == kRubberTreeSpriteId)
@@ -210,7 +237,9 @@ const Mesh* select_mesh(const Assets& loaded, std::uint32_t sprite, bool far) {
 void initialise(const std::filesystem::path& directory,
                 const std::filesystem::path& blueberry_directory,
                 const std::filesystem::path& rubber_tree_directory,
-                const std::filesystem::path& beach_tree_directory) {
+                const std::filesystem::path& beach_tree_directory,
+                const std::filesystem::path& banana_directory,
+                const std::filesystem::path& balloon_directory) {
     std::call_once(g_initialised, [&] {
         const char* opt_out = std::getenv("DKR_PALM_3D");
         g_enabled.store(!opt_out || std::strcmp(opt_out, "0") != 0);
@@ -258,7 +287,30 @@ void initialise(const std::filesystem::path& directory,
         } else if (!beach_tree_directory.empty()) {
             std::fprintf(stderr, "[plant3d] beach tree sprite fallback: %s\n", error.c_str());
         }
-        const bool any_ready = loaded.ready || loaded.blueberry_ready || loaded.rubber_tree_ready || loaded.beach_tree_ready;
+        if (!banana_directory.empty() &&
+            load_mesh(banana_directory / "near.dkrmesh", loaded.banana_near, error) &&
+            load_mesh(banana_directory / "far.dkrmesh", loaded.banana_far, error)) {
+            loaded.banana_directory = banana_directory;
+            loaded.banana_ready = true;
+            std::fprintf(stderr, "[item3d] banana ready: %zu / %zu triangles; sprite 156, guest-phase rotation\n",
+                         loaded.banana_near.indices.size() / 3, loaded.banana_far.indices.size() / 3);
+        } else if (!banana_directory.empty()) {
+            std::fprintf(stderr, "[item3d] banana sprite fallback: %s\n", error.c_str());
+        }
+        if (!balloon_directory.empty() &&
+            load_mesh(balloon_directory / "near.dkrmesh", loaded.balloon_near, error) &&
+            load_mesh(balloon_directory / "far.dkrmesh", loaded.balloon_far, error) &&
+            load_mesh(balloon_directory / "collectible-near.dkrmesh", loaded.collectible_near, error) &&
+            load_mesh(balloon_directory / "collectible-far.dkrmesh", loaded.collectible_far, error)) {
+            loaded.balloon_directory = balloon_directory;
+            loaded.balloon_ready = true;
+            std::fprintf(stderr, "[item3d] balloons ready: %zu weapon / %zu collectible triangles; sprites 147-151,154,155\n",
+                         loaded.balloon_near.indices.size()/3, loaded.collectible_near.indices.size()/3);
+        } else if (!balloon_directory.empty()) {
+            std::fprintf(stderr, "[item3d] balloon sprite fallback: %s\n", error.c_str());
+        }
+        const bool any_ready = loaded.ready || loaded.blueberry_ready || loaded.rubber_tree_ready ||
+                               loaded.beach_tree_ready || loaded.banana_ready || loaded.balloon_ready;
         g_assets = std::move(loaded);
         g_ready.store(any_ready, std::memory_order_release);
     });

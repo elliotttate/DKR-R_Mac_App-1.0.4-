@@ -1,0 +1,67 @@
+{
+  "configuration": {
+    "configurationVersion": 3,
+    "hashVersion": 5,
+    "autoPath": "rt64",
+    "defaultOperation": "preload",
+    "defaultShift": "none"
+  },
+  "textures": [
+    {
+      "hashes": {
+        "rt64": "42414c4c33440093"
+      },
+      "path": "42414c4c33440093.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c33440094"
+      },
+      "path": "42414c4c33440094.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c33440095"
+      },
+      "path": "42414c4c33440095.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c33440096"
+      },
+      "path": "42414c4c33440096.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c33440097"
+      },
+      "path": "42414c4c33440097.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c3344009a"
+      },
+      "path": "42414c4c3344009a.png",
+      "operation": "preload",
+      "shift": "none"
+    },
+    {
+      "hashes": {
+        "rt64": "42414c4c3344009b"
+      },
+      "path": "42414c4c3344009b.png",
+      "operation": "preload",
+      "shift": "none"
+    }
+  ]
+}

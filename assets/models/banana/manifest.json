@@ -1,0 +1,27 @@
+{
+  "source": "Banana_-_Photorealistic_Fruit_Asset.usdz",
+  "source_sha256": "c2d9e989430b632f3f02c2a7808695dda32b2b3bea5cc82a0d85d184e6091287",
+  "source_triangles": 2762,
+  "source_boundary_edges": 0,
+  "texture": "42414e414e413301.png",
+  "texture_size": [
+    1024,
+    1024
+  ],
+  "coordinate_system": "Y-up, upright, centered spin axis, bottom 0, height 1",
+  "baked_lighting_profile": "banana-gentle-wrap-v1",
+  "sprite_id": 156,
+  "animation": "guest animFrame low byte drives a world-space Y rotation",
+  "lods": [
+    {
+      "file": "near.dkrmesh",
+      "vertices": 1749,
+      "triangles": 2762
+    },
+    {
+      "file": "far.dkrmesh",
+      "vertices": 1749,
+      "triangles": 2762
+    }
+  ]
+}

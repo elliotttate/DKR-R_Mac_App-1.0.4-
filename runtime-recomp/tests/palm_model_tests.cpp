@@ -51,6 +51,15 @@ int main(int argc, char** argv) {
     CHECK(supported_sprite(113) && !supported_sprite(117));
     CHECK(supported_sprite(kBlueberrySpriteId));
     CHECK(supported_sprite(kBeachTreeSpriteId) && !supported_sprite(109));
+    CHECK(supported_sprite(kBananaSpriteId) && !supported_sprite(161)); // HUD stays a sprite.
+    CHECK(supported_object(kBananaSpriteId, 1, 32, 32));
+    CHECK(!supported_object(kBananaSpriteId, 1, 2, 2));
+    CHECK(!supported_object(kBananaSpriteId, 0, 32, 32));
+    CHECK(!supported_object(kBananaSpriteId, 1, 32, 65)); // Not the banana spawner.
+    CHECK(supported_object(115, 1, 2, 2));
+    CHECK(!supported_object(115, 1, 32, 32));
+    CHECK(texture_hash(kBananaSpriteId) == kBananaTextureHash &&
+          kBananaTextureHash != kTextureHash && kBananaTextureHash != kBlueberryTextureHash);
     CHECK(texture_hash(kBlueberrySpriteId) == kBlueberryTextureHash);
     CHECK(texture_hash(114) == kTextureHash && texture_hash(115) == kTextureHash);
     CHECK(texture_hash(109) == 0 && kBlueberryTextureHash != kTextureHash);
@@ -128,14 +137,93 @@ int main(int argc, char** argv) {
     CHECK(select_mesh(families, 108, false) == nullptr);
     CHECK(select_mesh(families, 115, false) == nullptr);
     CHECK(select_mesh(families, 106, false) == nullptr);
+    CHECK(select_mesh(families, kBananaSpriteId, false) == nullptr);
+    families.banana_ready = true;
+    CHECK(select_mesh(families, kBananaSpriteId, false) == &families.banana_near);
+    CHECK(select_mesh(families, kBananaSpriteId, true) == &families.banana_far);
+
+    // All seven active balloon finishes are sprite- AND behavior-scoped.
+    // Color cheats and Adventure Two naturally follow the guest's model ID.
+    for (const auto id : kBalloonSpriteIds) {
+        CHECK(supported_sprite(id) && balloon_sprite(id));
+        const int behavior = weapon_balloon(id) ? 17 : 77;
+        CHECK(supported_object(id, 1, behavior, behavior));
+        CHECK(!supported_object(id, 0, behavior, behavior));
+        CHECK(!supported_object(id, 1, behavior, 23));
+        CHECK(!supported_object(id, 1, 2, 2));
+        CHECK(!supported_object(id, 1, 32, 32));
+        CHECK(texture_hash(id) != texture_hash(156) && texture_hash(id) != texture_hash(115));
+        CHECK(trace_slot(id) >= 7 && trace_slot(id) < 14);
+        for (const auto other : kBalloonSpriteIds)
+            if (other != id) CHECK(texture_hash(id) != texture_hash(other) && trace_slot(id) != trace_slot(other));
+        CHECK(select_mesh(families, id, false) == nullptr);
+        families.balloon_ready = true;
+        CHECK(select_mesh(families, id, false) == (weapon_balloon(id) ? &families.balloon_near : &families.collectible_near));
+        CHECK(select_mesh(families, id, true) == (weapon_balloon(id) ? &families.balloon_far : &families.collectible_far));
+        families.balloon_ready = false;
+        Sample balloon{{0,0,0}, 1, 0,0,0, 789,true}; balloon.sprite_id = id;
+        const float bottom = id==154 ? 22 : id==155 ? 21 : id==147 ? 4 : 6;
+        const float height = id==154 ? 48 : id==155 ? 50 : 66;
+        CHECK(std::abs(world_position(base,balloon)[1]-bottom) < .001F);
+        CHECK(std::abs(world_position(top,balloon)[1]-bottom-height) < .001F);
+        CHECK(std::abs(world_position(side,balloon)[0]-43) < .001F);
+        const auto pose = model_transform(balloon);
+        balloon.animation_phase = 128;
+        CHECK(model_transform(balloon) == pose); // Unlike bananas, no invented spin.
+        const auto stable_key = model_interpolation_key(balloon);
+        for (float respawn_scale : {.001F,.1F,.5F,1.F}) {
+            balloon.scale = respawn_scale;
+            CHECK(valid_sample(balloon));
+            CHECK(model_interpolation_key(balloon) == stable_key);
+            CHECK(std::abs(world_position(top,balloon)[1]-(bottom+height)*respawn_scale) < .001F);
+        }
+    }
+    CHECK(supported_object(154,1,50,50)); // GoldBaloonSprit cutscene actor.
+    CHECK(!supported_object(155,1,50,50));
+    for (unsigned excluded : {81,82,99,152,153,176}) {
+        CHECK(!supported_sprite(excluded));
+        CHECK(texture_hash(excluded) == 0);
+        CHECK(!supported_object(excluded,1,17,17));
+    }
+
+    // All eight sprite views are ONE world-space mesh. The 256-phase guest
+    // counter drives 32 distinct poses per 32-tick revolution, not 8 swaps.
+    Sample banana{{0,0,0}, 1, 0, 0, 0, 456, true};
+    banana.sprite_id = kBananaSpriteId;
+    CHECK(valid_sample(banana));
+    CHECK(std::abs(world_position(base, banana)[1] - 9.F) < .001F);
+    CHECK(std::abs(world_position(top, banana)[1] - 59.F) < .001F);
+    const auto banana_identity = model_interpolation_key(banana);
+    for (unsigned phase = 0; phase < 256; phase += 8) {
+        banana.animation_phase = phase;
+        const auto point = world_position(side, banana);
+        const float radians = phase * 6.283185307179586F / 256;
+        CHECK(std::abs(point[0] - 50.F * std::cos(radians)) < .001F);
+        CHECK(std::abs(point[2] + 50.F * std::sin(radians)) < .001F);
+        CHECK(model_interpolation_key(banana) == banana_identity);
+    }
+    banana.animation_phase = 0;
+    const auto cycle_start = world_position(side, banana);
+    banana.animation_phase = static_cast<std::uint8_t>(256); // Same wrap as the guest.
+    CHECK(world_position(side, banana) == cycle_start);
+    banana.animation_phase = 248;
+    const auto cycle_end = world_position(side, banana);
+    CHECK(std::abs(cycle_start[0]-cycle_end[0]) < 1.F);
+    CHECK(std::abs(cycle_start[2]-cycle_end[2]) < 10.F);
+    banana.animation_phase = 64;
+    banana.yaw = -16384;
+    CHECK(std::abs(world_position(side, banana)[0] - 50.F) < .001F);
+    const auto paused_matrix = model_transform(banana);
+    CHECK(model_transform(banana) == paused_matrix); // No wall-clock animation.
 
     // Regression: a detail switch changes only the mesh, not the temporal
     // owner. Vertex interpolation must remain off even for equal-size LODs:
     // equal cardinality does not imply corresponding vertex order.
     CHECK(!kInterpolateMeshVertices);
-    for (const std::uint16_t sprite : {107, 108, 113, 114, 115, 116}) {
+    for (const std::uint16_t sprite : {107, 108, 113, 114, 115, 116, 147,148,149,150,151,154,155,156}) {
         Sample pose{{1865, 417, 2197}, 4.546875F, 12000, -3000, 2000, 123, true};
         pose.sprite_id = sprite;
+        pose.animation_phase = 248;
         pose.attachment = {1869.3333F, 385.F, 2192.6667F};
         pose.attachment_valid = sprite == 114 || sprite == 116;
         const auto identity = model_interpolation_key(pose);
@@ -186,11 +274,25 @@ int main(int argc, char** argv) {
     original.palm.position[0] = 1234;
     CHECK(submitted.palm.position[0] == 0); // Sidecar holds values, not live guest pointers.
     if (argc >= 2 && std::filesystem::exists(std::filesystem::path(argv[1]) / "near.dkrmesh")) {
-        initialise(argv[1], argc >= 3 ? argv[2] : "", argc >= 4 ? argv[3] : "", argc >= 5 ? argv[4] : "");
+        initialise(argv[1], argc >= 3 ? argv[2] : "", argc >= 4 ? argv[3] : "", argc >= 5 ? argv[4] : "",
+                   argc >= 6 ? argv[5] : "", argc >= 7 ? argv[6] : "");
         CHECK(available() && enabled());
         CHECK(assets().near_mesh.indices.size() <= 60006);
         CHECK(assets().far_mesh.indices.size() <= 15006);
         CHECK(!assets().canopy_near.indices.empty() && !assets().canopy_far.indices.empty());
+        if (argc >= 7) {
+            CHECK(assets().balloon_ready);
+            CHECK(assets().balloon_near.indices.size() <= 4000U*3U);
+            CHECK(assets().collectible_near.indices.size() <= 4000U*3U);
+            CHECK(assets().balloon_near.indices == assets().balloon_far.indices);
+            CHECK(assets().collectible_near.indices == assets().collectible_far.indices);
+        }
+        if (argc >= 6 && std::filesystem::exists(std::filesystem::path(argv[5]) / "near.dkrmesh")) {
+            CHECK(assets().banana_ready);
+            CHECK(assets().banana_near.indices.size() <= 3000U * 3U);
+            CHECK(assets().banana_far.indices.size() <= 3000U * 3U);
+            CHECK(select_mesh(assets(), kBananaSpriteId, false) == &assets().banana_near);
+        }
         if (argc >= 3 && std::filesystem::exists(std::filesystem::path(argv[2]) / "near.dkrmesh")) {
             CHECK(assets().blueberry_ready);
             CHECK(assets().blueberry_near.indices.size() == 3107U * 3U);

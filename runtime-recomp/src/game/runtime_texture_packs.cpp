@@ -1180,8 +1180,11 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
     static const auto blueberry_path = dkr::runtime::platform::asset_path("assets/models/blueberry/near.dkrmesh");
     static const auto rubber_path = dkr::runtime::platform::asset_path("assets/models/rubber-tree/near.dkrmesh");
     static const auto beach_path = dkr::runtime::platform::asset_path("assets/models/beach-tree/near.dkrmesh");
+    static const auto banana_path = dkr::runtime::platform::asset_path("assets/models/banana/near.dkrmesh");
+    static const auto balloon_path = dkr::runtime::platform::asset_path("assets/models/balloons/near.dkrmesh");
     dkr::runtime::palm::initialise(palm_path.parent_path(), blueberry_path.parent_path(),
-                                 rubber_path.parent_path(), beach_path.parent_path());
+                                 rubber_path.parent_path(), beach_path.parent_path(), banana_path.parent_path(),
+                                 balloon_path.parent_path());
     std::vector<RT64::ReplacementDirectory> replacements;
     std::vector<RT64::ReplacementDirectory> previous_replacements;
     std::set<std::string> replacement_ids;
@@ -1209,6 +1212,8 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
         if (models.blueberry_ready) replacements.emplace_back(models.blueberry_directory);
         if (models.rubber_tree_ready) replacements.emplace_back(models.rubber_tree_directory);
         if (models.beach_tree_ready) replacements.emplace_back(models.beach_tree_directory);
+        if (models.banana_ready) replacements.emplace_back(models.banana_directory);
+        if (models.balloon_ready) replacements.emplace_back(models.balloon_directory);
     }
     bool success = cache_available &&
         application.textureCache->loadReplacementDirectories(replacements);

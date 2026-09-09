@@ -1190,9 +1190,7 @@ void dkr::runtime::presentation::capture_palm_marker(
             ValidRange(header, 0x56U) ? byte(header + 0x53U) : 255,
             ValidRange(header, 0x56U) ? byte(header + 0x54U) : 255);
     }
-    if (!ValidRange(header, 0x56U) || byte(header + 0x53U) != 1U ||
-        byte(header + 0x54U) != 2U || half(object + kObjectBehaviourOffset) != 2)
-        return;
+    if (!ValidRange(header, 0x56U) || byte(header + 0x53U) != 1U) return;
     const auto models = read_word(header + 0x10U);
     const auto model_index = byte(object + 0x3AU);
     static unsigned trace_count = 0;
@@ -1202,7 +1200,8 @@ void dkr::runtime::presentation::capture_palm_marker(
         ++trace_count;
     }
     if (model_index >= byte(header + 0x55U) || !ValidRange(models + model_index * 4U, 4U) ||
-        !palm::supported_sprite(read_word(models + model_index * 4U))) return;
+        !palm::supported_object(read_word(models + model_index * 4U), byte(header + 0x53U),
+                                byte(header + 0x54U), half(object + kObjectBehaviourOffset))) return;
     palm::Sample sample;
     sample.sprite_id = static_cast<std::uint16_t>(read_word(models + model_index * 4U));
     sample.position = {std::bit_cast<float>(read_word(object + 0x0CU)),
@@ -1212,6 +1211,8 @@ void dkr::runtime::presentation::capture_palm_marker(
     sample.yaw = half(object);
     sample.pitch = half(object + 2U);
     sample.roll = half(object + 4U);
+    if (sample.sprite_id == palm::kBananaSpriteId)
+        sample.animation_phase = static_cast<std::uint8_t>(half(object + 0x18U));
     sample.identity = with_camera_continuity(capture.identity, capture.camera_identity);
     sample.valid = true;
     if (!palm::valid_sample(sample)) return;

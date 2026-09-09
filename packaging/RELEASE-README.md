@@ -1,4 +1,36 @@
-# DKR-R 1.0.4
+# DKR-R 1.0.4-macos.1 — Apple Silicon
+
+This is the experimental macOS build from
+https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-, based on jt87's macOS port
+and ThatGuyMcd's DKR-R. It includes native Metal rendering, bundled SDL2/SDL3,
+3D vegetation, spinning 3D bananas, seven wraparound balloon finishes and
+material-aware terrain detail. This is not jt87's notarized original release.
+
+## Install on macOS
+
+Requires Apple Silicon (M1 or newer) and macOS 12 Monterey or newer. Intel Macs
+are not supported. No Homebrew, Xcode or command-line build tools are required.
+
+1. Verify the ZIP against the release's `SHA256SUMS.txt`, then unzip it.
+2. Drag `DKR-R.app` to Applications and open it.
+3. Supply your own supported US ROM when prompted and select Modern to use
+   the new 3D replacements. Existing external HD packs can be imported separately.
+
+This build is **ad-hoc signed, not Developer ID signed or notarized**. macOS may
+block the first launch. Only if you trust this release and have verified its
+checksum, use System Settings > Privacy & Security > Open Anyway for this app.
+Do not disable Gatekeeper globally.
+
+F8 toggles the optional 3D plants/items; F7 toggles terrain detail. Original
+gameplay timing and collision are retained. Saves, ROMs and texture packs stay
+outside the app. No ROM, saves or external HD texture pack is included.
+
+The package passed all 63 DKR tests, controller-pak recovery and signature/
+dependency checks. Balloon models were reviewed through 360 degrees; native
+USA 1.1 attract-mode draws were checked. This is not exhaustive course,
+multiplayer or gold/silver collection testing.
+
+## Shared runtime information
 
 DKR-R is a native static recompilation of Diddy Kong Racing. This package does
 not include the game ROM or extracted game assets. Supply your own legally

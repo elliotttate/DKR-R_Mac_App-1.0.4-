@@ -620,7 +620,7 @@ if(DKR_RUNTIME_BUILD_GENERATED)
             COMMENT "Staging the DKR-R launcher, graphics and controller assets"
             VERBATIM
         )
-        foreach(plant IN ITEMS palm blueberry rubber-tree beach-tree)
+        foreach(plant IN ITEMS palm blueberry rubber-tree beach-tree banana balloons)
             if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/${plant}/near.dkrmesh")
                 add_custom_command(TARGET DKRPortGame POST_BUILD
                     COMMAND "${CMAKE_COMMAND}" -E copy_directory
@@ -1093,7 +1093,9 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm"
         "${CMAKE_CURRENT_LIST_DIR}/../assets/models/blueberry"
         "${CMAKE_CURRENT_LIST_DIR}/../assets/models/rubber-tree"
-        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree")
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree"
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/banana"
+        "${CMAKE_CURRENT_LIST_DIR}/../assets/models/balloons")
     if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/beach-tree/manifest.json")
         add_test(NAME DKRBeachTreeMeshSeams COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_LIST_DIR}/tools/validate_static_plant.py"
@@ -1116,6 +1118,16 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/far.dkrmesh"
             "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/canopy-near.dkrmesh"
             "${CMAKE_CURRENT_LIST_DIR}/../assets/models/palm/canopy-far.dkrmesh")
+    endif()
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/banana/manifest.json")
+        add_test(NAME DKRBananaMeshSeams COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_static_plant.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/banana")
+    endif()
+    if(Python3_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/balloons/manifest.json")
+        add_test(NAME DKRBalloonMeshes COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/validate_balloon_model.py"
+            "${CMAKE_CURRENT_LIST_DIR}/../assets/models/balloons")
     endif()
 
     add_executable(DKRInterpolationStatePolicyTests

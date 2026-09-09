@@ -1,9 +1,9 @@
-# DKR-R for macOS — 3D plants and terrain preview
+# DKR-R for macOS — 3D items, plants and terrain
 
 This experimental Apple Silicon fork builds on
 [jt87's macOS port](https://github.com/jt87/DKR-R_Mac_App-1.0.4-) of
 [DKR-R](https://github.com/ThatGuyMcd/DKR-R). It adds optional Modern-profile
-3D plant replacements and procedural terrain detail while preserving the
+3D item/plant replacements and procedural terrain detail while preserving the
 original game simulation and collision.
 
 - **3D plants (F8):** repaired [palms and attached canopies](HAVEN-PALM-3D-PREVIEW.md),
@@ -12,13 +12,20 @@ original game simulation and collision.
 - **Terrain detail (F7):** material-specific shading, refined cliffs, and restrained
   decorations across playable levels and startup demonstrations. See
   [coverage, controls, and validation limits](TERRAIN-DETAIL.md).
+- **3D items (F8):** [spinning bananas](BANANA-3D-PREVIEW.md) driven by the
+  original animation phase, and [seven glossy balloon finishes](BALLOONS-3D-PREVIEW.md)
+  with repaired wraparound textures. The shared F8 toggle covers plants and items.
 - **Native packaging:** bundled SDL runtimes and Finder-safe asset discovery.
   See [local build instructions](LOCAL-MAC-BUILD.md).
 
-These development previews are ad-hoc signed, **not notarized**. No binary
-release is published by this source update. ROMs, saves, external HD packs,
-and ROM-derived audit fixtures are not included. The original release and
-its installation instructions below describe jt87's build, not these previews.
+### [Download this fork's Mac release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
+
+Version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
+These experimental builds are ad-hoc signed, **not notarized**; see the included
+[Mac installation instructions](packaging/RELEASE-README.md). ROMs, saves,
+external HD packs, and ROM-derived audit fixtures are not included. The original
+release and its installation instructions below describe jt87's build, not this
+fork's experimental builds. See [release notes and verification limits](RELEASE-NOTES-macos.1.md).
 
 ## Original macOS release (jt87)
 
