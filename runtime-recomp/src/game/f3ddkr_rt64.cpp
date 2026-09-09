@@ -2514,7 +2514,7 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
                                                 sample.position[2], 1.0F), data.palm_world_matrix);
     // The combined DKR camera matrix carries camera distance in clip W.
     // LOD affects geometry only, never the object's transform identity.
-    const bool far = std::abs(static_cast<float>(anchor.w)) >
+    const bool use_far_lod = std::abs(static_cast<float>(anchor.w)) >
         (sample.sprite_id == palm::kBananaSpriteId ? 650.0F : 1800.0F);
     if (std::getenv("DKR_TRACE_PALM_3D")) {
         static std::unordered_map<std::uint32_t, bool> previous_lods;
@@ -2522,17 +2522,17 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
         if (logged_switches < 32U) {
             const auto key = presentation::normalise_identity(palm::model_interpolation_key(sample));
             const auto previous = previous_lods.find(key);
-            if (previous != previous_lods.end() && previous->second != far) {
+            if (previous != previous_lods.end() && previous->second != use_far_lod) {
                 std::fprintf(stderr, "[plant3d] lod-switch task=%llu sprite=%u transform=%08X %s->%s vertexInterpolation=0\n",
                     static_cast<unsigned long long>(data.task_count), sample.sprite_id, key,
-                    previous->second ? "far" : "near", far ? "far" : "near");
+                    previous->second ? "far" : "near", use_far_lod ? "far" : "near");
                 ++logged_switches;
             }
             if (previous_lods.size() >= 4096U) previous_lods.clear();
-            previous_lods[key] = far;
+            previous_lods[key] = use_far_lod;
         }
     }
-    const auto* selected_mesh = palm::select_mesh(palm::assets(), sample.sprite_id, far);
+    const auto* selected_mesh = palm::select_mesh(palm::assets(), sample.sprite_id, use_far_lod);
     if (!selected_mesh) return fallback("family-mesh-unavailable");
     const auto& mesh = *selected_mesh;
     // A rigid local mesh plus a stable model-to-clip transform keeps camera
@@ -2627,7 +2627,7 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
         std::fprintf(stderr, "[palm3d] draw task=%llu sprite=%u id=%08X pos=(%.1f,%.1f,%.1f) scale=%.3f lod=%s triangles=%zu clipw=%.1f phase=%u\n",
                      static_cast<unsigned long long>(data.task_count), sample.sprite_id, sample.identity,
                      sample.position[0], sample.position[1], sample.position[2], sample.scale,
-                     far ? "far" : "near", mesh.indices.size() / 3, static_cast<float>(anchor.w), sample.animation_phase);
+                     use_far_lod ? "far" : "near", mesh.indices.size() / 3, static_cast<float>(anchor.w), sample.animation_phase);
     }
     return true;
 }

@@ -1,6 +1,6 @@
-# DKR-R for macOS — 3D items, plants and terrain
+# DKR-R for Windows and macOS — 3D items, plants and terrain
 
-This experimental Apple Silicon fork builds on
+This experimental Windows x64 and Apple Silicon fork builds on
 [jt87's macOS port](https://github.com/jt87/DKR-R_Mac_App-1.0.4-) of
 [DKR-R](https://github.com/ThatGuyMcd/DKR-R). It adds optional Modern-profile
 3D item/plant replacements and procedural terrain detail while preserving the
@@ -15,17 +15,28 @@ original game simulation and collision.
 - **3D items (F8):** [spinning bananas](BANANA-3D-PREVIEW.md) driven by the
   original animation phase, and [seven glossy balloon finishes](BALLOONS-3D-PREVIEW.md)
   with repaired wraparound textures. The shared F8 toggle covers plants and items.
-- **Native packaging:** bundled SDL runtimes and Finder-safe asset discovery.
-  See [local build instructions](LOCAL-MAC-BUILD.md).
+- **Native packaging:** bundled SDL runtimes, complete model assets, and
+  Finder-safe asset discovery on macOS. See the [Windows build instructions](docs/BUILDING.md)
+  and [Mac build instructions](LOCAL-MAC-BUILD.md).
 
-### [Download this fork's Mac release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
+### [Download this fork's Windows and Mac builds](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
 
-Version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
-These experimental builds are ad-hoc signed, **not notarized**; see the included
+| Platform | Download | Installation and verification |
+|---|---|---|
+| Windows x64 | `DKR-R-1.0.4-Windows-x64.zip` | Extract the complete ZIP and run `DKR-R.exe`. See [Windows notes](RELEASE-NOTES-windows.1.md). |
+| Apple Silicon, macOS 12+ | `DKR-R-1.0.4-macos.1-macOS-arm64.zip` | Move `DKR-R.app` to Applications. See [Mac notes](RELEASE-NOTES-macos.1.md). |
+
+Both builds bundle all six model families and support your own US v1.0 or
+US Rev A/v1.1 ROM. Select **Modern**; **F8** toggles the 3D models and **F7**
+toggles terrain detail. Windows passed all 63 tests and packaged startup checks
+with both ROM revisions; full-course and live multiplayer coverage is unverified.
+
+The Mac build is ad-hoc signed, **not notarized**; see the
 [Mac installation instructions](packaging/RELEASE-README.md). ROMs, saves,
 external HD packs, and ROM-derived audit fixtures are not included. The original
-release and its installation instructions below describe jt87's build, not this
-fork's experimental builds. See [release notes and verification limits](RELEASE-NOTES-macos.1.md).
+release and its installation instructions below describe jt87's build. The
+existing Mac release is preserved alongside the new Windows download, with
+separate source commits and verification details in the release notes.
 
 ## Original macOS release (jt87)
 
@@ -83,9 +94,14 @@ vendors SDL into the app bundle so it runs without Homebrew.
 
 **Please do not report problems with this build to the DKR-R project or their
 Discord** unless you can reproduce the same issue on an official Windows or
-Linux release. Bugs specific to macOS belong here.
+Linux release. Bugs specific to this fork belong here.
 
 ## Building it yourself
+
+For Windows, follow [docs/BUILDING.md](docs/BUILDING.md). Packaging checks every
+model file against the source and verifies its hash inside the final ZIP.
+
+For macOS:
 
 ```bash
 ./Setup-macOS.sh
@@ -117,7 +133,7 @@ copyrighted game data is included or distributed here.
 
 Everything below is the original DKR-R README, unchanged. Note that it describes
 the Windows and Linux releases; the download links and platform notes there do
-not apply to this macOS fork.
+refer to the upstream project. Use this fork's downloads above for its 3D additions.
 
 # DKR-R — Diddy Kong Racing Recompiled
 

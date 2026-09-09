@@ -6,6 +6,11 @@
 #include "rice_texture_pack_policy.hpp"
 #include "runtime_rice_texture_import.hpp"
 
+#if defined(_WIN32)
+#include <Unknwn.h>
+#include <oaidl.h>
+#endif
+
 #include "common/rt64_filesystem.h"
 #include "common/rt64_filesystem_zip.h"
 #include "hle/rt64_application.h"

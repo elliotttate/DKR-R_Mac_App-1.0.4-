@@ -22,7 +22,21 @@ N64_HEADERS = {
     b"\x40\x12\x37\x80": ".n64 little-endian ROM",
 }
 MAX_SOURCE_SIZE = 5 * 1024 * 1024
-ALLOW_LARGE: set[str] = set()
+# Imported model atlases and the balloon seam-editing sources documented in
+# assets/models/*/manifest.json and art-source/balloons/README.md. These exact
+# paths only bypass the size heuristic; ROM headers/extensions are still checked.
+ALLOW_LARGE: set[str] = {
+    "assets/models/beach-tree/4245414348330001.png",
+    "assets/models/blueberry/424c554542330001.png",
+    "assets/models/rubber-tree/5255424252330001.png",
+    "art-source/balloons/editable/blue.psd",
+    "art-source/balloons/editable/gold.psd",
+    "art-source/balloons/editable/green.psd",
+    "art-source/balloons/editable/rainbow.psd",
+    "art-source/balloons/editable/red.psd",
+    "art-source/balloons/editable/shield.psd",
+    "art-source/balloons/editable/silver.psd",
+}
 
 
 def should_skip(path: pathlib.Path) -> bool:

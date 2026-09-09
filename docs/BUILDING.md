@@ -3,7 +3,8 @@
 ## Requirements
 
 Windows preparation requires Visual Studio 2022 with Desktop development with
-C++, Git, Python 3, PowerShell and WSL2/Ubuntu. Linux requires CMake 3.24+, Ninja,
+C++, Windows SDK 10.0.26100.0 or newer, Git, Python 3, PowerShell and WSL2/Ubuntu.
+Linux requires CMake 3.24+, Ninja,
 Clang or GCC, Vulkan development files, Wayland/X11 development files and
 AppImage packaging dependencies. The pinned SDL3 source used by the private
 input helper is fetched by the preparation pipeline. You must supply supported
@@ -64,6 +65,16 @@ scans the staged package and creates:
 ```text
 dist/DKR-R-1.0.4-Windows-x64.zip
 ```
+
+The Windows script defaults to SDK `10.0.26100.0`, which supplies the GameInput
+and D3D12 declarations used by the pinned dependencies. To select a newer
+installed SDK, pass `-WindowsSdkVersion <version>`; use `-Clean` when changing
+SDKs in an existing build tree.
+
+The Windows package includes all six 3D model families, their near/far meshes,
+attached palm canopies, collectible balloons, and texture mappings. Packaging
+rejects missing or stale staged model files and verifies their SHA-256 hashes
+inside the final ZIP. See `3D-MODELS.md` in the package for the F7/F8 controls.
 
 ## Linux and AppImage
 

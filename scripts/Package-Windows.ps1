@@ -30,6 +30,8 @@ $zip = "$stage.zip"
 $deniedExtensions = @('.z64', '.v64', '.n64', '.eep', '.mpk', '.sra', '.fla', '.o2r', '.otr')
 $runtimeFiles = @('DKR-R.exe', 'SDL2.dll', 'dxcompiler.dll', 'dxil.dll')
 $inputHostFiles = @('DKR-R-InputHost.exe', 'SDL3.dll')
+$modelFamilies = @('palm', 'blueberry', 'rubber-tree', 'beach-tree', 'banana', 'balloons')
+$modelHashes = [ordered]@{}
 
 if (Test-Path -LiteralPath $stage) {
     throw "Refusing to overwrite existing release directory: $stage"
@@ -50,6 +52,41 @@ foreach ($name in $inputHostFiles) {
     $source = Join-Path $inputHostBin $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
         throw "Missing private SDL3 input host file: $source"
+    }
+}
+
+# Package the assets staged with this binary. Every model file must match the
+# checkout, so stale or incomplete build output cannot silently ship sprites
+# in place of the fork's 3D replacements.
+foreach ($family in $modelFamilies) {
+    $sourceModels = Join-Path $projectRoot "assets\models\$family"
+    $builtModels = Join-Path $bin "assets\models\$family"
+    $requiredModels = @('near.dkrmesh', 'far.dkrmesh', 'manifest.json', 'rt64.json')
+    if ($family -eq 'palm') {
+        $requiredModels += @('canopy-near.dkrmesh', 'canopy-far.dkrmesh')
+    } elseif ($family -eq 'balloons') {
+        $requiredModels += @('collectible-near.dkrmesh', 'collectible-far.dkrmesh')
+    }
+    foreach ($name in $requiredModels) {
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceModels $name) -PathType Leaf)) {
+            throw "Missing required 3D model asset: $family/$name"
+        }
+    }
+    $sourceFiles = @(Get-ChildItem -LiteralPath $sourceModels -Recurse -File)
+    if (@($sourceFiles | Where-Object Extension -eq '.png').Count -eq 0) {
+        throw "Missing 3D model textures: $sourceModels"
+    }
+    foreach ($file in $sourceFiles) {
+        $relative = $file.FullName.Substring($sourceModels.Length + 1)
+        $builtFile = Join-Path $builtModels $relative
+        if (-not (Test-Path -LiteralPath $builtFile -PathType Leaf)) {
+            throw "Missing staged 3D model asset: $builtFile. Rebuild before packaging."
+        }
+        $expectedHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        if ((Get-FileHash -LiteralPath $builtFile -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw "Stale staged 3D model asset: $builtFile. Rebuild before packaging."
+        }
+        $modelHashes["assets/models/$family/$($relative.Replace('\', '/'))"] = $expectedHash
     }
 }
 
@@ -86,7 +123,15 @@ $controllerDirectory = Join-Path $stage 'assets\controllers'
 New-Item -ItemType Directory -Path $controllerDirectory -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'assets\controllers\gamecontrollerdb.txt') `
     -Destination (Join-Path $controllerDirectory 'gamecontrollerdb.txt')
-Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\RELEASE-README.md') -Destination (Join-Path $stage 'README.md')
+$modelDirectory = Join-Path $stage 'assets\models'
+New-Item -ItemType Directory -Path $modelDirectory -Force | Out-Null
+foreach ($family in $modelFamilies) {
+    Copy-Item -LiteralPath (Join-Path $bin "assets\models\$family") `
+        -Destination $modelDirectory -Recurse
+}
+Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\WINDOWS-README.md') -Destination (Join-Path $stage 'README.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\WINDOWS-3D-MODELS.md') `
+    -Destination (Join-Path $stage '3D-MODELS.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\ONLINE_MULTIPLAYER.md') -Destination (Join-Path $stage 'ONLINE_MULTIPLAYER.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE.md') -Destination (Join-Path $stage 'LICENSE.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY.md') -Destination (Join-Path $stage 'THIRD_PARTY.md')
@@ -251,10 +296,35 @@ try {
     if ($badEntries.Count -ne 0) {
         throw "Release ZIP contains prohibited game data: $($badEntries.FullName -join ', ')"
     }
+    # Windows PowerShell 5 writes backslashes in ZIP entry names; PowerShell
+    # 7 uses forward slashes. Compare the same relative paths on both hosts.
+    $archiveEntries = @{}
+    foreach ($entry in $archive.Entries) {
+        $archiveEntries[$entry.FullName.Replace('\', '/')] = $entry
+    }
+    foreach ($model in $modelHashes.GetEnumerator()) {
+        $entryName = "$(Split-Path -Leaf $stage)/$($model.Key)"
+        $entry = $archiveEntries[$entryName]
+        if ($null -eq $entry) {
+            throw "Release ZIP is missing 3D model asset: $entryName"
+        }
+        $stream = $entry.Open()
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $actualHash = [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+            if ($actualHash -ne $model.Value) {
+                throw "Release ZIP contains an incorrect 3D model asset: $entryName"
+            }
+        } finally {
+            $sha256.Dispose()
+            $stream.Dispose()
+        }
+    }
 } finally {
     $archive.Dispose()
 }
 
 $hash = Get-FileHash -LiteralPath $zip -Algorithm SHA256
 Write-Host "Created $zip"
+Write-Host "Verified $($modelHashes.Count) 3D model files across all $($modelFamilies.Count) families in the ZIP."
 Write-Host "SHA-256 $($hash.Hash)"
