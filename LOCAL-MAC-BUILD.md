@@ -53,7 +53,9 @@ export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
 export CMAKE_PREFIX_PATH=/path/to/sdl2-2.32.10/install
 export DKR_MAC_SDL2_DYLIB=/path/to/sdl2-2.32.10/install/lib/libSDL2-2.0.0.dylib
 export DKR_MAC_PAYLOAD_DIR="$PWD/build/payloads"
-export DKR_RELEASE_VERSION=1.0.5-beta.10-macos.1
+export DKR_RELEASE_VERSION=1.0.5-beta.10-macos.2
+export DKR_MACOS_DEPLOYMENT_TARGET=12.0
+export DKR_MAC_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 bash Build-macOS.sh
 ```
 
@@ -61,9 +63,19 @@ bash Build-macOS.sh
 composed policies used for the runtime fingerprint. The build runs all DKR tests,
 controller-pak recovery and the mod-importer self-test; packages SDL2, SDL3, the
 private mod worker and all six model families; checks dylib paths and scans the
-release for game assets; signs ad hoc and produces the ZIP under `dist`.
+release for game assets; signs with `DKR_MAC_SIGNING_IDENTITY` and produces the ZIP under `dist`.
 It refuses to overwrite an existing staged release or ZIP.
 
-The app requires Apple Silicon and macOS 12 or newer. It is ad-hoc signed and
-not notarized. Modern mode enables the optional models (F8) and terrain (F7).
+The build automatically applies `macos-patches/extern/rt64-metal-deployment-target.patch`.
+Metal's custom commands explicitly receive the minimum OS flag and Metal 2.4
+language version. CMake's normal compiler flags alone do not protect shaders.
+`scripts/validate_macos_package.py` checks all compiled shader targets, shaders
+embedded in the executable, each bundled Mach-O binary, dylib paths, the minimum
+OS declaration, and permission messages. Its report ships beside the app.
+
+The app targets Apple Silicon and macOS 12 or newer. The delivered release is
+Developer ID signed and not notarized. Omitting `DKR_MAC_SIGNING_IDENTITY` uses
+ad-hoc signing for local development, whose permission identity may change on
+rebuilds. macOS 27 is the currently available native QA host; the build audit
+does not substitute for execution on an older macOS machine. Modern mode enables the optional models (F8) and terrain (F7).
 ROMs, saves and external HD texture packs remain outside the bundle.

@@ -26,11 +26,15 @@ The unfinished PBR experiment remains separate. See [build instructions](LOCAL-M
 ### [Download this fork's Mac release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
 
 The previously published version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
-These experimental builds are ad-hoc signed, **not notarized**; see the included
+The new local `1.0.5-beta.10-macos.2` build fixes Metal deployment targets and
+uses the native ROM picker for macOS file access. It is Developer ID signed,
+**not notarized**; older published builds were ad-hoc signed. See the included
 [Mac installation instructions](packaging/RELEASE-README.md). ROMs, saves,
 external HD packs, and ROM-derived audit fixtures are not included. The original
 release and its installation instructions below describe jt87's build, not this
 fork's experimental builds. See [release notes and verification limits](RELEASE-NOTES-macos.1.md).
+Current compatibility fixes and testing limits are recorded in
+[MACOS-COMPATIBILITY.md](MACOS-COMPATIBILITY.md).
 
 ## Original macOS release (jt87)
 

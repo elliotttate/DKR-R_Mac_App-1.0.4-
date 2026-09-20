@@ -503,7 +503,15 @@ void DrawPlayPage(float available_width, const PlayPageContext& play) {
         look.hover_in = 0.12F;
         look.ellipsis_spread = 0.12F;
         if (PaddockRaceButton(primary, {primary_width, 46.0F}, look)) {
+#if defined(__APPLE__)
+            // NSOpenPanel gives macOS explicit user consent for the chosen
+            // file, including protected folders and file-provider volumes.
+            if (SelectRomWithDialog(play.selected_rom, play.rom_catalog, play.rom_status)) {
+                play.rom_ready = true;
+            }
+#else
             OpenRomBrowser(play.selected_rom);
+#endif
         }
         if (secondary != nullptr) {
             ImGui::SetCursorScreenPos(actions_row

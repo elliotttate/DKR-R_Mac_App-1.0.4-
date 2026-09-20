@@ -134,6 +134,9 @@ bool dkr::runtime::SelectRom(const std::filesystem::path& rom_path, std::string&
     switch (result) {
     case recomp::RomValidationError::FailedToOpen:
         error = "The ROM could not be opened.";
+#if defined(__APPLE__)
+        error += " Choose it again with Browse for ROM to allow access. If it is stored in iCloud, download it in Finder first.";
+#endif
         break;
     case recomp::RomValidationError::NotARom:
         error = "The selected file is not a recognized N64 ROM.";
@@ -157,6 +160,11 @@ bool dkr::runtime::ValidateRomForLauncher(const std::filesystem::path& rom_path,
     identity = rom::inspect(rom_path);
     if (!identity.supported()) {
         error = rom::describe(identity);
+#if defined(__APPLE__)
+        if (identity.error == rom::InspectionError::FailedToOpen) {
+            error += " Choose it again with Browse for ROM to allow access. If it is stored in iCloud, download it in Finder first.";
+        }
+#endif
         return false;
     }
     error.clear();

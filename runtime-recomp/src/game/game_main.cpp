@@ -61,6 +61,22 @@ extern RspUcodeFunc dkrAspMain;
 
 namespace {
 
+void ShowMacLaunchFailure(const std::string& reason, unsigned timeout_seconds) {
+#if defined(__APPLE__) && DKR_RUNTIME_HAS_RT64
+    // Automated timed runs keep reporting through stderr. Finder launches
+    // must explain a rejected ROM or renderer failure before the window exits.
+    if (timeout_seconds == 0) {
+        const std::string message = reason + "\n\nDiagnostic log: " +
+            (dkr::runtime::support::log_directory() / "runtime.log").string();
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DKR-R could not start the game",
+                                 message.c_str(), nullptr);
+    }
+#else
+    (void)reason;
+    (void)timeout_seconds;
+#endif
+}
+
 #ifdef _WIN32
 std::atomic_flag g_crash_filter_active = ATOMIC_FLAG_INIT;
 std::filesystem::path g_crash_directory;
@@ -764,12 +780,14 @@ int DkrMain(int argc, char** argv) {
     if (!rom_identified && !dkr::runtime::ValidateRomForLauncher(
             rom_path, rom_identity, rom_error)) {
         std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+        ShowMacLaunchFailure(rom_error, timeout_seconds);
         dkr::runtime::platform::shutdown();
         return 3;
     }
     if (!rom_identified && !PrepareCanonicalRomPath(
             rom_path, rom_identity, config_directory, rom_error)) {
         std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+        ShowMacLaunchFailure(rom_error, timeout_seconds);
         dkr::runtime::platform::shutdown();
         return 3;
     }
@@ -787,6 +805,7 @@ int DkrMain(int argc, char** argv) {
 #endif
             std::fprintf(stderr,
                          "[boot][window] failed to prepare the game renderer window\n");
+            ShowMacLaunchFailure("The Metal game window could not be created.", timeout_seconds);
             dkr::runtime::platform::shutdown();
             return 4;
         }
@@ -876,6 +895,7 @@ int DkrMain(int argc, char** argv) {
 #endif
         if (!dkr::runtime::SelectRom(rom_path, rom_error)) {
             std::fprintf(stderr, "[boot][rom] %s\n", rom_error.c_str());
+            ShowMacLaunchFailure(rom_error, timeout_seconds);
             dkr::runtime::platform::shutdown();
             return 3;
         }
@@ -991,10 +1011,12 @@ int DkrMain(int argc, char** argv) {
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "[boot] runtime failed: %s\n",
                              error.what());
+                ShowMacLaunchFailure(error.what(), timeout_seconds);
             } catch (...) {
                 std::fprintf(
                     stderr,
                     "[boot] runtime failed with an unknown exception\n");
+                ShowMacLaunchFailure("The game runtime stopped unexpectedly.", timeout_seconds);
             }
             return 5;
         }

@@ -1,0 +1,26 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -136,6 +136,14 @@
+ endfunction()
+ 
+ function(build_shader_msl_impl TARGETOBJ FILENAME TARGET_NAME OUTNAME)
++    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
++        message(FATAL_ERROR "Set CMAKE_OSX_DEPLOYMENT_TARGET for Metal shaders")
++    endif()
++    # Custom commands do not inherit CMake's C/C++ deployment flags. Without
++    # this, a newer Xcode silently embeds shaders that older macOS cannot load.
++    set(METAL_DEPLOYMENT_FLAGS
++        "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}"
++        "-std=macos-metal2.4")
+     add_custom_command(OUTPUT ${OUTNAME}.spv
+             COMMAND ${DXC} ${DXC_SPV_OPTS} ${ARGN} ${FILENAME} /Fo ${OUTNAME}.spv
+             DEPENDS ${FILENAME})
+@@ -143,7 +151,7 @@
+             COMMAND spirv_cross_msl ${OUTNAME}.spv ${OUTNAME}.metal
+             DEPENDS ${OUTNAME}.spv spirv_cross_msl)
+     add_custom_command(OUTPUT ${OUTNAME}.ir
+-            COMMAND xcrun -sdk macosx metal -o ${OUTNAME}.ir -c ${OUTNAME}.metal $<$<CONFIG:Debug>:-frecord-sources>
++            COMMAND xcrun -sdk macosx metal ${METAL_DEPLOYMENT_FLAGS} -o ${OUTNAME}.ir -c ${OUTNAME}.metal $<$<CONFIG:Debug>:-frecord-sources>
+             DEPENDS ${OUTNAME}.metal)
+     add_custom_command(OUTPUT ${OUTNAME}.metallib
+             COMMAND xcrun -sdk macosx metallib ${OUTNAME}.ir -o ${OUTNAME}.metallib

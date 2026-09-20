@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Set this before project() initializes the Apple compiler targets.
+if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version" FORCE)
+endif()
 project(DKRRuntimePreparation LANGUAGES C CXX)
 if(APPLE)
     enable_language(OBJC OBJCXX)
+    if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "12.0")
+        message(FATAL_ERROR "DKR-R's Metal shaders require macOS 12.0 or newer")
+    endif()
 endif()
 
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../VERSION" DKR_NETWORK_RELEASE_VERSION
@@ -682,6 +689,7 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         # applying an ad-hoc signature for local testing.
         set_target_properties(DKRPortGame PROPERTIES
             MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MacInfo.plist.in"
             MACOSX_BUNDLE_BUNDLE_NAME "DKR-R"
             MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.thatguymcd.dkr-r"
             MACOSX_BUNDLE_INFO_STRING "Diddy Kong Racing - Recompiled"

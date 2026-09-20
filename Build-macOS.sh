@@ -7,7 +7,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   exit 1
 }
 
-for tool in cmake ninja ditto codesign file install_name_tool otool; do
+for tool in cmake ninja ditto codesign file install_name_tool otool python3; do
   command -v "${tool}" >/dev/null 2>&1 || {
     echo "Missing required macOS build tool: ${tool}" >&2
     exit 1
@@ -43,9 +43,18 @@ grep -Eq 'set\(PLUME_APPLE_RETINA_ENABLED ON\)' \
   exit 1
 }
 
+# Keep this Mac-only renderer correction reproducible without changing the
+# upstream dependency pin. Refuse to overwrite an incompatible local edit.
+metal_patch="${project_root}/macos-patches/extern/rt64-metal-deployment-target.patch"
+if ! git -C "${project_root}/extern/rt64" apply --reverse --check "${metal_patch}" 2>/dev/null; then
+  git -C "${project_root}/extern/rt64" apply --check "${metal_patch}"
+  git -C "${project_root}/extern/rt64" apply "${metal_patch}"
+fi
+
 version="${DKR_RELEASE_VERSION:-$(tr -d '\r\n' < "${project_root}/VERSION")}"
 host_arch="$(uname -m)"
 architectures="${DKR_MAC_ARCHITECTURES:-${host_arch}}"
+deployment_target="${DKR_MACOS_DEPLOYMENT_TARGET:-12.0}"
 archive_arch="$(printf '%s' "${architectures}" | tr ';' '-')"
 build_dir="${DKR_MAC_BUILD_DIR:-${project_root}/build/dkr-runtime-macos}"
 revision_80_generated="${DKR_MAC_V80_GENERATED_SOURCE:-}"
@@ -68,7 +77,7 @@ output="${stage}.zip"
 
 cmake -S "${project_root}/runtime-recomp" -B "${build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET="${DKR_MACOS_DEPLOYMENT_TARGET:-12.0}" \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="${deployment_target}" \
   -DCMAKE_OSX_ARCHITECTURES="${architectures}" \
   -DDKRPORT_ROOT="${project_root}" \
   -DDKR_RELEASE_VERSION="${version}" \
@@ -225,9 +234,21 @@ if command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1 && \
     "${stage}/DKR-R.app/Contents/Info.plist"
 fi
 
-# Ad-hoc signing keeps the local bundle internally consistent. Public notarised
-# releases can replace this signature in CI using an Apple Developer identity.
-codesign --force --deep --sign - "${stage}/DKR-R.app"
+# Verify the actual shader bitcode and every shipped native binary, not just
+# the CMake setting. This catches shaders built for the build machine's SDK.
+python3 "${project_root}/scripts/validate_macos_package.py" \
+  --app "${app}" --shaders "${build_dir}/src/shaders" \
+  --minimum "${deployment_target}" --report "${stage}/macOS-compatibility.json"
+
+# A stable Developer ID signature lets macOS recognize permission decisions
+# across releases. Local builds without an identity may still opt into ad hoc.
+signing_identity="${DKR_MAC_SIGNING_IDENTITY:--}"
+signing_options=(--force --deep --sign "${signing_identity}")
+if [[ "${signing_identity}" != "-" ]]; then
+  signing_options+=(--timestamp --options runtime)
+fi
+codesign "${signing_options[@]}" "${app}"
+codesign --verify --deep --strict "${app}"
 
 while IFS= read -r -d '' file; do
   extension="${file##*.}"

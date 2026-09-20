@@ -1,4 +1,4 @@
-# DKR-R 1.0.5-beta.10-macos.1 — Apple Silicon
+# DKR-R 1.0.5-beta.10-macos.2 — Apple Silicon
 
 This is the experimental macOS build from
 https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-, based on jt87's macOS port
@@ -11,12 +11,12 @@ material-aware terrain detail. This is not jt87's notarized original release.
 Requires Apple Silicon (M1 or newer) and macOS 12 Monterey or newer. Intel Macs
 are not supported. No Homebrew, Xcode or command-line build tools are required.
 
-1. Verify the ZIP against the release's `SHA256SUMS.txt`, then unzip it.
+1. Verify the ZIP against the supplied SHA256 checksum, then unzip it.
 2. Drag `DKR-R.app` to Applications and open it.
 3. Supply your own supported US ROM when prompted and select Modern to use
    the new 3D replacements. Existing external HD packs can be imported separately.
 
-This build is **ad-hoc signed, not Developer ID signed or notarized**. macOS may
+This release is **Developer ID signed, but not notarized**. macOS may
 block the first launch. Only if you trust this release and have verified its
 checksum, use System Settings > Privacy & Security > Open Anyway for this app.
 Do not disable Gatekeeper globally.
@@ -24,6 +24,27 @@ Do not disable Gatekeeper globally.
 F8 toggles the optional 3D plants/items; F7 toggles terrain detail. Original
 gameplay timing and collision are retained. Saves, ROMs and texture packs stay
 outside the app. No ROM, saves or external HD texture pack is included.
+
+## macOS compatibility and permissions
+
+This revision fixes the Start Game compatibility issue caused by game shaders
+compiled for the build Mac's newer OS. Native code and Metal shaders now target
+macOS 12.0; packaging rejects binaries or shaders that exceed that target.
+Native launch checks were performed on macOS 27. An older-macOS device test is
+still needed to confirm the complete runtime on each supported OS release.
+
+Browse for ROM opens the native macOS file picker. Select your own ROM there
+to authorize access, including files in Documents, Downloads, iCloud or external
+drives. Download cloud-only files in Finder before selecting them. If access
+was previously denied, select the file again or check System Settings > Privacy
+& Security > Files & Folders. macOS 12 uses System Preferences > Security &
+Privacy > Privacy. LAN multiplayer may request Local Network access on macOS 15
+or newer. DKR-R includes explanations for these requests; it does not require
+Full Disk Access. Permission is requested when the corresponding feature needs it.
+
+For a launch failure, collect `runtime.log` from `~/.config/dkr-port/logs/`
+immediately afterward. Reopening the app moves the prior log to
+`runtime-previous.log`.
 
 ## Upstream beta changes
 

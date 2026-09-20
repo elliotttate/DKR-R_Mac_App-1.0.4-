@@ -1,5 +1,9 @@
 # DKR-R upstream update, 2026-09-20
 
+The integration results below describe `macos.1`. The subsequent
+`1.0.5-beta.10-macos.2` compatibility and file-access fix is documented in
+[MACOS-COMPATIBILITY.md](MACOS-COMPATIBILITY.md).
+
 Upstream: [ThatGuyMcd/DKR-R](https://github.com/ThatGuyMcd/DKR-R), default branch
 `main`, commit `8a8e927e9ea14c5c07ca7ad74b44fdbe077f5ff6` (2026-09-19).
 Source version: `1.0.5-beta.10`. Mac package: `1.0.5-beta.10-macos.1`.
