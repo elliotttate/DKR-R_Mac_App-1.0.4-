@@ -186,7 +186,11 @@
         },
         {
           "path": "patches/rt64/0015-configurable-default-mip-lod-bias.patch",
-          "sha256": "65147d7d07c257936f533767de3d7cc72eb78d08e385cbf3169da2cdc7c3c92c"
+          "sha256": "5de3dff56a71b536b9a9d2a753c07204fb2acdae9620c6ab8feb273037598794"
+        },
+        {
+          "path": "patches/rt64/0016-optional-generated-texture-mips.patch",
+          "sha256": "c3394574e3e740a1c28ff6ca4be135515565966e3023a8511c1a30b335e7a914"
         }
       ]
     },

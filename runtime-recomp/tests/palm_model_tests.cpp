@@ -1,6 +1,7 @@
 #include "palm_model.hpp"
 #include "presentation_identity.hpp"
 #include "interpolation_state_policy.hpp"
+#include "presentation_marker_policy.hpp"
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -11,11 +12,16 @@ using namespace dkr::runtime::palm;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
 
 int main(int argc, char** argv) {
+    // The upstream marker kind owns UI routing; high billboard variant bits
+    // must remain geometry and may still carry a replacement model sample.
+    using dkr::runtime::presentation::PresentationMarkerKind;
+    using dkr::runtime::presentation::valid_presentation_marker;
+    static_assert(valid_presentation_marker(PresentationMarkerKind::Geometry, 4U, 31U));
+    static_assert(!dkr::runtime::presentation::is_aspect_marker(PresentationMarkerKind::Geometry));
+
     for (unsigned variant = 26; variant <= 31; ++variant) {
-        CHECK(dkr::runtime::interpolation::is_layout_marker(0, variant));
-        CHECK(dkr::runtime::interpolation::is_layout_marker(1, variant));
-        CHECK(!dkr::runtime::interpolation::is_layout_marker(6, variant));
-        CHECK(!dkr::runtime::interpolation::is_layout_marker(4, variant));
+        CHECK(valid_presentation_marker(PresentationMarkerKind::Geometry, 4U, variant));
+        CHECK(valid_presentation_marker(PresentationMarkerKind::Geometry, 6U, variant));
     }
     std::vector<std::uint8_t> bytes{'D','K','R','P','M','0','0','1'};
     const auto append = [&](std::uint32_t n) { for (int s = 0; s < 32; s += 8) bytes.push_back(n >> s); };

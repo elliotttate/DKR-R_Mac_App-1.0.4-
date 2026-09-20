@@ -71,28 +71,6 @@ int main() {
         true, false, true, false));
     static_assert(!preserve_track_select_lens_flare_tint(
         true, true, false, false));
-    static_assert(postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 0, 0, 1, 0));
-    static_assert(postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 0, 0, 8, 19));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 0, 0, 0, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 0, 0, 1, 20));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, false, 1, 1, 0, 0, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 0, 1, 0, 0, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 1, 2, 0, 0, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 1, 0, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, true, true, 1, 1, 0, 1, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        false, true, true, 1, 1, 0, 0, 1, 0));
-    static_assert(!postrace_wooden_frame_visible(
-        true, false, true, 1, 1, 0, 0, 1, 0));
     static_assert(split_sky_horizontal_cover_scale(4.0F / 3.0F, 0) ==
                   1.0F);
     static_assert(split_sky_vertical_cover_scale(4.0F / 3.0F, 0) ==

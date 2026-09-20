@@ -12,6 +12,7 @@
 #include "render/rt64_texture_cache.h"
 
 #include <json/json.hpp>
+#include <miniz/miniz.h>
 
 #include <algorithm>
 #include <atomic>
@@ -41,12 +42,28 @@ std::string g_last_selected_id;
 std::set<std::string> g_hidden_ids;
 std::map<std::string, std::int64_t> g_imported_at;
 std::map<std::string, std::uintmax_t> g_managed_sizes;
+
+// pack id -> the custom track it shipped with, and the digest both carry.
+// Persisted in texture-packs.ini so the browser keeps filtering these out of
+// its default list across restarts.
+struct TrackPackOwnerRecord {
+    std::string track_id;
+    std::string digest;
+    std::string fingerprint;   // ArchiveFingerprint of the imported archive
+};
+std::map<std::string, TrackPackOwnerRecord> g_track_pack_owners;
 std::set<std::string> g_applied_ids;
 std::string g_status;
 std::uint64_t g_generation = 1;
 std::uint64_t g_applied_generation = 0;
 bool g_applied_modern = false;
 std::vector<RT64::ReplacementDirectory> g_applied_replacements;
+// request_reload() wants RT64 to reload even an unchanged set.
+bool g_force_replacement_reload = false;
+// Held while an import is mid-flight, so the set it leaves behind reaches RT64
+// as one reload instead of one per intermediate step (the stale pack gone and
+// the new one not yet scanned, then the new one in).
+std::atomic<int> g_import_apply_hold{0};
 
 struct CachedPackInfo {
     std::string fingerprint;
@@ -182,6 +199,7 @@ void LoadSettingsLocked() {
     g_hidden_ids.clear();
     g_imported_at.clear();
     g_managed_sizes.clear();
+    g_track_pack_owners.clear();
     g_last_selected_id.clear();
     std::ifstream input(g_settings_path);
     std::string line;
@@ -191,6 +209,35 @@ void LoadSettingsLocked() {
         constexpr const char* selected_prefix = "last_selected=";
         constexpr const char* imported_prefix = "imported_at=";
         constexpr const char* size_prefix = "managed_size=";
+        constexpr const char* track_pack_prefix = "track_pack=";
+        if (line.rfind(track_pack_prefix, 0) == 0 && line.size() > 11) {
+            // track_pack=<id>\t<track_id>\t<digest>[\t<fingerprint>]
+            const std::string value = line.substr(11);
+            const auto first = value.find('\t');
+            if (first == std::string::npos || first == 0U) {
+                continue;
+            }
+            const auto second = value.find('\t', first + 1U);
+            const std::string id = Lower(value.substr(0, first));
+            const std::string track_id = second == std::string::npos
+                ? value.substr(first + 1U)
+                : value.substr(first + 1U, second - first - 1U);
+            std::string digest;
+            std::string fingerprint;
+            if (second != std::string::npos) {
+                const auto third = value.find('\t', second + 1U);
+                digest = third == std::string::npos
+                    ? value.substr(second + 1U)
+                    : value.substr(second + 1U, third - second - 1U);
+                if (third != std::string::npos) {
+                    fingerprint = value.substr(third + 1U);
+                }
+            }
+            if (!track_id.empty()) {
+                g_track_pack_owners[id] = {track_id, digest, fingerprint};
+            }
+            continue;
+        }
         if (line.rfind(enabled_prefix, 0) == 0 && line.size() > 8) {
             g_enabled_ids.insert(Lower(line.substr(8)));
         } else if (line.rfind(hidden_prefix, 0) == 0 && line.size() > 7) {
@@ -251,6 +298,10 @@ void SaveSettingsLocked() {
     }
     for (const auto& [id, size] : g_managed_sizes) {
         output << "managed_size=" << id << '\t' << size << '\n';
+    }
+    for (const auto& [id, owner] : g_track_pack_owners) {
+        output << "track_pack=" << id << '\t' << owner.track_id << '\t'
+               << owner.digest << '\t' << owner.fingerprint << '\n';
     }
     output.close();
     std::filesystem::rename(temporary, g_settings_path, error);
@@ -625,6 +676,49 @@ bool RemoveManagedPath(const std::filesystem::path& path,
     return true;
 }
 
+// Identifies a pack archive by its entries - each name, CRC-32 and size, read
+// from the zip's own central directory and sorted - so an identical pack
+// re-exported with fresh file timestamps still matches, while any change to a
+// name or an image does not. Empty when the archive cannot be read.
+std::string ArchiveFingerprint(const std::filesystem::path& path) {
+    try {
+        mz_zip_archive zip{};
+        if (mz_zip_reader_init_file(&zip, path.string().c_str(), 0) ==
+            MZ_FALSE) {
+            return {};
+        }
+        std::vector<std::string> entries;
+        const mz_uint count = mz_zip_reader_get_num_files(&zip);
+        entries.reserve(count);
+        for (mz_uint index = 0; index < count; ++index) {
+            mz_zip_archive_file_stat stat{};
+            if (mz_zip_reader_file_stat(&zip, index, &stat) == MZ_FALSE) {
+                continue;
+            }
+            char suffix[48];
+            std::snprintf(suffix, sizeof(suffix), ":%08x:%llu",
+                          static_cast<unsigned>(stat.m_crc32),
+                          static_cast<unsigned long long>(stat.m_uncomp_size));
+            entries.push_back(std::string(stat.m_filename) + suffix);
+        }
+        mz_zip_reader_end(&zip);
+        std::sort(entries.begin(), entries.end());
+        std::uint64_t hash = 14695981039346656037ULL;   // FNV-1a
+        for (const std::string& entry : entries) {
+            for (const unsigned char character : entry) {
+                hash = (hash ^ character) * 1099511628211ULL;
+            }
+            hash = (hash ^ 0x0AU) * 1099511628211ULL;
+        }
+        char text[17];
+        std::snprintf(text, sizeof(text), "%016llx",
+                      static_cast<unsigned long long>(hash));
+        return text;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
 } // namespace
 
 namespace dkr::runtime::texture_packs {
@@ -668,6 +762,7 @@ void ScanLibrary(bool cache_only, bool force_deep,
     std::set<std::string> hidden;
     std::map<std::string, std::int64_t> imported_at;
     std::map<std::string, std::uintmax_t> managed_sizes;
+    std::map<std::string, TrackPackOwnerRecord> track_pack_owners;
     std::map<std::string, CachedPackInfo> pack_index;
     {
         std::scoped_lock lock(g_mutex);
@@ -676,8 +771,21 @@ void ScanLibrary(bool cache_only, bool force_deep,
         hidden = g_hidden_ids;
         imported_at = g_imported_at;
         managed_sizes = g_managed_sizes;
+        track_pack_owners = g_track_pack_owners;
         pack_index = g_pack_index;
     }
+    const auto apply_origin = [&track_pack_owners](PackInfo& info) {
+        const auto owner = track_pack_owners.find(info.id);
+        if (owner == track_pack_owners.end()) {
+            info.origin = Origin::User;
+            info.owner_track_id.clear();
+            info.texture_digest.clear();
+            return;
+        }
+        info.origin = Origin::TrackPack;
+        info.owner_track_id = owner->second.track_id;
+        info.texture_digest = owner->second.digest;
+    };
     std::vector<PackInfo> scanned;
     std::map<std::string, CachedPackInfo> next_index;
     bool imported_metadata_changed = false;
@@ -746,6 +854,7 @@ void ScanLibrary(bool cache_only, bool force_deep,
                 ++deep_scans;
             }
             populate_metadata(info, !cache_only);
+            apply_origin(info);
             info.hidden = hidden.contains(info.id);
             info.enabled = !info.hidden && info.compatible && enabled.contains(info.id);
             if (fully_inspected) {
@@ -755,6 +864,9 @@ void ScanLibrary(bool cache_only, bool force_deep,
                 cached_info.hidden = false;
                 cached_info.managed_size_bytes = 0U;
                 cached_info.imported_at_unix_seconds = 0;
+                cached_info.origin = Origin::User;
+                cached_info.owner_track_id.clear();
+                cached_info.texture_digest.clear();
                 next_index[id] = {fingerprint, std::move(cached_info)};
             }
             scanned.emplace_back(std::move(info));
@@ -768,6 +880,16 @@ void ScanLibrary(bool cache_only, bool force_deep,
     {
         std::scoped_lock lock(g_mutex);
         for (auto& info : scanned) {
+            const auto owner = g_track_pack_owners.find(info.id);
+            if (owner == g_track_pack_owners.end()) {
+                info.origin = Origin::User;
+                info.owner_track_id.clear();
+                info.texture_digest.clear();
+            } else {
+                info.origin = Origin::TrackPack;
+                info.owner_track_id = owner->second.track_id;
+                info.texture_digest = owner->second.digest;
+            }
             info.hidden = g_hidden_ids.contains(info.id);
             info.enabled = !info.hidden && info.compatible &&
                            g_enabled_ids.contains(info.id);
@@ -858,7 +980,14 @@ std::uint64_t generation() {
 }
 
 bool import_archive(const std::filesystem::path& source, std::string& status_text,
-                    const ImportProgressCallback& progress) {
+                    const ImportProgressCallback& progress,
+                    const TrackPackOwner* owner) {
+    // See g_import_apply_hold: whatever this import changes reaches RT64 as a
+    // single reload, after it returns, however many steps it takes to get there.
+    struct ApplyHold {
+        ApplyHold() { g_import_apply_hold.fetch_add(1, std::memory_order_acq_rel); }
+        ~ApplyHold() { g_import_apply_hold.fetch_sub(1, std::memory_order_acq_rel); }
+    } apply_hold;
     if (!ReportImportProgress(progress, 0.01F,
                               "Validating texture-pack archive")) {
         status_text = "Texture-pack import cancelled.";
@@ -881,6 +1010,60 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
         status_text = "The texture-pack archive is empty, unreadable, or larger than 4 GB.";
         return false;
     }
+
+    // A <track>-hd.zip: skip when this exact pack is already filed against a
+    // track (the authoring loop rescans on every editor save), and drop the
+    // one from an earlier export of the same track so packs never accumulate.
+    // "Exact" means the archive's entries, not only the textureDigest: that
+    // digest covers the 64x32 payloads, and the same payloads can ship under
+    // different replacement names - the addon once hashed the Rice identity
+    // over the wrong byte order, and a fixed re-export changed every name but
+    // not one payload. A record from before fingerprints existed never
+    // matches, so such an install heals on its next import.
+    const std::string fingerprint =
+        owner != nullptr ? ArchiveFingerprint(source) : std::string{};
+    std::string stale_track_pack_id;
+    if (owner != nullptr) {
+        std::scoped_lock lock(g_mutex);
+        for (const auto& pack : g_packs) {
+            if (pack.origin != Origin::TrackPack) continue;
+            const auto record = g_track_pack_owners.find(pack.id);
+            const bool same_pack =
+                !owner->texture_digest.empty() && !fingerprint.empty() &&
+                pack.texture_digest == owner->texture_digest &&
+                record != g_track_pack_owners.end() &&
+                record->second.fingerprint == fingerprint;
+            if (same_pack) {
+                if (pack.compatible && !pack.hidden &&
+                    !g_enabled_ids.contains(pack.id)) {
+                    g_enabled_ids.insert(pack.id);
+                    SaveSettingsLocked();
+                    ++g_generation;
+                }
+                status_text =
+                    pack.name + " is already installed for this track.";
+                return true;
+            }
+            if (pack.owner_track_id == owner->track_id) {
+                stale_track_pack_id = pack.id;
+            }
+        }
+    }
+    if (!stale_track_pack_id.empty()) {
+        std::string ignored;
+        delete_managed(stale_track_pack_id, ignored);
+    }
+
+    const auto record_track_pack = [&](const std::filesystem::path& dest) {
+        if (owner == nullptr) return;
+        const std::string id = StableId(dest);
+        std::scoped_lock lock(g_mutex);
+        g_track_pack_owners[id] = {owner->track_id, owner->texture_digest,
+                                   fingerprint};
+        g_enabled_ids.insert(id);   // a track pack is born enabled
+        SaveSettingsLocked();
+        ++g_generation;
+    };
 
     if (!ReportImportProgress(progress, 0.04F,
                               "Inspecting texture-pack archive")) {
@@ -955,6 +1138,7 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
             g_managed_sizes[StableId(destination)] = ManagedSize(destination);
             SaveSettingsLocked();
         }
+        record_track_pack(destination);
         refresh();
         const auto imported = InspectDirectory(destination);
         status_text = "Imported " + source.filename().string() + " as " +
@@ -1039,6 +1223,7 @@ bool import_archive(const std::filesystem::path& source, std::string& status_tex
         g_managed_sizes[StableId(destination)] = size;
         SaveSettingsLocked();
     }
+    record_track_pack(destination);
     refresh();
     const auto imported = InspectArchive(destination);
     status_text = "Imported " + destination.filename().string() + " as " +
@@ -1154,6 +1339,7 @@ bool delete_managed(const std::string& id, std::string& status_text) {
             g_imported_at.erase(normalized);
             g_managed_sizes.erase(normalized);
         }
+        g_track_pack_owners.erase(normalized);
         g_packs.erase(std::remove_if(g_packs.begin(), g_packs.end(),
             [&](const PackInfo& pack) { return pack.id == normalized; }),
             g_packs.end());
@@ -1168,8 +1354,44 @@ bool delete_managed(const std::string& id, std::string& status_text) {
     return true;
 }
 
+TrackPackState track_pack_state(const std::string& track_id,
+                                const std::string& expected_digest) {
+    std::scoped_lock lock(g_mutex);
+    TrackPackState state;
+    for (const auto& pack : g_packs) {
+        if (pack.origin != Origin::TrackPack ||
+            pack.owner_track_id != track_id) {
+            continue;
+        }
+        state.installed = true;
+        state.pack_id = pack.id;
+        state.enabled = pack.enabled;
+        state.digest_matches = !expected_digest.empty() &&
+                               pack.texture_digest == expected_digest;
+    }
+    return state;
+}
+
+bool forget_track_pack(const std::string& track_id, std::string& status_text) {
+    std::string pack_id;
+    {
+        std::scoped_lock lock(g_mutex);
+        for (const auto& [id, owner] : g_track_pack_owners) {
+            if (owner.track_id == track_id) {
+                pack_id = id;
+            }
+        }
+    }
+    if (pack_id.empty()) {
+        status_text = "That track has no HD texture pack to remove.";
+        return false;
+    }
+    return delete_managed(pack_id, status_text);
+}
+
 void request_reload() {
     std::scoped_lock lock(g_mutex);
+    g_force_replacement_reload = true;
     ++g_generation;
 }
 
@@ -1190,6 +1412,9 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
     std::set<std::string> replacement_ids;
     std::vector<PendingDeletion> completed_deletions;
     std::uint64_t generation = 0;
+    // An import in flight applies once, when it is done. The generation is left
+    // unconsumed, so the frame after the hold lifts picks it up.
+    if (g_import_apply_hold.load(std::memory_order_acquire) > 0) return;
     {
         std::scoped_lock lock(g_mutex);
         generation = g_generation;
@@ -1203,6 +1428,30 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
                 }
             }
         }
+        // Only a changed replacement set is worth handing to RT64. The reload
+        // is transactional - streaming stops, every mapping is cleared and
+        // rebuilt, resident textures are re-resolved - and it runs here, on the
+        // graphics thread, where a long enough stall makes the game's scheduler
+        // drop a late completion and wait on it forever. The generation also
+        // moves for changes that never reach RT64 (a rescan, hiding a disabled
+        // pack), so compare the set itself.
+        const bool same_set =
+            g_applied_generation != 0 && !g_force_replacement_reload &&
+            modern_profile == g_applied_modern &&
+            g_pending_deletions.empty() &&
+            std::equal(replacements.begin(), replacements.end(),
+                       g_applied_replacements.begin(),
+                       g_applied_replacements.end(),
+                       [](const RT64::ReplacementDirectory& left,
+                          const RT64::ReplacementDirectory& right) {
+                           return left.dirOrZipPath == right.dirOrZipPath &&
+                                  left.zipBasePath == right.zipBasePath;
+                       });
+        if (same_set) {
+            g_applied_generation = generation;
+            return;
+        }
+        g_force_replacement_reload = false;
     }
 
     const bool cache_available = application.textureCache != nullptr;
@@ -1221,6 +1470,16 @@ void apply_pending(RT64::Application& application, bool modern_profile) {
     if (!success && cache_available) {
         restored = application.textureCache->loadReplacementDirectories(
             previous_replacements);
+    }
+    // One line per real reload - rare, since unchanged sets are skipped above -
+    // because a rejected or slow reload is otherwise invisible in the log.
+    std::fprintf(stderr,
+                 "[texture-packs] replacement set reloaded: %zu pack(s) "
+                 "accepted=%d restored=%d\n",
+                 replacements.size(), success ? 1 : 0, restored ? 1 : 0);
+    for (const auto& directory : replacements) {
+        std::fprintf(stderr, "[texture-packs]   %s\n",
+                     directory.dirOrZipPath.string().c_str());
     }
     {
         std::scoped_lock lock(g_mutex);

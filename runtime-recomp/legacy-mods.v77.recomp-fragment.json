@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "revision": "us.v77",
+  "purpose": "Offline legacy asset-bus PI bridge qualification; not enabled in the release policy yet.",
+  "callTarget": "osPiStartDma",
+  "callTargetVram": "0x800C8F80",
+  "assetApis": [
+    {"function":"asset_table_load","operation":0,"vram":"0x80076C58","expected":["0x3C038012","0x8C634290","0x27BDFFD8"]},
+    {"function":"asset_load","operation":1,"vram":"0x80076E68","expected":["0x27BDFFE8","0xAFBF0014","0xAFA40018"]},
+    {"function":"asset_rom_offset","operation":2,"vram":"0x80076EE8","expected":["0x3C038012","0x8C634290","0x00A03825"]},
+    {"function":"asset_table_size","operation":3,"vram":"0x80076F30","expected":["0x3C038012","0x8C634290","0x00000000"]},
+    {"function":"asset_table_load_addr","operation":4,"vram":"0x80076DFC","expected":["0x3C088012","0x8D084290","0x27BDFFE0"]},
+    {"function":"asset_table_load_zipped","operation":5,"vram":"0x80076CF0","expected":["0x27BDFFC8","0x3C028012","0x8C424290"]}
+  ],
+  "sites": [
+    {
+      "function": "dmacopy",
+      "vram": "0x80076FF4",
+      "expected": ["0x0C0323E0", "0xAFB40018", "0x02802025"]
+    },
+    {
+      "function": "__amDMA",
+      "vram": "0x80002FD8",
+      "expected": ["0x0C0323E0", "0xAFA3004C", "0x8FA4004C"]
+    }
+  ]
+}

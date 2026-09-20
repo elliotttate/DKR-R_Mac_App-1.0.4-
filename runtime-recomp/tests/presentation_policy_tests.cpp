@@ -49,9 +49,9 @@ static_assert(!interpolation_allowed_for_camera(
     PresentationProfile::Accurate, 0));
 static_assert(interpolation_allowed_for_camera(
     PresentationProfile::Modern, 0));
-static_assert(!interpolation_allowed_for_camera(
+static_assert(interpolation_allowed_for_camera(
     PresentationProfile::Modern, 5));
-static_assert(!interpolation_allowed_for_camera(
+static_assert(interpolation_allowed_for_camera(
     PresentationProfile::Modern, 7));
 static_assert(!modern_options_visible(PresentationProfile::Accurate));
 static_assert(modern_options_visible(PresentationProfile::Modern));

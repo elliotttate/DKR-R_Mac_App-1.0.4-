@@ -1,4 +1,5 @@
 #include "direct_session.hpp"
+#include "online_lobby_policy.hpp"
 
 #include "authoritative_state_codec.hpp"
 
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <thread>
 
 namespace dkr::runtime::netplay {
@@ -100,6 +102,8 @@ std::optional<std::size_t> preflight_lane(protocol::MessageType type) {
         return 2U;
     case protocol::MessageType::PreflightReplicaProbe:
         return 3U;
+    case protocol::MessageType::PreflightCheckpointProbe:
+        return 4U;
     default:
         return std::nullopt;
     }
@@ -152,6 +156,7 @@ std::size_t receive_sequence_lane(protocol::MessageType type) {
     case protocol::MessageType::StateAcknowledge:
     case protocol::MessageType::InputRepair:
     case protocol::MessageType::PreflightAuthorityProbe:
+    case protocol::MessageType::PreflightCheckpointProbe:
         return 3U; // authority/recovery traffic
     case protocol::MessageType::PreflightReplicaProbe:
         return 4U;
@@ -171,6 +176,8 @@ DirectSession::~DirectSession() {
     worker_stop_.store(true, std::memory_order_release);
     state_changed_.notify_all();
     if (network_worker_.joinable()) network_worker_.join();
+    replay_writer_.stop();
+    transport_closer_.stop();
 }
 
 void DirectSession::configure_manifest(const CompatibilityManifest& manifest) {
@@ -196,6 +203,24 @@ void DirectSession::configure_session_save(
     }
     local_online_save_ready_ = false;
     local_online_save_acknowledged_ = false;
+    online_save_status_.reset();
+}
+
+void DirectSession::retire_transport_locked() {
+    pending_invitation_.reset();
+    if (!transport_->quick_join()) {
+        transport_->close();
+        return;
+    }
+    if (!transport_closer_started_) {
+        transport_closer_.start([] {}, [] {});
+        transport_closer_started_ = true;
+    }
+    // SDK teardown can drain callbacks. Retire ownership immediately, but do
+    // not make frontend SessionView readers wait for that drain under mutex_.
+    auto retired = std::shared_ptr<SessionTransport>(std::move(transport_));
+    transport_ = make_udp_session_transport();
+    transport_closer_.post([retired] { retired->close(); });
 }
 
 void DirectSession::configure_artifact_directory(std::filesystem::path directory) {
@@ -211,12 +236,13 @@ bool DirectSession::host(std::uint16_t port, std::string advertised_host,
     std::scoped_lock lock(mutex_);
     local_online_save_ready_ = false;
     local_online_save_acknowledged_ = false;
+    online_save_status_.reset();
     local_runtime_save_hash_ = 0U;
     local_runtime_save_generation_ = 0U;
     runtime_save_hashes_ = {};
     runtime_save_generations_ = {};
     runtime_save_present_ = {};
-    transport_->close();
+    retire_transport_locked();
     quick_join_bootstrap_pending_ = false;
     critical_outbound_.clear();
     repair_outbound_.clear();
@@ -226,12 +252,19 @@ bool DirectSession::host(std::uint16_t port, std::string advertised_host,
     normal_priority_outbound_.clear();
     bulk_outbound_.clear();
     peers_ = {};
+    completed_releases_.clear();
+    checkpoint_encoding_.reset();
+    duplicate_retries_coalesced_ = 0U;
+    checkpoint_encoding_cache_hits_ = 0U;
+    maximum_network_pump_us_ = 0U;
     pending_joins_ = {};
     next_ready_request_id_ = 1U;
     pending_ready_request_id_ = 0U;
     desired_ready_.reset();
     reset_launch_transaction_locked();
     reset_connection_test_locked();
+    terminal_connection_test_id_ = 0U;
+    last_admission_response_ = {};
     connection_test_results_ = {};
     compatibility_sync_offer_.reset();
     launch_countdown_generation_ = 0U;
@@ -310,7 +343,7 @@ bool DirectSession::host(std::uint16_t port, std::string advertised_host,
     if (!lobby_.create(room_id, join_code, std::move(room_name), visibility,
                        std::to_string(sender_id_), local_name_, manifest_, rules,
                        error)) {
-        transport_->close();
+        retire_transport_locked();
         return false;
     }
     is_host_ = true;
@@ -347,6 +380,7 @@ bool DirectSession::join_friend_invite(std::string_view invite,
     std::scoped_lock lock(mutex_);
     local_online_save_ready_ = false;
     local_online_save_acknowledged_ = false;
+    online_save_status_.reset();
     local_runtime_save_hash_ = 0U;
     local_runtime_save_generation_ = 0U;
     runtime_save_hashes_ = {};
@@ -370,7 +404,7 @@ bool DirectSession::join_friend_invite(std::string_view invite,
                              host_public, invitation_capability, error)) {
         return false;
     }
-    transport_->close();
+    retire_transport_locked();
     critical_outbound_.clear();
     repair_outbound_.clear();
     high_priority_outbound_.clear();
@@ -380,11 +414,20 @@ bool DirectSession::join_friend_invite(std::string_view invite,
     bulk_outbound_.clear();
     peers_ = {};
     pending_joins_ = {};
+    // Completion/encoding caches belong to this authenticated session only.
+    // A new room can reuse the same numeric scene and boundary identifiers.
+    completed_releases_.clear();
+    checkpoint_encoding_.reset();
+    duplicate_retries_coalesced_ = 0U;
+    checkpoint_encoding_cache_hits_ = 0U;
+    maximum_network_pump_us_ = 0U;
     next_ready_request_id_ = 1U;
     pending_ready_request_id_ = 0U;
     desired_ready_.reset();
     reset_launch_transaction_locked();
     reset_connection_test_locked();
+    terminal_connection_test_id_ = 0U;
+    last_admission_response_ = {};
     connection_test_results_ = {};
     compatibility_sync_offer_.reset();
     launch_countdown_generation_ = 0U;
@@ -465,7 +508,7 @@ bool DirectSession::join_friend_invite(std::string_view invite,
         : "Contacting the host...";
     if (!quick_join && !send_join_request()) {
         error = "The authenticated join request could not be created.";
-        transport_->close();
+        retire_transport_locked();
         state_ = ConnectionState::Failed;
         return false;
     }
@@ -496,15 +539,33 @@ void DirectSession::disconnect(std::string_view reason) {
         // the worker queue because the socket is about to close.
         flush_outbound_locked();
     }
-    std::string replay_error;
-    replay_.finalize(replay_error);
-    transport_->close();
+    if (replay_.active()) {
+        if (!replay_writer_started_) {
+            replay_writer_.start([] {}, [] {});
+            replay_writer_started_ = true;
+        }
+        auto recording = std::make_shared<ReplayRecorder>(replay_.detach());
+        auto result = std::make_shared<std::promise<std::string>>();
+        replay_writes_.push_back(result->get_future());
+        if (!replay_writer_.post([recording, result] {
+                std::string error;
+                try { recording->finalize(error); }
+                catch (...) { error = "Replay finalization failed unexpectedly."; }
+                result->set_value(std::move(error));
+            })) result->set_value("Replay storage queue is unavailable. The recording could not be saved.");
+    }
+    retire_transport_locked();
     transport_ = make_udp_session_transport();
     quick_join_bootstrap_pending_ = false;
     lobby_ = {};
     room_view_ = {};
     timeline_.reset();
     peers_ = {};
+    completed_releases_.clear();
+    checkpoint_encoding_.reset();
+    duplicate_retries_coalesced_ = 0U;
+    checkpoint_encoding_cache_hits_ = 0U;
+    maximum_network_pump_us_ = 0U;
     pending_joins_ = {};
     received_sequences_.clear();
     blocked_senders_.clear();
@@ -515,7 +576,7 @@ void DirectSession::disconnect(std::string_view reason) {
     runtime_save_hashes_ = {};
     runtime_save_generations_ = {};
     runtime_save_present_ = {};
-    local_history_.clear();
+    clear_input_history_locked();
     frame_commits_.clear();
     commit_history_.clear();
     authoritative_states_.clear();
@@ -567,6 +628,8 @@ void DirectSession::disconnect(std::string_view reason) {
     launch_requested_ = false;
     reset_launch_transaction_locked();
     reset_connection_test_locked();
+    terminal_connection_test_id_ = 0U;
+    last_admission_response_ = {};
     connection_test_results_ = {};
     compatibility_sync_offer_.reset();
     launch_countdown_generation_ = 0U;
@@ -581,12 +644,14 @@ void DirectSession::disconnect(std::string_view reason) {
     local_online_save_ready_ = false;
     local_online_save_acknowledged_ = false;
     run_signal_sent_ = false;
+    online_save_status_.reset();
     launch_descriptor_.reset();
     last_verified_frame_ = 0U;
     last_authoritative_frame_ = 0U;
     authoritative_corrections_ = 0U;
     consecutive_authoritative_frames_ = 0U;
     next_commit_frame_ = 0U;
+    native_completed_frame_.reset();
     last_consumed_input_frame_.reset();
     last_consumed_inputs_ = {};
     input_epoch_ = 1U;
@@ -672,12 +737,36 @@ void DirectSession::network_loop() {
     std::uint32_t observed_commit_frame = next_commit_frame_;
     auto last_commit_progress = std::chrono::steady_clock::now();
     bool progress_stall_reported = false;
+    bool worker_fault = false;
     while (!worker_stop_.load(std::memory_order_acquire)) {
-        if (transport_->is_open()) pump_locked();
+        for (auto it = replay_writes_.begin(); it != replay_writes_.end();) {
+            if (it->wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
+            const auto error = it->get();
+            if (!error.empty()) replay_write_error_ = error;
+            it = replay_writes_.erase(it);
+        }
+        const auto pump_started = std::chrono::steady_clock::now();
+        if (state_ != ConnectionState::Failed) worker_fault = false;
+        if (!worker_fault) {
+            try {
+                if (transport_->is_open()) pump_locked();
+            } catch (const std::exception& exception) {
+                worker_fault = true;
+                fail_locked(std::string("The online transport failed safely: ") + exception.what());
+            } catch (...) {
+                worker_fault = true;
+                fail_locked("The online transport encountered an unexpected failure. Leave and reconnect; your separate saves are retained.");
+            }
+        }
+        const auto pump_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - pump_started).count();
+        maximum_network_pump_us_ = (std::max)(maximum_network_pump_us_, static_cast<std::uint64_t>(pump_us));
         const auto now = std::chrono::steady_clock::now();
-        if (state_ == ConnectionState::Running &&
-            authoritative_phase_active_ &&
-            authority_lifecycle_ == AuthorityLifecycle::Racing) {
+        if (now - last_view_publication_ >= std::chrono::milliseconds(50)) {
+            presentation_view_.store(std::make_shared<const SessionView>(view_locked()), std::memory_order_release);
+            last_view_publication_ = now;
+        }
+        if (state_ == ConnectionState::Running) {
             if (next_commit_frame_ != observed_commit_frame) {
                 observed_commit_frame = next_commit_frame_;
                 last_commit_progress = now;
@@ -691,7 +780,7 @@ void DirectSession::network_loop() {
                     static_cast<std::uint32_t>(authority_outbound_.size()),
                     is_host_ ? "host authored timeline stopped"
                              : "client authored timeline stopped");
-                failure_recorder().dump(stderr);
+                queue_diagnostics_locked();
                 progress_stall_reported = true;
             }
         } else {
@@ -793,6 +882,7 @@ bool DirectSession::approve_join_locked(std::uint64_t request_id,
     peers_[*slot].next_sequence = pending->next_sequence;
     peers_[*slot].requires_save_sync = requires_save_sync;
     peers_[*slot].online_save_ready = false;
+    transport_->retain_peer_route(pending->address);
     room_view_ = lobby_.room();
     send_with_key(pending->address, pending->key,
                   protocol::MessageType::HelloAck,
@@ -951,6 +1041,7 @@ bool DirectSession::kick_player(std::uint8_t slot, std::string& error) {
                   std::span<const std::uint8_t>(
                       reinterpret_cast<const std::uint8_t*>(message.data()), message.size()));
     lobby_.leave(std::to_string(departing.sender_id));
+    transport_->release_peer_route(peers_[slot].address);
     peers_[slot] = {};
     synchronize_peer_slots();
     room_view_ = lobby_.room();
@@ -962,6 +1053,14 @@ bool DirectSession::kick_player(std::uint8_t slot, std::string& error) {
 
 bool DirectSession::revoke_invitation(std::string& error) {
     std::scoped_lock lock(mutex_);
+    if (pending_invitation_) {
+        error = "A replacement code is still registering. The existing code remains valid.";
+        return false;
+    }
+    if (connection_test_active_ || launch_countdown_active_ || launch_stage_ != LaunchStage::Idle) {
+        error = "Finish or cancel the connection test/countdown before replacing the invitation.";
+        return false;
+    }
     if (!is_host_ || advertised_host_.empty()) {
         error = "Only the host can replace an active invitation.";
         return false;
@@ -971,12 +1070,15 @@ bool DirectSession::revoke_invitation(std::string& error) {
         const secure::KeyPair previous_host_key_pair = host_key_pair_;
         invitation_capability_ = secure::generate_key();
         host_key_pair_ = secure::generate_key_pair();
-        if (!transport_->rekey_quick_join(make_quick_join_bootstrap(), error)) {
-            invitation_capability_ = previous_capability;
-            host_key_pair_ = previous_host_key_pair;
-            return false;
-        }
-        invite_ = transport_->quick_join_code();
+        const PendingInvitation staged{invitation_capability_, host_key_pair_};
+        const std::string bootstrap = make_quick_join_bootstrap();
+        invitation_capability_ = previous_capability;
+        host_key_pair_ = previous_host_key_pair;
+        if (!transport_->rekey_quick_join(bootstrap, error)) return false;
+        pending_invitation_ = staged;
+        status_ = "Registering a replacement code. The existing code remains valid until confirmed.";
+        error.clear();
+        return true;
     } else {
         invitation_capability_ = secure::generate_key();
         host_key_pair_ = secure::generate_key_pair();
@@ -993,6 +1095,10 @@ bool DirectSession::revoke_invitation(std::string& error) {
 
 bool DirectSession::request_start(std::string& error) {
     std::scoped_lock lock(mutex_);
+    if (pending_invitation_) {
+        error = "Wait for the code replacement to finish before starting.";
+        return false;
+    }
     if (connection_test_active_) {
         error = "Wait for the connection pre-flight check to finish.";
         return false;
@@ -1015,7 +1121,8 @@ bool DirectSession::request_start(std::string& error) {
     // launch descriptor until every admitted racer can receive control,
     // authority, realtime input and corrective replicas. UDP reports its one
     // shared datagram route ready for every class.
-    constexpr std::array<TransportTrafficClass, 4U> required_traffic{{
+    constexpr std::array<TransportTrafficClass, 5U> required_traffic{{
+        TransportTrafficClass::Checkpoint,
         TransportTrafficClass::Control,
         TransportTrafficClass::Authoritative,
         TransportTrafficClass::Realtime,
@@ -1054,6 +1161,10 @@ bool DirectSession::request_start(std::string& error) {
 
 bool DirectSession::request_connection_test(std::string& error) {
     std::scoped_lock lock(mutex_);
+    if (pending_invitation_) {
+        error = "Wait for the code replacement to finish before testing.";
+        return false;
+    }
     if (!is_host_ || (state_ != ConnectionState::Hosting &&
                       state_ != ConnectionState::Lobby)) {
         error = "Only Player 1 can run a connection pre-flight check from the lobby.";
@@ -1063,11 +1174,12 @@ bool DirectSession::request_connection_test(std::string& error) {
         error = "A synchronized lobby operation is already running.";
         return false;
     }
-    if (occupied_players() != kSupportedOnlinePlayers) {
-        error = "Both racers must be in the lobby before testing the session.";
+    if (occupied_players() < 2U || occupied_players() > kSupportedOnlinePlayers) {
+        error = "At least two racers must be in the lobby before testing the session.";
         return false;
     }
-    constexpr std::array<TransportTrafficClass, 4U> required_traffic{{
+    constexpr std::array<TransportTrafficClass, 5U> required_traffic{{
+        TransportTrafficClass::Checkpoint,
         TransportTrafficClass::Control,
         TransportTrafficClass::Authoritative,
         TransportTrafficClass::Realtime,
@@ -1105,6 +1217,7 @@ bool DirectSession::request_connection_test(std::string& error) {
 }
 
 void DirectSession::reset_connection_test_locked() {
+    if (connection_test_id_) terminal_connection_test_id_ = connection_test_id_;
     connection_test_active_ = false;
     connection_test_draining_ = false;
     connection_test_id_ = 0U;
@@ -1115,24 +1228,55 @@ void DirectSession::reset_connection_test_locked() {
     connection_test_next_sequence_ = {};
     connection_test_sent_ = {};
     connection_test_received_ = {};
-    for (auto& samples : connection_test_rtt_samples_) samples.clear();
+    for (auto& peer : connection_test_rtt_samples_)
+        for (auto& samples : peer) samples.clear();
+    for (auto& peer : connection_test_echoes_)
+        for (auto& echoes : peer) echoes.clear();
     connection_test_queue_failures_at_start_ = transport_queue_failures_;
+    connection_test_result_acks_ = {};
+    connection_test_result_retry_until_ = {};
+    connection_test_result_last_send_ = {};
 }
 
 void DirectSession::service_connection_test_locked(
     std::chrono::steady_clock::time_point now) {
-    if (!connection_test_active_ || !is_host_) return;
+    if (!connection_test_active_ || !is_host_) {
+        if (connection_test_active_ && !is_host_ && now >= connection_test_drain_end_) {
+            terminal_connection_test_id_ = connection_test_id_;
+            connection_test_active_ = false;
+            ++connection_test_result_generation_;
+            status_ = "Connection pre-flight was inconclusive: final results did not arrive in time. You can retry the test or change Ready.";
+        }
+        if (is_host_ && !connection_test_active_ && now < connection_test_result_retry_until_ &&
+            now - connection_test_result_last_send_ >= std::chrono::milliseconds(500)) {
+            for (const auto& peer : peers_) {
+                if (!peer.active) continue;
+                for (const auto& result : connection_test_results_) {
+                    if (!result.valid || (connection_test_result_acks_[peer.slot] & (1U << result.player_slot))) continue;
+                    send_to(peer.address, protocol::MessageType::PreflightResult,
+                        protocol::encode_preflight_result({connection_test_id_, result.player_slot, result.score,
+                            result.p95_rtt_ms, result.jitter_ms,
+                            static_cast<std::uint16_t>(result.loss_percent * 10.0F),
+                            static_cast<std::uint16_t>(result.late_percent * 10.0F), result.queues_drained}));
+                }
+            }
+            connection_test_result_last_send_ = now;
+        }
+        return;
+    }
 
-    constexpr std::array<protocol::MessageType, 4U> message_types{{
+    constexpr std::array<protocol::MessageType, 5U> message_types{{
         protocol::MessageType::PreflightControlProbe,
         protocol::MessageType::PreflightAuthorityProbe,
         protocol::MessageType::PreflightRealtimeProbe,
-        protocol::MessageType::PreflightReplicaProbe}};
-    constexpr std::array<std::chrono::milliseconds, 4U> intervals{{
+        protocol::MessageType::PreflightReplicaProbe,
+        protocol::MessageType::PreflightCheckpointProbe}};
+    constexpr std::array<std::chrono::milliseconds, 5U> intervals{{
         std::chrono::milliseconds(100), std::chrono::milliseconds(33),
-        std::chrono::milliseconds(33), std::chrono::milliseconds(200)}};
-    constexpr std::array<std::size_t, 4U> padding_sizes{{
-        16U, 192U, 24U, 880U}};
+        std::chrono::milliseconds(33), std::chrono::milliseconds(200),
+        std::chrono::milliseconds(100)}};
+    constexpr std::array<std::size_t, 5U> padding_sizes{{
+        16U, 192U, 24U, 880U, 880U}};
 
     if (now < connection_test_measurement_end_) {
         for (std::size_t lane = 0U; lane < message_types.size(); ++lane) {
@@ -1153,7 +1297,7 @@ void DirectSession::service_connection_test_locked(
             for (const PeerRecord& peer : peers_) {
                 if (!peer.active) continue;
                 if (send_to(peer.address, message_types[lane], payload)) {
-                    ++connection_test_sent_[lane];
+                    ++connection_test_sent_[peer.slot][lane];
                 }
             }
             connection_test_last_send_[lane] = now;
@@ -1167,17 +1311,23 @@ void DirectSession::service_connection_test_locked(
     }
     if (now < connection_test_drain_end_) return;
 
+    connection_test_results_ = {};
+    connection_test_results_[local_slot_] = {
+        true, local_slot_, 10U, 0U, 0U, 0.0F, 0.0F, true};
+    int overall_score = 10;
+    for (const PeerRecord& peer : peers_) {
+    if (!peer.active) continue;
     std::vector<double> all_rtt;
     std::uint64_t total_sent = 0U;
     std::uint64_t total_received = 0U;
     std::uint64_t late_samples = 0U;
     double jitter_sum = 0.0;
     std::uint64_t jitter_samples = 0U;
-    for (std::size_t lane = 0U; lane < connection_test_rtt_samples_.size();
+    for (std::size_t lane = 0U; lane < connection_test_rtt_samples_[peer.slot].size();
          ++lane) {
-        total_sent += connection_test_sent_[lane];
-        total_received += connection_test_received_[lane];
-        const auto& samples = connection_test_rtt_samples_[lane];
+        total_sent += connection_test_sent_[peer.slot][lane];
+        total_received += connection_test_received_[peer.slot][lane];
+        const auto& samples = connection_test_rtt_samples_[peer.slot][lane];
         all_rtt.insert(all_rtt.end(), samples.begin(), samples.end());
         for (std::size_t sample = 0U; sample < samples.size(); ++sample) {
             if (samples[sample] > 100.0) ++late_samples;
@@ -1209,6 +1359,7 @@ void DirectSession::service_connection_test_locked(
         bulk_outbound_.empty() &&
         transport_->buffered_bytes(TransportTrafficClass::Control) < 4096U &&
         transport_->buffered_bytes(TransportTrafficClass::Authoritative) < 4096U &&
+        transport_->buffered_bytes(TransportTrafficClass::Checkpoint) < 4096U &&
         transport_->buffered_bytes(TransportTrafficClass::Realtime) < 4096U &&
         transport_->buffered_bytes(TransportTrafficClass::Replica) < 4096U &&
         transport_queue_failures_ == connection_test_queue_failures_at_start_;
@@ -1228,11 +1379,7 @@ void DirectSession::service_connection_test_locked(
     if (!queues_drained) score -= 3;
     score = std::clamp(score, 1, 10);
 
-    connection_test_results_ = {};
-    connection_test_results_[local_slot_] = {
-        true, local_slot_, 10U, 0U, 0U, 0.0F, 0.0F, true};
-    for (const PeerRecord& peer : peers_) {
-        if (!peer.active) continue;
+        overall_score = (std::min)(overall_score, score);
         ConnectionTestResultView result{
             true, peer.slot, static_cast<std::uint8_t>(score),
             static_cast<std::uint16_t>(std::clamp(p95, 0.0, 65535.0)),
@@ -1260,9 +1407,11 @@ void DirectSession::service_connection_test_locked(
     }
     connection_test_active_ = false;
     connection_test_draining_ = false;
-    status_ = score >= 8
+    terminal_connection_test_id_ = connection_test_id_;
+    connection_test_result_retry_until_ = now + std::chrono::seconds(15);
+    status_ = overall_score >= 8
         ? "Connection pre-flight passed in the green band."
-        : score >= 5
+        : overall_score >= 5
             ? "Connection pre-flight completed in the orange band."
             : "Connection pre-flight found a red-band route.";
     state_changed_.notify_all();
@@ -1377,7 +1526,7 @@ bool DirectSession::prepare_launch_locked(std::string& error) {
     runtime_save_generations_ = {};
     runtime_save_present_ = {};
     timeline_.reset();
-    local_history_.clear();
+    clear_input_history_locked();
     frame_commits_.clear();
     commit_history_.clear();
     authoritative_states_.clear();
@@ -1521,7 +1670,7 @@ bool DirectSession::release_launch_locked(std::uint32_t launch_epoch,
     runtime_save_generations_ = {};
     runtime_save_present_ = {};
     timeline_.reset();
-    local_history_.clear();
+    clear_input_history_locked();
     frame_commits_.clear();
     commit_history_.clear();
     authoritative_states_.clear();
@@ -1665,6 +1814,12 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
         inputs = {};
         return InputSynchronizationResult::Suspended;
     }
+    // A late recovery announcement may race the outer coordinator, but not
+    // this lock: complete its native boundary once, then park admission.
+    if (recovery_frame_ && !recovery_resumed_ && frame > *recovery_frame_) {
+        inputs = {};
+        return InputSynchronizationResult::Suspended;
+    }
     if (frame != next_commit_frame_) {
         // DKR can invoke its retail input boundary once more after the outer
         // authored tick has already committed the same simulation frame. This
@@ -1728,14 +1883,10 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
             newly_filled_first_frame = first_missing;
             for (std::uint32_t missing = first_missing;
                  missing < target; ++missing) {
-                timeline_.set_local(local_slot_, missing,
-                                    local_input_submitted_);
-                local_history_.emplace_back(missing,
-                                            local_input_submitted_);
+                store_local_input_locked(missing, local_input_submitted_, false);
             }
         }
-        timeline_.set_local(local_slot_, target, local);
-        local_history_.emplace_back(target, local);
+        store_local_input_locked(target, local);
         pending_local_submission_frame_ = target;
         local_input_submitted_frame_ = target;
         local_input_submitted_ = local;
@@ -1861,29 +2012,17 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
         begin_or_continue_pending_wait(now);
         service_pending_repair(now);
 
-        // Rollback is host-authoritative. Reaching the configured prediction
-        // runway means the repair lane is already late; adding a second
-        // 250-ms grace here used to freeze the authored game thread and turn
-        // otherwise healthy rollback races into a slideshow. Commit the
-        // predicted input immediately while the network worker continues to
-        // advertise and repair the missing history. Lockstep never enters
-        // this branch and retains its strict confirmed-input barrier.
+        // The native world is not rewindable. Once the prediction window is
+        // exhausted, publishing more immutable guesses loses client controls.
+        // Yield immediately; never block the UI thread or bypass the window.
         if (is_host_ && host_owned_prediction) {
             if (!prediction_failsafe_active_) {
                 prediction_failsafe_active_ = true;
-                status_ = "A delayed racer input is being predicted while its history is repaired.";
+                ++prediction_limit_waits_;
+                status_ = "Waiting for a racer's inputs at the prediction limit; recovery is active.";
             }
-            ++forced_prediction_frames_;
-            failure_recorder().record(
-                FailureEventKind::InputPredicted, frame,
-                timeline_.unconfirmed_runway(frame, occupied_mask),
-                authoritative_phase_active_ && launch_descriptor_
-                    ? launch_descriptor_->rollback_window : 0U,
-                authoritative_phase_active_
-                    ? "Player 1 committed hold-last gameplay input"
-                    : "Player 1 committed hold-last frontend input");
-            waiting = false;
-        } else {
+        }
+        {
             // A latency spike is a soft simulation stall, not proof of a
             // divergent session. Keep the UI/network worker responsive and
             // continue reliable repair until the route recovers or the player
@@ -1894,6 +2033,10 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
                 status_ = is_host_
                     ? "Waiting for a racer's authored inputs; reliable recovery is still active."
                     : "Waiting for Player 1's frame commits; reliable recovery is still active.";
+            }
+            if (now - pending_commit_wait_started_ >= std::chrono::seconds(90)) {
+                fail_locked("No authenticated input progress for 90 seconds. The connection could not recover; leave the session and reconnect. Your separate saves are retained.");
+                return InputSynchronizationResult::Failed;
             }
             return InputSynchronizationResult::Pending;
         }
@@ -1907,6 +2050,10 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
             inputs = {};
             return InputSynchronizationResult::Suspended;
         }
+        if (recovery_frame_ && !recovery_resumed_ && frame > *recovery_frame_) {
+            inputs = {};
+            return InputSynchronizationResult::Suspended;
+        }
         const auto now = std::chrono::steady_clock::now();
         begin_or_continue_pending_wait(now);
         service_pending_repair(now);
@@ -1915,6 +2062,17 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
             return InputSynchronizationResult::Failed;
         }
         state_changed_.wait_for(lock, std::chrono::milliseconds(20));
+    }
+    // The wait releases mutex_: a commit and a boundary can arrive together.
+    // Re-check admission even when awaiting_commit() has just become false.
+    if (state_ != ConnectionState::Running) {
+        return InputSynchronizationResult::Failed;
+    }
+    if ((gameplay_handoff_ && gameplay_handoff_->suspended &&
+         frame >= gameplay_handoff_->local_suspend_frame) ||
+        (recovery_frame_ && !recovery_resumed_ && frame > *recovery_frame_)) {
+        inputs = {};
+        return InputSynchronizationResult::Suspended;
     }
     reset_pending_commit_wait_locked();
     if (is_host_) {
@@ -1962,6 +2120,7 @@ InputSynchronizationResult DirectSession::synchronize_inputs_result(
         return InputSynchronizationResult::Failed;
     }
     inputs = found->second.inputs;
+    record_input_latency_locked(found->second, true);
     last_consumed_commit_hash_ = found->second.commit_hash;
     last_consumed_input_frame_ = frame;
     last_consumed_inputs_ = inputs;
@@ -2009,6 +2168,13 @@ std::uint32_t DirectSession::contiguous_authoritative_commits(
 
 bool DirectSession::fast_forward_authoritative_commits(
     std::uint32_t next_frame, std::string& error) {
+    return install_fast_forward(next_frame, [] { return true; }, error) ==
+        SessionPollResult::Ready;
+}
+
+SessionPollResult DirectSession::install_fast_forward(
+    std::uint32_t next_frame, const std::function<bool()>& installer,
+    std::string& error) {
     std::scoped_lock lock(mutex_);
     if (is_host_ || state_ != ConnectionState::Running ||
         !authoritative_phase_active_ ||
@@ -2017,15 +2183,21 @@ bool DirectSession::fast_forward_authoritative_commits(
         launch_descriptor_->synchronization !=
             SynchronizationMode::Rollback) {
         error = "Only a running rollback guest can fast-forward to Player 1's state.";
-        return false;
+        return SessionPollResult::Failed;
+    }
+    // A portable snapshot must not skip a native lifecycle/capture hook.
+    if (gameplay_handoff_ || (gameplay_barrier_ && !gameplay_barrier_->go_released) || transition_barrier_ ||
+        recovery_frame_ || finish_seal_frame_) {
+        error.clear();
+        return SessionPollResult::Pending;
     }
     if (next_frame < next_commit_frame_) {
         error = "The Player 1 state fast-forward boundary moved backwards.";
-        return false;
+        return SessionPollResult::Failed;
     }
     if (next_frame == next_commit_frame_) {
         error.clear();
-        return true;
+        return SessionPollResult::Ready;
     }
 
     // Validate the complete immutable chain first. Nothing below mutates the
@@ -2039,9 +2211,11 @@ bool DirectSession::fast_forward_authoritative_commits(
          ++frame) {
         const auto found = frame_commits_.find(frame);
         if (found == frame_commits_.end()) {
-            error = "Player 1's state arrived before its authenticated frame chain at frame " +
-                    std::to_string(frame) + ".";
-            return false;
+            request_missing_commit_locked(frame);
+            worker_wake_ = true;
+            state_changed_.notify_all();
+            error.clear();
+            return SessionPollResult::Pending;
         }
         std::string commit_error;
         if (!validate_commit(found->second, commit_error) ||
@@ -2050,7 +2224,7 @@ bool DirectSession::fast_forward_authoritative_commits(
                 ? "Player 1's state fast-forward chain is discontinuous at frame " +
                       std::to_string(frame) + "."
                 : std::move(commit_error);
-            return false;
+            return SessionPollResult::Failed;
         }
         previous_hash = found->second.commit_hash;
         last_inputs = found->second.inputs;
@@ -2058,6 +2232,12 @@ bool DirectSession::fast_forward_authoritative_commits(
         last_predicted_mask = found->second.predicted_mask;
     }
 
+    // The lock pins the complete chain and epoch across installation. The
+    // installer stages all RDRAM writes, returning false without mutation.
+    if (!installer()) {
+        error.clear();
+        return SessionPollResult::Pending;
+    }
     const std::uint32_t last_frame = next_frame - 1U;
     last_consumed_commit_hash_ = previous_hash;
     last_consumed_input_frame_ = last_frame;
@@ -2076,7 +2256,43 @@ bool DirectSession::fast_forward_authoritative_commits(
     ++simulation_wake_generation_;
     state_changed_.notify_all();
     error.clear();
-    return true;
+    native_completed_frame_ = last_frame;
+    return SessionPollResult::Ready;
+}
+
+std::optional<std::uint32_t> DirectSession::native_completed_frame() const {
+    std::scoped_lock lock(mutex_);
+    return native_completed_frame_;
+}
+
+std::uint64_t DirectSession::synchronization_progress() const {
+    std::scoped_lock lock(mutex_);
+    std::uint64_t marker = 14695981039346656037ULL;
+    const auto add = [&](std::uint64_t value) { marker = (marker ^ value) * 1099511628211ULL; };
+    add(input_epoch_); add(scene_epoch_); add(next_commit_frame_);
+    for (std::size_t slot = 0; slot < kMaximumPlayers; ++slot) {
+        if (simulation_progress_present_[slot]) add(simulation_completed_frame_[slot]);
+        add(recovery_acks_[slot]);
+        if (gameplay_barrier_) { add(gameplay_barrier_->ready[slot]); add(gameplay_barrier_->armed[slot]); }
+        if (transition_barrier_) add(transition_barrier_->acknowledgements[slot]);
+    }
+    if (gameplay_barrier_) {
+        add(gameplay_barrier_->epoch_synchronized); add(gameplay_barrier_->baseline_released);
+        add(gameplay_barrier_->arm_announced); add(gameplay_barrier_->go_released);
+    }
+    add(recovery_resumed_);
+    // Commutative aggregate: unordered-map iteration order is not progress.
+    std::uint64_t pieces = 0;
+    for (const auto& [frame, assembly] : snapshot_assemblies_)
+        pieces += (static_cast<std::uint64_t>(frame) + 1U) *
+            (1U + std::count(assembly.present.begin(), assembly.present.end(), true));
+    add(pieces); add(authoritative_states_.size());
+    std::uint64_t acknowledgements = 0;
+    for (const auto& [frame, present] : authoritative_acknowledgements_)
+        acknowledgements += (static_cast<std::uint64_t>(frame) + 1U) *
+            std::count(present.begin(), present.end(), true);
+    add(acknowledgements);
+    return marker;
 }
 
 void DirectSession::report_simulation_progress(
@@ -2098,6 +2314,8 @@ void DirectSession::report_simulation_progress(
         return;
     }
     const std::uint32_t progress_scene_epoch = gameplay ? scene_epoch_ : 0U;
+    if (!native_completed_frame_ || completed_frame > *native_completed_frame_)
+        native_completed_frame_ = completed_frame;
     const auto now = std::chrono::steady_clock::now();
     if (simulation_progress_present_[local_slot_] &&
         completed_frame < simulation_completed_frame_[local_slot_]) {
@@ -2376,7 +2594,7 @@ void DirectSession::reset_pending_input_locked() {
     // target frame prevents a delayed menu input from becoming frame one of
     // the race after the fresh epoch opens.
     timeline_.reset(next_commit_frame_);
-    local_history_.clear();
+    clear_input_history_locked();
     frame_commits_.clear();
     commit_history_.clear();
     pending_input_correction_.reset();
@@ -2426,10 +2644,13 @@ bool DirectSession::record_simulation_progress_locked(
         completed_frame < simulation_completed_frame_[player_slot]) {
         return false;
     }
+    if (!simulation_progress_present_[player_slot] ||
+        completed_frame > simulation_completed_frame_[player_slot]) {
+        simulation_progress_time_[player_slot] =
+            std::chrono::steady_clock::now();
+    }
     simulation_completed_frame_[player_slot] = completed_frame;
     simulation_progress_present_[player_slot] = true;
-    simulation_progress_time_[player_slot] =
-        std::chrono::steady_clock::now();
     ++simulation_wake_generation_;
     state_changed_.notify_all();
     return true;
@@ -2437,6 +2658,7 @@ bool DirectSession::record_simulation_progress_locked(
 
 void DirectSession::reset_input_delivery_tracking_locked(
     std::uint32_t first_frame) {
+    native_completed_frame_.reset();
     const std::uint32_t first_authored_input =
         first_frame >
                 std::numeric_limits<std::uint32_t>::max() - input_delay_
@@ -2698,10 +2920,8 @@ SessionPollResult DirectSession::poll_authoritative_state(
     const std::uint16_t measured_jitter =
         local_slot_ < room_view_.players.size()
             ? room_view_.players[local_slot_].jitter_ms : 0U;
-    const auto retry_interval = std::chrono::milliseconds(std::clamp(
-        30 + static_cast<int>(measured_rtt / 2U) +
-            static_cast<int>(measured_jitter) * 2,
-        30, 250));
+    const auto retry_interval = std::chrono::milliseconds(
+        checkpoint_retry_milliseconds(measured_rtt, measured_jitter));
     if (last_authoritative_request_frame_ != frame) {
         last_authoritative_request_frame_ = frame;
         last_authoritative_request_ = now;
@@ -3113,7 +3333,7 @@ SessionPollResult DirectSession::poll_gameplay_ready(
         !authoritative_phase_active_ ||
         authority_lifecycle_ != AuthorityLifecycle::Racing ||
         scene_epoch_ == 0U ||
-        racer_count == 0U || racer_count > 10U) {
+        racer_count > 10U) {
         error = "The synchronized gameplay-start barrier is not available.";
         return SessionPollResult::Failed;
     }
@@ -3226,6 +3446,33 @@ bool DirectSession::wait_gameplay_ready(
     return false;
 }
 
+void DirectSession::remember_release_locked(protocol::MessageType type,
+    std::uint32_t epoch, std::uint32_t boundary, std::uint32_t detail) {
+    if (completed_release_locked(type, epoch, boundary, detail)) return;
+    CompletedRelease completed{type, epoch, boundary, detail};
+    for (const auto& peer : peers_) {
+        if (peer.active) completed.recipients[peer.slot] = peer.sender_id;
+    }
+    completed.expires = std::chrono::steady_clock::now() + std::chrono::minutes(2);
+    constexpr std::size_t maximum_completed = 16U;
+    if (completed_releases_.size() == maximum_completed) completed_releases_.pop_front();
+    completed_releases_.push_back(completed);
+}
+
+bool DirectSession::completed_release_locked(protocol::MessageType type,
+    std::uint32_t epoch, std::uint32_t boundary, std::uint32_t detail,
+    std::uint64_t recipient) {
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(completed_releases_, [now](const auto& entry) { return entry.expires <= now; });
+    return std::any_of(completed_releases_.begin(), completed_releases_.end(),
+        [&](const auto& entry) {
+            return entry.type == type && entry.epoch == epoch &&
+                entry.boundary == boundary && entry.detail == detail &&
+                (recipient == 0U || std::find(entry.recipients.begin(),
+                    entry.recipients.end(), recipient) != entry.recipients.end());
+        });
+}
+
 SessionPollResult DirectSession::poll_gameplay_resume(
     std::uint32_t map, std::uint32_t racer_count, std::string& error) {
     std::scoped_lock lock(mutex_);
@@ -3271,6 +3518,8 @@ SessionPollResult DirectSession::poll_gameplay_resume(
         }
         if (!gameplay_barrier_->go_released) {
             gameplay_barrier_->go_released = true;
+            remember_release_locked(protocol::MessageType::GameplayBarrier,
+                scene_epoch_, map, racer_count);
             const auto payload = protocol::encode_gameplay_barrier({
                 scene_epoch_, map, racer_count, local_slot_,
                 protocol::GameplayBarrierStage::Go});
@@ -3298,6 +3547,8 @@ SessionPollResult DirectSession::poll_gameplay_resume(
         return SessionPollResult::Pending;
     }
     status_ = "The synchronized race baseline is armed. Go!";
+    remember_release_locked(protocol::MessageType::GameplayBarrier,
+        scene_epoch_, map, racer_count);
     error.clear();
     return SessionPollResult::Ready;
 }
@@ -3433,6 +3684,13 @@ SessionPollResult DirectSession::poll_authoritative_acknowledgements(
         gameplay_barrier_ && gameplay_barrier_->scene_epoch == scene_epoch_ &&
         gameplay_barrier_->baseline_released &&
         !gameplay_barrier_->arm_announced;
+    std::uint32_t baseline_retry_ms = 100U;
+    for (const auto& peer : peers_) {
+        if (peer.active) baseline_retry_ms = (std::max)(baseline_retry_ms,
+            checkpoint_retry_milliseconds(
+                static_cast<std::uint16_t>((std::clamp)(peer.rtt_ms, 0.0, 65535.0)),
+                static_cast<std::uint16_t>((std::clamp)(peer.jitter_ms, 0.0, 65535.0))));
+    }
     if (!is_host_ || state_ != ConnectionState::Running ||
         (!finish_boundary && !gameplay_baseline)) {
         error = status_.empty()
@@ -3469,7 +3727,7 @@ SessionPollResult DirectSession::poll_authoritative_acknowledgements(
     } else if (gameplay_baseline && gameplay_barrier_ &&
                (last_gameplay_barrier_broadcast_.time_since_epoch().count() == 0 ||
                 now - last_gameplay_barrier_broadcast_ >=
-                    std::chrono::milliseconds(100))) {
+                    std::chrono::milliseconds(baseline_retry_ms))) {
         broadcast(protocol::MessageType::GameplayBarrier,
                   protocol::encode_gameplay_barrier({
                       gameplay_barrier_->scene_epoch,
@@ -3673,6 +3931,8 @@ void DirectSession::confirm_authoritative_state(std::uint32_t frame,
             recovery_resumed_ = true;
             recovery_stage_ = RecoveryStage::Completed;
             completed_recovery_frame_ = frame;
+            remember_release_locked(protocol::MessageType::RecoveryResume,
+                scene_epoch_, frame, 0U);
             completed_recovery_epoch_ = scene_epoch_;
             recovery_resume_until_ = std::chrono::steady_clock::now() +
                                      std::chrono::seconds(1);
@@ -3744,6 +4004,8 @@ SessionPollResult DirectSession::poll_recovery_complete(
         error.clear();
         return SessionPollResult::Pending;
     }
+    remember_release_locked(protocol::MessageType::RecoveryResume,
+        scene_epoch_, frame, 0U);
     recovery_frame_.reset();
     recovery_stage_ = RecoveryStage::Idle;
     recovery_acks_ = {};
@@ -3830,6 +4092,8 @@ SessionPollResult DirectSession::poll_transition(
         transition_resume_until_ = now + std::chrono::seconds(1);
     }
     if (transition_barrier_->resumed) {
+        remember_release_locked(protocol::MessageType::TransitionBarrier,
+            scene_epoch_, frame, transition_kind);
         error.clear();
         return SessionPollResult::Ready;
     }
@@ -3948,6 +4212,20 @@ bool DirectSession::request_rollback_recovery(
 
 SessionView DirectSession::view() const {
     std::scoped_lock lock(mutex_);
+    return view_locked();
+}
+
+SessionView DirectSession::presentation_view() const {
+    const auto snapshot = presentation_view_.load(std::memory_order_acquire);
+    return snapshot ? *snapshot : SessionView{};
+}
+
+bool DirectSession::presentation_active() const {
+    const auto snapshot = presentation_view_.load(std::memory_order_acquire);
+    return snapshot && snapshot->state != ConnectionState::Offline && snapshot->state != ConnectionState::Failed;
+}
+
+SessionView DirectSession::view_locked() const {
     SessionView result{state_, is_host_ ? lobby_.room() : room_view_, is_host_,
                        local_slot_, transport_->local_port(), invite_, status_,
                        last_verified_frame_ > 0U,
@@ -3981,6 +4259,20 @@ SessionView DirectSession::view() const {
         transport_->buffered_bytes(TransportTrafficClass::Realtime);
     result.replica_transport_buffered_bytes =
         transport_->buffered_bytes(TransportTrafficClass::Replica);
+    result.checkpoint_transport_buffered_bytes = transport_->buffered_bytes(TransportTrafficClass::Checkpoint);
+    result.duplicate_retries_coalesced = duplicate_retries_coalesced_;
+    result.checkpoint_encoding_cache_hits = checkpoint_encoding_cache_hits_;
+    result.maximum_network_pump_us = maximum_network_pump_us_;
+    const auto queue_now = std::chrono::steady_clock::now();
+    for (const auto* queue : {&critical_outbound_, &repair_outbound_, &commit_outbound_,
+             &high_priority_outbound_, &authority_outbound_, &normal_priority_outbound_, &bulk_outbound_}) {
+        for (const auto& packet : *queue) {
+            result.pending_outbound_bytes += packet.bytes.size();
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(queue_now - packet.enqueued).count();
+            result.oldest_outbound_age_ms = (std::max)(result.oldest_outbound_age_ms,
+                static_cast<std::uint32_t>((std::clamp)(age, std::int64_t{0}, std::int64_t{UINT32_MAX})));
+        }
+    }
     result.host_backpressure_events = host_backpressure_events_;
     result.maximum_peer_frame_debt = maximum_peer_frame_debt_;
     result.recovering_peer_count = recovering_peer_count_;
@@ -4008,6 +4300,12 @@ SessionView DirectSession::view() const {
     result.commit_repair_requests_received = commit_repair_requests_received_;
     result.commit_repair_batches_sent = commit_repair_batches_sent_;
     result.late_inputs_discarded = late_inputs_discarded_;
+    result.refreshed_input_samples = refreshed_input_samples_;
+    result.stale_input_revisions = stale_input_revisions_;
+    result.prediction_limit_waits = prediction_limit_waits_;
+    result.local_input_echo_ms = local_input_echo_ms_;
+    result.local_input_consume_ms = local_input_consume_ms_;
+    result.measured_input_echoes = measured_input_echoes_;
     result.live_replica_requests_sent = live_replica_requests_sent_;
     result.live_replica_request_misses = live_replica_request_misses_;
     result.live_replica_window_rejections = live_replica_window_rejections_;
@@ -4036,6 +4334,16 @@ SessionView DirectSession::view() const {
     result.compatibility_sync_offer = compatibility_sync_offer_;
     result.local_online_save_ready = is_host_
         ? local_online_save_ready_ : local_online_save_acknowledged_;
+    if (!is_host_ && local_online_save_ready_) {
+        // Installing the host's validated HelloAck proves its source save.
+        // Other racers require the host's matching roster confirmation.
+        result.online_save_ready[0] = true;
+        if (online_save_status_ && online_save_status_->room_generation == room_view_.generation) {
+            for (std::size_t slot = 0; slot < result.online_save_ready.size(); ++slot)
+                result.online_save_ready[slot] = room_view_.players[slot].occupied &&
+                    (online_save_status_->verified_mask & (1U << slot));
+        }
+    }
     if (local_slot_ < result.online_save_ready.size()) {
         result.online_save_ready[local_slot_] =
             result.local_online_save_ready;
@@ -4125,6 +4433,7 @@ RuntimeSessionView DirectSession::runtime_view() const {
     result.online_save_generation = session_save_generation_;
     result.online_save_hash = manifest_.session_save_hash;
     result.status = status_;
+    if (!replay_write_error_.empty()) result.status += " Replay: " + replay_write_error_;
     return result;
 }
 
@@ -4342,6 +4651,43 @@ bool DirectSession::send_with_key(const PeerAddress& address,
                                   protocol::MessageType type,
                                   std::span<const std::uint8_t> payload,
                                   std::uint32_t frame) {
+    // Coalesce only identical, still-unsent idempotent requests. Once a packet
+    // leaves the application queue a retry must get a fresh authenticated
+    // sequence/nonce and remain eligible for transmission.
+    const bool coalescible = type == protocol::MessageType::StateSnapshot ||
+        type == protocol::MessageType::StateRequest ||
+        type == protocol::MessageType::StateAcknowledge ||
+        type == protocol::MessageType::GameplayBarrier ||
+        type == protocol::MessageType::TransitionBarrier ||
+        type == protocol::MessageType::RecoveryBegin ||
+        type == protocol::MessageType::RecoveryAck ||
+        type == protocol::MessageType::RecoveryResume ||
+        type == protocol::MessageType::GameplayHandoff ||
+        type == protocol::MessageType::InputRepairRequest ||
+        type == protocol::MessageType::Start ||
+        type == protocol::MessageType::ReadyRequest ||
+        type == protocol::MessageType::ReadyAck ||
+        type == protocol::MessageType::CountdownAck ||
+        type == protocol::MessageType::LaunchPrepare ||
+        type == protocol::MessageType::LaunchPrepareAck ||
+        type == protocol::MessageType::LaunchCommit ||
+        type == protocol::MessageType::LaunchCommitAck ||
+        type == protocol::MessageType::LaunchRelease ||
+        type == protocol::MessageType::LaunchReleaseAck ||
+        type == protocol::MessageType::Disconnect ||
+        type == protocol::MessageType::FrameCommitRequest;
+    if (coalescible) {
+        for (const auto* queue : {&critical_outbound_, &repair_outbound_, &authority_outbound_, &normal_priority_outbound_}) {
+            if (std::any_of(queue->begin(), queue->end(), [&](const auto& queued) {
+                    return queued.type == type && queued.destination == address &&
+                        queued.frame == frame && queued.retry_identity.size() == payload.size() &&
+                        std::equal(queued.retry_identity.begin(), queued.retry_identity.end(), payload.begin());
+                })) {
+                ++duplicate_retries_coalesced_;
+                return true;
+            }
+        }
+    }
     std::uint64_t& sequence = outbound_sequence(address, key);
     protocol::Datagram datagram{{type, match_id_, sequence, frame},
                                 std::vector<std::uint8_t>(payload.begin(), payload.end())};
@@ -4351,13 +4697,15 @@ bool DirectSession::send_with_key(const PeerAddress& address,
     const std::uint64_t packet_sequence = sequence++;
     const auto encrypted = secure::seal(plain, key, sender_id_,
                                         packet_sequence, match_id_);
-    return enqueue_outbound(address, type, std::move(encrypted), frame);
+    return enqueue_outbound(address, type, std::move(encrypted), frame,
+        coalescible ? std::vector<std::uint8_t>(payload.begin(), payload.end()) : std::vector<std::uint8_t>{});
 }
 
 bool DirectSession::enqueue_outbound(PeerAddress destination,
                                      protocol::MessageType type,
-                                     std::vector<std::uint8_t> bytes,
-                                     std::uint32_t frame) {
+                                      std::vector<std::uint8_t> bytes,
+                                      std::uint32_t frame,
+                                      std::vector<std::uint8_t> retry_identity) {
     constexpr std::size_t maximum_critical = 512U;
     constexpr std::size_t maximum_repair = 2048U;
     constexpr std::size_t maximum_high = 2048U;
@@ -4369,7 +4717,7 @@ bool DirectSession::enqueue_outbound(PeerAddress destination,
     constexpr std::size_t maximum_authority = 512U;
     constexpr std::size_t maximum_normal = 256U;
     constexpr std::size_t maximum_bulk = 96U;
-    OutboundPacket packet{destination, type, frame, std::move(bytes)};
+    OutboundPacket packet{destination, type, frame, std::move(bytes), std::move(retry_identity)};
     const bool critical = type == protocol::MessageType::Disconnect ||
         type == protocol::MessageType::Start ||
         type == protocol::MessageType::ReadyRequest ||
@@ -4409,7 +4757,11 @@ bool DirectSession::enqueue_outbound(PeerAddress destination,
     const bool authoritative_commit =
         type == protocol::MessageType::FrameCommit;
     if (critical) {
-        if (critical_outbound_.size() >= maximum_critical) {
+        // Leave one terminal slot per remote racer. An overflow must still
+        // be able to notify the other instances, without evicting unique work.
+        const auto critical_limit = type == protocol::MessageType::Disconnect
+            ? maximum_critical + kMaximumPlayers - 1U : maximum_critical;
+        if (critical_outbound_.size() >= critical_limit) {
             ++outbound_packets_dropped_;
             ++transport_queue_failures_;
             failure_recorder().record(FailureEventKind::QueueOverflow,
@@ -4463,18 +4815,25 @@ bool DirectSession::enqueue_outbound(PeerAddress destination,
         }
         commit_outbound_.push_back(std::move(packet));
     } else if (high_priority) {
-        if (type == protocol::MessageType::SimulationProgress ||
+        if (type == protocol::MessageType::Input ||
+            type == protocol::MessageType::InputAck ||
+            type == protocol::MessageType::SimulationProgress ||
             type == protocol::MessageType::RacerOrientation) {
+            // Live input is rolling redundancy, not the repair ledger. Exact
+            // older samples remain in local_history_ for reliable repair.
+            // Epoch changes purge this lane; within it a newer batch wins.
             // These are advisory/latest-wins frame samples, not ledgers. A
             // newer unsent value fully supersedes an older one for the same
             // peer, keeping a congested route from accumulating stale pacing
             // or orientation reports that arrive after they can be useful.
+            const auto before = high_priority_outbound_.size();
             std::erase_if(
                 high_priority_outbound_,
                 [&](const OutboundPacket& queued) {
                     return queued.type == type &&
                            queued.destination == destination;
                 });
+            duplicate_retries_coalesced_ += before - high_priority_outbound_.size();
         }
         if (high_priority_outbound_.size() >= maximum_high) {
             ++outbound_packets_dropped_;
@@ -4534,6 +4893,11 @@ bool DirectSession::enqueue_outbound(PeerAddress destination,
         }
         authority_outbound_.push_back(std::move(packet));
     } else {
+        if (type == protocol::MessageType::OnlineSaveStatus) {
+            std::erase_if(normal_priority_outbound_, [&](const OutboundPacket& queued) {
+                return queued.type == type && queued.destination == destination;
+            });
+        }
         if (normal_priority_outbound_.size() >= maximum_normal) {
             normal_priority_outbound_.pop_front();
             ++outbound_packets_dropped_;
@@ -4564,6 +4928,10 @@ void DirectSession::flush_outbound_locked() {
     std::vector<BlockedRoute> blocked_routes;
     const auto traffic_class = [](protocol::MessageType type) {
         return
+            (type == protocol::MessageType::StateSnapshot ||
+             type == protocol::MessageType::PreflightCheckpointProbe)
+                ? TransportTrafficClass::Checkpoint
+                :
             type == protocol::MessageType::LiveReplicaSnapshot
                 ? TransportTrafficClass::Replica
                 : type == protocol::MessageType::PreflightReplicaProbe
@@ -4599,6 +4967,17 @@ void DirectSession::flush_outbound_locked() {
         for (std::size_t attempt = 0U; attempt < attempts; ++attempt) {
             OutboundPacket packet = std::move(queue.front());
             queue.pop_front();
+            // Only redundant disposable traffic expires. Ledger, repair,
+            // save and lifecycle packets are never discarded on age.
+            if ((packet.type == protocol::MessageType::Input ||
+                 packet.type == protocol::MessageType::InputAck ||
+                 packet.type == protocol::MessageType::SimulationProgress ||
+                 packet.type == protocol::MessageType::RacerOrientation) &&
+                std::chrono::steady_clock::now() - packet.enqueued >
+                    std::chrono::milliseconds(250)) {
+                ++outbound_packets_dropped_;
+                continue;
+            }
             const TransportTrafficClass traffic = traffic_class(packet.type);
             if (route_blocked(packet.destination, traffic)) {
                 queue.push_back(std::move(packet));
@@ -4682,6 +5061,21 @@ void DirectSession::broadcast(protocol::MessageType type,
 
 void DirectSession::pump_locked() {
     transport_->service();
+    if (pending_invitation_) {
+        const auto rekey = transport_->rekey_status();
+        if (rekey == QuickJoinRekeyStatus::Committed) {
+            invitation_capability_ = pending_invitation_->capability;
+            host_key_pair_ = pending_invitation_->key_pair;
+            invite_ = transport_->quick_join_code();
+            clear_friend_admissions_locked();
+            pending_joins_ = {};
+            pending_invitation_.reset();
+            status_ = "Quick Join code replaced. Existing racers remain connected.";
+        } else if (rekey == QuickJoinRekeyStatus::Failed) {
+            pending_invitation_.reset();
+            status_ = "Replacement registration failed. The previous code and lobby are unchanged.";
+        }
+    }
     if (quick_join_bootstrap_pending_) {
         std::string bootstrap_error;
         if (!activate_quick_join_locked(bootstrap_error) &&
@@ -4759,6 +5153,25 @@ void DirectSession::pump_locked() {
     state_changed_.notify_all();
     const auto now = std::chrono::steady_clock::now();
     constexpr auto control_retry = std::chrono::milliseconds(250);
+    // The outer runtime can apply lead backpressure before requesting input,
+    // so its pending-input timer is not necessarily armed. Expire genuine
+    // lack of native peer progress here on the independent network worker.
+    // Loading/recovery/finish have their own staged deadlines.
+    if (is_host_ && state_ == ConnectionState::Running &&
+        host_backpressure_active_ && !gameplay_handoff_ &&
+        (!gameplay_barrier_ || gameplay_barrier_->go_released) &&
+        !recovery_frame_ && !transition_barrier_ &&
+        authority_lifecycle_ != AuthorityLifecycle::SealingFinish) {
+        for (const auto& peer : peers_) {
+            if (!peer.active || !simulation_progress_present_[peer.slot] ||
+                next_commit_frame_ <= simulation_completed_frame_[peer.slot] + 1U) continue;
+            if (now - simulation_progress_time_[peer.slot] >= std::chrono::seconds(90)) {
+                fail_locked("Player " + std::to_string(peer.slot + 1U) +
+                    " stopped making simulation progress for 90 seconds. The online session ended safely; your separate saves are retained.");
+                return;
+            }
+        }
+    }
     service_connection_test_locked(now);
     if (is_host_ && launch_countdown_active_) {
         std::string countdown_error;
@@ -4907,6 +5320,12 @@ void DirectSession::pump_locked() {
             : "The host did not answer the encrypted join request. Confirm the invitation address, allow DKR-R through the host firewall and verify that the host UDP port is reachable.");
         return;
     }
+    if (!is_host_ && state_ == ConnectionState::AwaitingApproval &&
+        last_admission_response_.time_since_epoch().count() != 0 &&
+        now - last_admission_response_ >= std::chrono::seconds(20)) {
+        fail_locked("The host stopped responding while approval was pending. Leave and retry when the host is reachable.");
+        return;
+    }
     if (!is_host_ && state_ == ConnectionState::Lobby &&
         local_online_save_ready_ && !local_online_save_acknowledged_ &&
         now - last_client_request_ >= control_retry) {
@@ -5037,7 +5456,8 @@ void DirectSession::pump_locked() {
         gameplay_barrier_->arm_announced &&
         gameplay_barrier_->armed[local_slot_] &&
         !gameplay_barrier_->go_released &&
-        now < gameplay_resume_ack_until_ &&
+        // Continue asking until Go arrives or the runtime's handoff deadline
+        // ends the transaction. A two-second packet blackout is recoverable.
         (last_gameplay_resume_ack_.time_since_epoch().count() == 0 ||
          now - last_gameplay_resume_ack_ >= std::chrono::milliseconds(100))) {
         send_to(host_address_, protocol::MessageType::GameplayBarrier,
@@ -5182,11 +5602,6 @@ void DirectSession::handle_join_request(
         return;
     }
     ++join_packets_accepted_;
-    if (lobby_locked_) {
-        send_with_key(source, peer_key, protocol::MessageType::HelloAck,
-            protocol::encode_hello_ack({false, 0U, "The host has locked this lobby."}));
-        return;
-    }
     if (PeerRecord* existing = peer_by_sender(packet_sender)) {
         if (!(existing->address == source)) return;
         send_with_key(existing->address, existing->key,
@@ -5197,6 +5612,11 @@ void DirectSession::handle_join_request(
                 session_save_, {}, session_save_generation_,
                 manifest_.session_save_hash}));
         broadcast_lobby();
+        return;
+    }
+    if (lobby_locked_ || (state_ != ConnectionState::Lobby && state_ != ConnectionState::Hosting)) {
+        send_with_key(source, peer_key, protocol::MessageType::HelloAck,
+            protocol::encode_hello_ack({false, 0U, "The host is not accepting new racers right now."}));
         return;
     }
     const std::string incompatibility = admission_incompatibility(
@@ -5350,6 +5770,11 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         }
         launch_commit_acks_[peer->slot] = true;
         state_changed_.notify_all();
+    } else if (packet.header.type == protocol::MessageType::PreflightResult) {
+        protocol::PreflightResultPayload result{};
+        if (!protocol::decode_preflight_result(packet.payload, result, error) ||
+            result.test_id != connection_test_id_ || !connection_test_results_[result.player_slot].valid) return;
+        connection_test_result_acks_[peer->slot] |= static_cast<std::uint8_t>(1U << result.player_slot);
     } else if (packet.header.type == protocol::MessageType::LaunchReleaseAck) {
         protocol::LaunchReleaseAckPayload acknowledgement{};
         if (!protocol::decode_launch_release_ack(packet.payload,
@@ -5373,8 +5798,11 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         if (now_us < probe.sent_time_us) return;
         const double rtt_ms = static_cast<double>(now_us - probe.sent_time_us) /
                               1000.0;
-        ++connection_test_received_[*lane];
-        connection_test_rtt_samples_[*lane].push_back(rtt_ms);
+        if (probe.sequence >= connection_test_next_sequence_[*lane] ||
+            connection_test_echoes_[peer->slot][*lane].size() >= 2048U ||
+            !connection_test_echoes_[peer->slot][*lane].insert(probe.sequence).second) return;
+        ++connection_test_received_[peer->slot][*lane];
+        connection_test_rtt_samples_[peer->slot][*lane].push_back(rtt_ms);
     } else if (packet.header.type == protocol::MessageType::Loaded) {
         protocol::LoadedPayload loaded{};
         if (!protocol::decode_loaded(packet.payload, loaded, error) ||
@@ -5408,6 +5836,12 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
             else ++future_epoch_packets_;
             return;
         }
+        const auto batch_newest = batch.first_frame +
+            static_cast<std::uint32_t>(batch.inputs.size() - 1U);
+        if ((batch_newest > next_commit_frame_ &&
+             batch_newest - next_commit_frame_ > 256U) ||
+            (batch_newest < next_commit_frame_ &&
+             next_commit_frame_ - batch_newest > 512U)) return;
         if (batch.simulation_progress_present) {
             (void)record_simulation_progress_locked(
                 peer->slot, batch.simulation_scene_epoch, batch.epoch,
@@ -5416,9 +5850,25 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         for (std::size_t index = 0; index < batch.inputs.size(); ++index) {
             const std::uint32_t input_frame =
                 batch.first_frame + static_cast<std::uint32_t>(index);
+            // Bound both history and future indexing before touching the
+            // ring. A delayed old packet must not evict a useful newer slot.
+            if ((input_frame < next_commit_frame_ &&
+                 next_commit_frame_ - input_frame > 512U) ||
+                (input_frame > next_commit_frame_ &&
+                 input_frame - next_commit_frame_ > 256U)) continue;
+            auto& revisions = received_input_revisions_[batch.player_slot];
+            auto& accepted = revisions[input_frame];
+            if (batch.revisions[index] <= accepted) {
+                ++stale_input_revisions_;
+                continue;
+            }
+            accepted = batch.revisions[index];
             const auto mismatch = timeline_.set_remote(
                 batch.player_slot, input_frame, batch.inputs[index]);
-            if (mismatch) {
+            const auto committed = frame_commits_.find(input_frame);
+            const bool missed_published_deadline = committed != frame_commits_.end() &&
+                committed->second.inputs[batch.player_slot] != batch.inputs[index];
+            if (mismatch || missed_published_deadline) {
                 // Player 1 is the canonical simulation. Once a frame commit
                 // has been published, a late guest sample cannot rewrite it:
                 // rewinding only the old racer/RNG subset while track actors,
@@ -5433,6 +5883,11 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
                     "late sample arrived after immutable host commit");
             }
         }
+        auto& revisions = received_input_revisions_[batch.player_slot];
+        std::erase_if(revisions, [&](const auto& entry) {
+            return entry.first < next_commit_frame_ &&
+                   next_commit_frame_ - entry.first > 512U;
+        });
         const std::uint32_t newest = batch.first_frame +
             static_cast<std::uint32_t>(batch.inputs.size() - 1U);
         host_input_accepted_frame_ =
@@ -5457,9 +5912,15 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         const bool frontend_commit_timeline =
             !authoritative_phase_active_ &&
             (authority_lifecycle_ == AuthorityLifecycle::Inactive ||
-             authority_lifecycle_ == AuthorityLifecycle::PostRace) &&
-            (!gameplay_handoff_ || !gameplay_handoff_->suspended);
-        if ((!gameplay_commit_timeline && !frontend_commit_timeline) ||
+             authority_lifecycle_ == AuthorityLifecycle::PostRace);
+        const bool sealed_commit_timeline =
+            authority_lifecycle_ == AuthorityLifecycle::SealingFinish &&
+            finish_seal_frame_.has_value();
+        // Repair replays immutable, already-published history; it does not
+        // authorize a new simulation tick. A peer must be able to reach the
+        // sealed boundary even while the host is parked there.
+        if ((!gameplay_commit_timeline && !frontend_commit_timeline &&
+             !sealed_commit_timeline) ||
             !launch_descriptor_ ||
             !protocol::decode_frame_commit_request(packet.payload, request) ||
             request.epoch != authority_epoch() ||
@@ -5469,6 +5930,11 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         }
         ++commit_repair_requests_received_;
         if (request.first_missing_frame >= next_commit_frame_) return;
+        if (sealed_commit_timeline &&
+            request.first_missing_frame > *finish_seal_frame_) return;
+        if (gameplay_handoff_ && gameplay_handoff_->suspended &&
+            !gameplay_handoff_->armed &&
+            request.first_missing_frame >= gameplay_handoff_->boundary_frame) return;
         if (commit_history_.empty() ||
             request.first_missing_frame < commit_history_.front().frame) {
             // The requested hash-chain prefix has aged out. Use the existing
@@ -5478,13 +5944,20 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
                 schedule_recovery_locked(request.first_missing_frame,
                                          "authoritative commit delivery");
             } else {
-                status_ = "A frontend commit request exceeded retained history; "
-                          "Player 1 is holding the authored timeline until the "
-                          "peer's current progress is known.";
+                fail_locked("Required menu input history is no longer available. The session cannot safely resume; leave and reconnect. Your separate saves are retained.");
             }
             return;
         }
-        send_commit_history_to_peer(*peer, request.first_missing_frame, 64U);
+        std::uint32_t repair_end = next_commit_frame_;
+        if (sealed_commit_timeline && *finish_seal_frame_ < repair_end) {
+            repair_end = *finish_seal_frame_ + 1U;
+        }
+        if (gameplay_handoff_ && gameplay_handoff_->suspended &&
+            !gameplay_handoff_->armed) {
+            repair_end = (std::min)(repair_end, gameplay_handoff_->boundary_frame);
+        }
+        send_commit_history_to_peer(*peer, request.first_missing_frame,
+            (std::min<std::uint32_t>)(64U, repair_end - request.first_missing_frame));
     } else if (packet.header.type ==
                protocol::MessageType::FrameCorrectionAck) {
         protocol::FrameCorrectionAcknowledgePayload acknowledgement{};
@@ -5589,8 +6062,19 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
                                  "rollback gameplay state");
     } else if (packet.header.type == protocol::MessageType::GameplayBarrier) {
         protocol::GameplayBarrierPayload barrier{};
+        if (!protocol::decode_gameplay_barrier(packet.payload, barrier) ||
+            barrier.player_slot != peer->slot ||
+            (barrier.stage != protocol::GameplayBarrierStage::Ready &&
+             barrier.stage != protocol::GameplayBarrierStage::Armed)) return;
+        if (completed_release_locked(protocol::MessageType::GameplayBarrier,
+                barrier.scene_epoch, barrier.map, barrier.racer_count, peer->sender_id)) {
+            send_to(peer->address, protocol::MessageType::GameplayBarrier,
+                protocol::encode_gameplay_barrier({barrier.scene_epoch,
+                    barrier.map, barrier.racer_count, local_slot_,
+                    protocol::GameplayBarrierStage::Go}));
+            return;
+        }
         if (!authoritative_phase_active_ || !gameplay_barrier_ ||
-            !protocol::decode_gameplay_barrier(packet.payload, barrier) ||
             barrier.scene_epoch != scene_epoch_ ||
             barrier.scene_epoch != gameplay_barrier_->scene_epoch ||
             barrier.map != gameplay_barrier_->map ||
@@ -5708,8 +6192,14 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
     } else if (packet.header.type == protocol::MessageType::RecoveryAck) {
         protocol::RecoveryPayload recovery{};
         if (!protocol::decode_recovery(packet.payload, recovery) ||
-            recovery.player_slot != peer->slot ||
-            !recovery_frame_ || recovery.frame != *recovery_frame_ ||
+            recovery.player_slot != peer->slot) return;
+        if (completed_release_locked(protocol::MessageType::RecoveryResume,
+                recovery.scene_epoch, recovery.frame, 0U, peer->sender_id)) {
+            send_to(peer->address, protocol::MessageType::RecoveryResume,
+                protocol::encode_recovery({recovery.scene_epoch, recovery.frame, 0U}), recovery.frame);
+            return;
+        }
+        if (!recovery_frame_ || recovery.frame != *recovery_frame_ ||
             recovery.scene_epoch != scene_epoch_) return;
         recovery_acks_[peer->slot] = true;
         bool complete = true;
@@ -5731,6 +6221,8 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
             }
             recovery_resumed_ = true;
             completed_recovery_frame_ = recovery.frame;
+            remember_release_locked(protocol::MessageType::RecoveryResume,
+                recovery.scene_epoch, recovery.frame, 0U);
             completed_recovery_epoch_ = recovery.scene_epoch;
             recovery_resume_until_ = std::chrono::steady_clock::now() +
                                      std::chrono::seconds(1);
@@ -5741,8 +6233,16 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
         if (!protocol::decode_transition_barrier(packet.payload, transition) ||
             transition.stage !=
                 protocol::TransitionBarrierStage::Acknowledge ||
-            transition.player_slot != peer->slot ||
-            transition.scene_epoch != scene_epoch_) return;
+            transition.player_slot != peer->slot) return;
+        if (completed_release_locked(protocol::MessageType::TransitionBarrier,
+                transition.scene_epoch, transition.frame, transition.transition_kind, peer->sender_id)) {
+            send_to(peer->address, protocol::MessageType::TransitionBarrier,
+                protocol::encode_transition_barrier({transition.scene_epoch,
+                    transition.frame, transition.transition_kind, local_slot_,
+                    protocol::TransitionBarrierStage::Resume}), transition.frame);
+            return;
+        }
+        if (transition.scene_epoch != scene_epoch_) return;
         if (!transition_barrier_) {
             // UDP may deliver a duplicate Acknowledge after a completed
             // transition has already entered post-race teardown. It is stale,
@@ -5791,6 +6291,7 @@ void DirectSession::handle_host_packet(const PeerAddress& source,
             return;
         }
         lobby_.leave(peer_id);
+        transport_->release_peer_route(peer->address);
         *peer = {};
         synchronize_peer_slots();
         room_view_ = lobby_.room();
@@ -5805,9 +6306,12 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
     if (state_ == ConnectionState::Failed) return;
     std::string error;
     if (packet.header.type == protocol::MessageType::JoinPending) {
+        if (!admission_pending(state_)) return;
+        last_admission_response_ = std::chrono::steady_clock::now();
         state_ = ConnectionState::AwaitingApproval;
         status_ = "Waiting for the host to approve your join request...";
     } else if (packet.header.type == protocol::MessageType::HelloAck) {
+        if (!admission_pending(state_)) return;
         protocol::HelloAckPayload acknowledgement{};
         if (!protocol::decode_hello_ack(packet.payload, acknowledgement, error)) return;
         if (!acknowledgement.accepted) {
@@ -5846,7 +6350,9 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         room_view_.manifest = manifest_;
         local_online_save_ready_ = true;
         local_online_save_acknowledged_ = false;
+        online_save_status_.reset();
         local_slot_ = acknowledgement.player_slot;
+        transport_->retain_peer_route(host_address_);
         state_ = ConnectionState::Lobby;
         status_ = "Isolated online save installed and verified at " +
                   installed_path.string() + ".";
@@ -5856,7 +6362,7 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         last_client_request_ = std::chrono::steady_clock::now();
     } else if (packet.header.type == protocol::MessageType::OnlineSaveReadyAck) {
         protocol::OnlineSaveReadyPayload ready{};
-        if (!protocol::decode_online_save_ready(packet.payload, ready, error) ||
+        if (!local_online_save_ready_ || !protocol::decode_online_save_ready(packet.payload, ready, error) ||
             ready.player_slot != local_slot_ ||
             ready.generation != session_save_generation_ ||
             ready.hash != manifest_.session_save_hash) {
@@ -5864,13 +6370,18 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         }
         local_online_save_acknowledged_ = true;
         status_ = "Player 1 confirmed the isolated online save.";
+    } else if (packet.header.type == protocol::MessageType::OnlineSaveStatus) {
+        protocol::OnlineSaveStatusPayload payload{};
+        if (protocol::decode_online_save_status(packet.payload, payload, error))
+            apply_online_save_status_locked(payload);
     } else if (packet.header.type == protocol::MessageType::LobbyState) {
         protocol::LobbyStatePayload payload{};
         if (protocol::decode_lobby_state(packet.payload, payload, error)) apply_lobby_payload(payload);
     } else if (packet.header.type == protocol::MessageType::PreflightBegin) {
         protocol::PreflightBeginPayload begin{};
         if (!protocol::decode_preflight_begin(packet.payload, begin, error) ||
-            state_ != ConnectionState::Lobby) {
+            state_ != ConnectionState::Lobby || !newer_preflight(begin.test_id,
+                terminal_connection_test_id_, connection_test_active_, connection_test_id_)) {
             return;
         }
         reset_connection_test_locked();
@@ -5879,7 +6390,7 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         connection_test_id_ = begin.test_id;
         connection_test_started_ = std::chrono::steady_clock::now();
         connection_test_drain_end_ = connection_test_started_ +
-            std::chrono::milliseconds(begin.duration_ms);
+            std::chrono::milliseconds(begin.duration_ms) + std::chrono::seconds(5);
         status_ = "Player 1 is testing the real online traffic lanes.";
     } else if (const auto lane = preflight_lane(packet.header.type);
                lane.has_value()) {
@@ -5888,26 +6399,30 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
             probe.echo) {
             return;
         }
-        if (!connection_test_active_ && state_ == ConnectionState::Lobby) {
+        if (!connection_test_active_ && state_ == ConnectionState::Lobby &&
+            newer_preflight(probe.test_id, terminal_connection_test_id_, false, connection_test_id_)) {
             reset_connection_test_locked();
             connection_test_results_ = {};
             connection_test_active_ = true;
             connection_test_id_ = probe.test_id;
             connection_test_started_ = std::chrono::steady_clock::now();
             connection_test_drain_end_ = connection_test_started_ +
-                                         std::chrono::seconds(7);
+                                         std::chrono::seconds(12);
         }
-        if (probe.test_id != connection_test_id_) return;
+        if (!connection_test_active_ || probe.test_id != connection_test_id_) return;
         probe.echo = true;
         send_to(host_address_, packet.header.type,
                 protocol::encode_preflight_probe(probe));
     } else if (packet.header.type == protocol::MessageType::PreflightResult) {
         protocol::PreflightResultPayload result{};
         if (!protocol::decode_preflight_result(packet.payload, result, error) ||
-            !connection_test_active_ ||
             result.test_id != connection_test_id_) {
             return;
         }
+        // Echo the authenticated result as an ACK, including harmless retries
+        // after completion. No additional gameplay protocol message is needed.
+        send_to(host_address_, protocol::MessageType::PreflightResult, packet.payload);
+        if (!connection_test_active_) return;
         connection_test_results_[result.player_slot] = {
             true, result.player_slot, result.score, result.p95_rtt_ms,
             result.jitter_ms,
@@ -5923,6 +6438,7 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         }
         if (complete) {
             connection_test_active_ = false;
+            terminal_connection_test_id_ = connection_test_id_;
             ++connection_test_result_generation_;
             if (connection_test_result_generation_ == 0U) {
                 ++connection_test_result_generation_;
@@ -6113,12 +6629,27 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         protocol::GameplayBarrierPayload barrier{};
         if (!authoritative_phase_active_ || !gameplay_barrier_ ||
             !protocol::decode_gameplay_barrier(packet.payload, barrier) ||
-            barrier.map != gameplay_barrier_->map ||
-            barrier.racer_count != gameplay_barrier_->racer_count ||
             barrier.player_slot != 0U ||
             barrier.stage == protocol::GameplayBarrierStage::Ready ||
             barrier.stage == protocol::GameplayBarrierStage::Armed) {
             return;
+        }
+        if (barrier.map != gameplay_barrier_->map ||
+            barrier.racer_count != gameplay_barrier_->racer_count) {
+            const bool current = gameplay_barrier_->epoch_synchronized
+                ? barrier.scene_epoch == gameplay_barrier_->scene_epoch
+                : gameplay_handoff_ && gameplay_handoff_->local_load_started &&
+                    barrier.stage == protocol::GameplayBarrierStage::Prepare &&
+                    barrier.scene_epoch > last_host_scene_epoch_;
+            if (current) {
+                fail_locked("Loaded scene disagreement: host map " + std::to_string(barrier.map) +
+                    ", racers " + std::to_string(barrier.racer_count) + "; local map " +
+                    std::to_string(gameplay_barrier_->map) + ", racers " +
+                    std::to_string(gameplay_barrier_->racer_count) + ", scene epoch " +
+                    std::to_string(barrier.scene_epoch) + ", input epoch " +
+                    std::to_string(input_epoch_) + ". The session cannot safely continue.");
+            }
+            return; // A stale scene remains harmless, not a new failure.
         }
         if (barrier.stage == protocol::GameplayBarrierStage::Prepare) {
             // This is the one legal point at which a client adopts a scene
@@ -6166,7 +6697,7 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
             request.first_missing_frame != packet.header.frame) {
             return;
         }
-        // The host's exact hole is authoritative. In strict lockstep the guest
+        // The host's exact hole is authoritative. In either mode the guest
         // game thread may itself be parked waiting for the commit containing
         // this input, so the missing sample is not guaranteed to have been
         // authored yet. Merely asking the parked game thread to resend it
@@ -6177,17 +6708,11 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         // produced, without polling SDL from the network worker.
         host_input_first_missing_frame_ = (std::max)(
             host_input_first_missing_frame_, request.first_missing_frame);
-        const bool strict_lockstep = launch_descriptor_ &&
-            launch_descriptor_->synchronization ==
-                SynchronizationMode::Lockstep;
-        const bool input_available =
-            local_input_submitted_frame_ >= request.first_missing_frame;
         const bool gameplay_handoff_parked = gameplay_handoff_ &&
             gameplay_handoff_->suspended;
-        if ((strict_lockstep && !gameplay_handoff_parked &&
+        if (!gameplay_handoff_parked &&
              ensure_local_input_for_repair_locked(
-                 request.first_missing_frame)) ||
-            (!strict_lockstep && input_available)) {
+                 request.first_missing_frame)) {
             send_local_history(local_input_submitted_frame_, true,
                                request.first_missing_frame);
             last_input_history_send_ = std::chrono::steady_clock::now();
@@ -6226,6 +6751,7 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         while (local_history_.size() > kAcknowledgedHistoryOverlap &&
                local_history_.front().first <
                    host_input_first_missing_frame_) {
+            local_input_metadata_.erase(local_history_.front().first);
             local_history_.pop_front();
         }
     } else if (packet.header.type == protocol::MessageType::FrameCommit) {
@@ -6369,6 +6895,8 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
             recovery.player_slot != 0U || !authoritative_phase_active_ ||
             authority_lifecycle_ != AuthorityLifecycle::Racing ||
             recovery.scene_epoch != scene_epoch_) return;
+        if (completed_release_locked(protocol::MessageType::RecoveryResume,
+                recovery.scene_epoch, recovery.frame, 0U)) return;
         if (completed_recovery_frame_ &&
             completed_recovery_epoch_ == recovery.scene_epoch &&
             *completed_recovery_frame_ == recovery.frame) return;
@@ -6378,7 +6906,9 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
             }
             return;
         }
-        if (recovery.frame < next_commit_frame_) {
+        if ((native_completed_frame_ && *native_completed_frame_ > recovery.frame) ||
+            (next_commit_frame_ > recovery.frame &&
+             next_commit_frame_ - recovery.frame > 1U)) {
             fail_locked("Player 1 requested recovery after this racer had already passed its boundary.");
             return;
         }
@@ -6588,6 +7118,8 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
         if (!protocol::decode_transition_barrier(packet.payload, transition) ||
             transition.player_slot != 0U ||
             transition.scene_epoch != scene_epoch_) return;
+        if (completed_release_locked(protocol::MessageType::TransitionBarrier,
+                transition.scene_epoch, transition.frame, transition.transition_kind)) return;
         if (!transition_barrier_) {
             transition_barrier_ = TransitionBarrierState{
                 transition.scene_epoch, transition.frame,
@@ -6628,6 +7160,34 @@ void DirectSession::handle_client_packet(const protocol::Datagram& packet) {
 void DirectSession::broadcast_lobby() {
     broadcast(protocol::MessageType::LobbyState,
               protocol::encode_lobby_state(lobby_payload()));
+    if (is_host_ && local_online_save_ready_ && save_sync_available() &&
+        (state_ == ConnectionState::Hosting || state_ == ConnectionState::Lobby)) {
+        std::uint8_t verified = 1U;
+        for (const auto& peer : peers_)
+            if (peer.active && peer.online_save_ready && peer.slot < kMaximumPlayers &&
+                lobby_.room().players[peer.slot].occupied)
+                verified |= static_cast<std::uint8_t>(1U << peer.slot);
+        broadcast(protocol::MessageType::OnlineSaveStatus,
+            protocol::encode_online_save_status({lobby_.room().generation,
+                session_save_generation_, manifest_.session_save_hash, verified}));
+    }
+}
+
+void DirectSession::apply_online_save_status_locked(const protocol::OnlineSaveStatusPayload& payload) {
+    if (is_host_ || state_ != ConnectionState::Lobby || !local_online_save_ready_ ||
+        payload.save_generation != session_save_generation_ || payload.save_hash != manifest_.session_save_hash ||
+        payload.room_generation < room_view_.generation ||
+        (online_save_status_ && payload.room_generation < online_save_status_->room_generation)) return;
+    auto updated = payload;
+    if (online_save_status_ && online_save_status_->room_generation == payload.room_generation)
+        updated.verified_mask |= online_save_status_->verified_mask;
+    online_save_status_ = updated;
+    // A status packet may arrive before its LobbyState. Retain it but never
+    // apply it to an older roster, particularly when a slot has been reused.
+    if (updated.room_generation == room_view_.generation && local_slot_ < kMaximumPlayers &&
+        room_view_.players[local_slot_].occupied && (updated.verified_mask & (1U << local_slot_))) {
+        local_online_save_acknowledged_ = true;
+    }
 }
 
 protocol::LobbyStatePayload DirectSession::lobby_payload() const {
@@ -6687,6 +7247,7 @@ void DirectSession::apply_lobby_payload(const protocol::LobbyStatePayload& paylo
             destination.packet_loss_percent = source.packet_loss_percent;
         }
     }
+    if (online_save_status_) apply_online_save_status_locked(*online_save_status_);
     const auto now = std::chrono::steady_clock::now();
     if (payload.countdown_generation > launch_countdown_generation_) {
         launch_countdown_active_ = payload.countdown_active;
@@ -6764,6 +7325,72 @@ std::uint8_t DirectSession::occupied_players() const {
         [](const Player& player) { return player.occupied; }));
 }
 
+void DirectSession::clear_input_history_locked() {
+    local_history_.clear();
+    local_input_metadata_.clear();
+    for (auto& revisions : received_input_revisions_) revisions.clear();
+    local_input_echo_ms_ = local_input_consume_ms_ = 0U;
+    measured_input_echoes_ = 0U;
+    refreshed_input_samples_ = stale_input_revisions_ = prediction_limit_waits_ = 0U;
+}
+
+void DirectSession::store_local_input_locked(std::uint32_t frame,
+                                            PackedInput input,
+                                            bool physical_sample) {
+    // Unique sorted history is shared by live transmission and exact repair.
+    // A pending target may be refreshed, but an already committed target may
+    // not be edited, even while a client is consuming an older presentation.
+    if (physical_sample && ((is_host_ && frame < next_commit_frame_) ||
+        (!is_host_ && authoritative_inputs_valid_ &&
+         frame <= authoritative_input_frame_))) return;
+    const auto position = std::lower_bound(local_history_.begin(), local_history_.end(),
+        frame, [](const auto& entry, std::uint32_t value) { return entry.first < value; });
+    auto& metadata = local_input_metadata_[frame];
+    if (position != local_history_.end() && position->first == frame) {
+        if (position->second == input) return;
+        if (metadata.revision == UINT32_MAX) {
+            fail_locked("The input sample revision limit was exceeded.");
+            return;
+        }
+        position->second = input;
+        ++metadata.revision;
+        ++refreshed_input_samples_;
+    } else {
+        local_history_.insert(position, {frame, input});
+    }
+    metadata.sampled_at = physical_sample ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+    timeline_.set_local(local_slot_, frame, input);
+    // The host never needs to answer its own repair requests.
+    while (is_host_ && local_history_.size() > 256U) {
+        local_input_metadata_.erase(local_history_.front().first);
+        local_history_.pop_front();
+    }
+}
+
+void DirectSession::record_input_latency_locked(
+    const protocol::FrameCommitPayload& commit, bool consumed) {
+    const auto metadata = local_input_metadata_.find(commit.frame);
+    if (metadata == local_input_metadata_.end() ||
+        metadata->second.sampled_at.time_since_epoch().count() == 0 ||
+        (commit.predicted_mask & (1U << local_slot_)) != 0) return;
+    const auto sample = std::lower_bound(local_history_.begin(), local_history_.end(),
+        commit.frame, [](const auto& entry, std::uint32_t value) { return entry.first < value; });
+    if (sample == local_history_.end() || sample->first != commit.frame ||
+        sample->second != commit.inputs[local_slot_]) return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - metadata->second.sampled_at).count();
+    const auto ms = static_cast<std::uint32_t>((std::clamp<std::int64_t>)(elapsed, 0, UINT32_MAX));
+    if (consumed) local_input_consume_ms_ = ms;
+    else { local_input_echo_ms_ = ms; ++measured_input_echoes_; }
+    // No cross-machine clock subtraction. The existing bounded recorder
+    // samples once per second; no file I/O in this input path.
+    if (commit.frame % 30U == 0U) failure_recorder().record(
+        FailureEventKind::ProgressWatchdog, commit.frame, ms, local_slot_,
+        consumed ? "local sample to commit consumption (ms)"
+                 : "local sample to host commit echo (ms)");
+}
+
 protocol::InputBatch DirectSession::make_local_history_batch(
     std::uint32_t newest_frame, bool reliable_repair,
     std::optional<std::uint32_t> requested_first) const {
@@ -6806,6 +7433,9 @@ protocol::InputBatch DirectSession::make_local_history_batch(
         if (batch.inputs.empty()) batch.first_frame = frame;
         if (frame != batch.first_frame + batch.inputs.size()) continue;
         batch.inputs.push_back(input);
+        const auto metadata = local_input_metadata_.find(frame);
+        batch.revisions.push_back(metadata == local_input_metadata_.end()
+            ? 1U : metadata->second.revision);
         if (batch.inputs.size() == kMaximumBatchInputs) break;
     }
     return batch;
@@ -6857,8 +7487,7 @@ bool DirectSession::ensure_local_input_for_repair_locked(
     if (position != local_history_.begin()) {
         held = std::prev(position)->second;
     }
-    local_history_.insert(position, {frame, held});
-    timeline_.set_local(local_slot_, frame, held);
+    store_local_input_locked(frame, held, false);
     if (frame > local_input_submitted_frame_) {
         local_input_submitted_frame_ = frame;
         local_input_submitted_ = held;
@@ -7141,6 +7770,7 @@ bool DirectSession::apply_frame_commit_locked(
         }
     }
     frame_commits_[commit.frame] = commit;
+    record_input_latency_locked(commit, false);
     authoritative_input_frame_ = (std::max)(
         authoritative_input_frame_, commit.frame);
     authoritative_input_revision_ = commit.revision;
@@ -7270,6 +7900,13 @@ bool DirectSession::send_authoritative_state(
                      maximum_datagram_bytes - snapshot_headers)
         : 900U;
     std::vector<std::uint8_t> wire_state;
+    if (!live_replica && checkpoint_encoding_ &&
+        checkpoint_encoding_->epoch == scene_epoch_ && checkpoint_encoding_->frame == frame &&
+        checkpoint_encoding_->source.size() == state.size() &&
+        std::equal(state.begin(), state.end(), checkpoint_encoding_->source.begin())) {
+        wire_state = checkpoint_encoding_->wire;
+        ++checkpoint_encoding_cache_hits_;
+    }
     if (live_replica && live_replica_keyframe_frame_ &&
         *live_replica_keyframe_frame_ < frame &&
         !live_replica_keyframe_state_.empty()) {
@@ -7279,6 +7916,10 @@ bool DirectSession::send_authoritative_state(
     }
     if (wire_state.empty()) {
         wire_state = encode_authoritative_state_wire(state);
+        if (!live_replica && !wire_state.empty()) {
+            checkpoint_encoding_ = CheckpointEncoding{scene_epoch_, frame,
+                std::vector<std::uint8_t>(state.begin(), state.end()), wire_state};
+        }
     }
     if (wire_state.empty() ||
         wire_state.size() > kMaximumAuthoritativeStateBytes) return false;
@@ -7319,6 +7960,9 @@ bool DirectSession::send_authoritative_state(
             // instead of reporting success after silently skipping a racer.
             for (const PeerRecord& peer : peers_) {
                 if (!peer.active) continue;
+                const auto acknowledged = authoritative_acknowledgements_.find(frame);
+                if (!live_replica && acknowledged != authoritative_acknowledgements_.end() &&
+                    acknowledged->second[peer.slot]) continue;
                 if (!send_with_key(peer.address, peer.key,
                                    message_type, payload, wire_frame)) {
                     return false;
@@ -7431,14 +8075,10 @@ void DirectSession::write_determinism_artifact_locked(
     std::uint32_t frame, std::size_t mismatched_slot,
     std::string_view subsystem, const HashFrame& hashes) {
     if (artifact_directory_.empty()) return;
-    std::error_code filesystem_error;
-    std::filesystem::create_directories(artifact_directory_, filesystem_error);
-    if (filesystem_error) return;
     const std::filesystem::path path = artifact_directory_ /
         ("determinism-frame-" + std::to_string(frame) + "-player-" +
          std::to_string(mismatched_slot + 1U) + ".txt");
-    std::ofstream stream(path, std::ios::trunc);
-    if (!stream) return;
+    std::ostringstream stream;
     stream << "protocol=" << kProtocolVersion << '\n'
            << "scene_epoch=" << scene_epoch_ << '\n'
            << "frame=" << frame << '\n'
@@ -7469,6 +8109,27 @@ void DirectSession::write_determinism_artifact_locked(
                << hashes.racer_details[mismatched_slot][racer] << '\n';
         break;
     }
+    if (replay_writes_.size() >= 8U) {
+        replay_write_error_ = "The diagnostic writer is busy; an additional determinism report was not queued.";
+        return;
+    }
+    if (!replay_writer_started_) {
+        replay_writer_.start([] {}, [] {});
+        replay_writer_started_ = true;
+    }
+    auto result = std::make_shared<std::promise<std::string>>();
+    replay_writes_.push_back(result->get_future());
+    if (!replay_writer_.post([path, text = stream.str(), result] {
+            try {
+                std::filesystem::create_directories(path.parent_path());
+                std::ofstream output(path, std::ios::trunc);
+                output << text;
+                output.close();
+                result->set_value(output ? std::string{} : "Could not write the determinism diagnostic.");
+            } catch (...) {
+                result->set_value("Could not write the determinism diagnostic.");
+            }
+        })) result->set_value("The determinism diagnostic writer is unavailable.");
 }
 
 void DirectSession::schedule_recovery_locked(std::uint32_t mismatch_frame,
@@ -7505,38 +8166,52 @@ void DirectSession::schedule_recovery_locked(std::uint32_t mismatch_frame,
 
 void DirectSession::send_connection_probes() {
     const auto now = std::chrono::steady_clock::now();
+    const auto now_us = steady_microseconds();
     for (PeerRecord& peer : peers_) {
-        if (!peer.active ||
-            (peer.last_ping.time_since_epoch().count() != 0 &&
-             now - peer.last_ping < std::chrono::seconds(1))) continue;
-        if (peer.ping_outstanding) {
-            // Rolling loss estimate: a probe still outstanding at the next
-            // one-second sample is considered lost, while successful samples
-            // decay the estimate again instead of accumulating forever.
-            peer.loss_percent = peer.loss_percent * 0.8F + 20.0F;
-        } else {
-            peer.loss_percent *= 0.8F;
+        if (!peer.active) continue;
+        for (auto& pending : peer.pending_ping_tokens) {
+            // This measures expired application probes, not wire packet loss.
+            // Keep earlier probes alive across the one-second sampling tick.
+            if (pending != 0U && now_us >= pending &&
+                now_us - pending >= 3000000U) {
+                pending = 0U;
+                peer.loss_percent = peer.loss_percent * 0.8F + 20.0F;
+            }
         }
+        if (peer.last_ping.time_since_epoch().count() != 0 &&
+            now - peer.last_ping < std::chrono::seconds(1)) continue;
+        auto available = std::find(peer.pending_ping_tokens.begin(),
+                                   peer.pending_ping_tokens.end(), 0U);
+        if (available == peer.pending_ping_tokens.end()) continue;
         peer.last_ping = now;
-        peer.ping_token = steady_microseconds();
-        peer.ping_outstanding = true;
-        ++peer.pings_sent;
-        send_to(peer.address, protocol::MessageType::Ping,
-                encode_probe(peer.ping_token));
+        peer.ping_token = (std::max)(now_us, peer.ping_token + 1U);
+        if (send_to(peer.address, protocol::MessageType::Ping,
+                    encode_probe(peer.ping_token))) {
+            *available = peer.ping_token;
+            ++peer.pings_sent;
+        }
     }
 }
 
 void DirectSession::update_peer_metrics(PeerRecord& peer, std::uint64_t token) {
-    if (token == 0U || token != peer.ping_token) return;
+    if (token == 0U) return;
+    auto pending = std::find(peer.pending_ping_tokens.begin(),
+                             peer.pending_ping_tokens.end(), token);
+    if (pending == peer.pending_ping_tokens.end()) return;
     const std::uint64_t now = steady_microseconds();
     if (now < token) return;
+    *pending = 0U; // Duplicate replies cannot produce another sample.
+    if (now - token >= 3000000U) {
+        peer.loss_percent = peer.loss_percent * 0.8F + 20.0F;
+        return;
+    }
+    peer.loss_percent *= 0.8F;
     const double measured = static_cast<double>(now - token) / 1000.0;
     const double delta = peer.pings_received == 0U
         ? 0.0 : std::abs(measured - peer.rtt_ms);
     peer.rtt_ms = measured;
     peer.jitter_ms = peer.pings_received == 0U
         ? 0.0 : peer.jitter_ms * 0.75 + delta * 0.25;
-    peer.ping_outstanding = false;
     peer.rtt_samples[peer.rtt_sample_cursor] = measured;
     peer.rtt_sample_cursor =
         (peer.rtt_sample_cursor + 1U) % peer.rtt_samples.size();
@@ -7551,23 +8226,30 @@ void DirectSession::update_peer_metrics(PeerRecord& peer, std::uint64_t token) {
     broadcast_lobby();
 }
 
+void DirectSession::queue_diagnostics_locked(std::string_view reason) {
+    if (replay_writes_.size() >= 8U) return;
+    if (!replay_writer_started_) {
+        replay_writer_.start([] {}, [] {});
+        replay_writer_started_ = true;
+    }
+    auto result = std::make_shared<std::promise<std::string>>();
+    auto text = failure_recorder().snapshot_text();
+    if (!reason.empty()) text = "[netplay][failure] " + std::string(reason) + "\n" + text;
+    replay_writes_.push_back(result->get_future());
+    if (!replay_writer_.post([text = std::move(text), result] {
+        std::fwrite(text.data(), 1U, text.size(), stderr);
+        std::fflush(stderr);
+        result->set_value({});
+    })) result->set_value("Diagnostic writer queue was full.");
+}
+
 void DirectSession::fail_locked(std::string message) {
     if (state_ == ConnectionState::Failed) return;
     failure_recorder().record(FailureEventKind::SessionFailure,
                               next_commit_frame_,
                               static_cast<std::uint32_t>(state_),
                               scene_epoch_, message);
-    std::fprintf(stderr,
-                 "[netplay][failure] %s packets=%llu/%llu bytes=%llu/%llu checkpoints=%llu checkpoint_timeouts=%llu frame=%u\n",
-                 message.c_str(),
-                 static_cast<unsigned long long>(packets_sent_),
-                 static_cast<unsigned long long>(packets_received_),
-                 static_cast<unsigned long long>(bytes_sent_),
-                 static_cast<unsigned long long>(bytes_received_),
-                 static_cast<unsigned long long>(authority_checkpoints_sent_),
-                 static_cast<unsigned long long>(authority_wait_timeouts_),
-                 next_commit_frame_);
-    failure_recorder().dump(stderr);
+    queue_diagnostics_locked(message);
     failure_payload_.assign(message.begin(), message.end());
     // Mark failure before the best-effort disconnect broadcast. If the queue
     // itself caused this failure, enqueue_outbound must not recurse back into
@@ -7670,7 +8352,7 @@ bool DirectSession::accept_start_descriptor(
     input_delay_ = descriptor.input_delay_frames;
     if (first_descriptor) {
         timeline_.reset();
-        local_history_.clear();
+        clear_input_history_locked();
         frame_commits_.clear();
         commit_history_.clear();
         authoritative_states_.clear();

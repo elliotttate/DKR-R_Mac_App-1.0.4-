@@ -29,6 +29,14 @@ bool apply_authoritative_state(std::uint8_t* rdram,
                                std::uint32_t expected_frame,
                                std::string& error);
 
+// A forward jump must not substitute global state for native lifecycle work.
+// Reject changed roster/actor membership and race-finish transitions without
+// writing anything; the caller continues ordinary authored ticks instead.
+bool apply_catch_up_authoritative_state(
+    std::uint8_t* rdram, std::size_t rdram_size,
+    std::span<const std::uint8_t> snapshot, std::uint32_t expected_frame,
+    std::string& error);
+
 // Live race replicas are corrective samples, not lifecycle checkpoints. A
 // collected, spawned or unloaded map actor can legitimately cross the wire
 // while the receiving machine is one authored tick either side of the same

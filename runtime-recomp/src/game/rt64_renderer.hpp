@@ -2,6 +2,7 @@
 
 #include "f3ddkr_rt64.hpp"
 #include "presentation_counter_policy.hpp"
+#include "track_performance.hpp"
 #include "ultramodern/renderer_context.hpp"
 
 #include <cstdint>
@@ -38,6 +39,9 @@ public:
     void service_online_wait_presentation();
 
 private:
+    void record_track_performance(std::uint8_t* snapshot,
+                                  track_performance::Clock::time_point start);
+    track_performance::Capture track_capture_{};
     std::mutex presentation_mutex_;
     std::unique_ptr<RT64::Application> application_;
     F3DDKRRT64Bridge f3ddkr_;
@@ -45,6 +49,7 @@ private:
     std::uint64_t interpolated_present_count_ = 0;
     presentation_counter::Snapshot completed_presentations_{};
     std::chrono::steady_clock::time_point last_wait_presentation_{};
+    std::chrono::milliseconds slowest_wait_replay_{};
     std::uint64_t observed_wait_generation_ = 0U;
     bool observed_overlay_visible_ = false;
     bool wait_replay_deferred_logged_ = false;

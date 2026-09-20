@@ -1015,7 +1015,8 @@ namespace {
 bool apply_authoritative_state_impl(
     std::uint8_t* rdram, std::size_t rdram_size,
     std::span<const std::uint8_t> snapshot, std::uint32_t expected_frame,
-    bool allow_unmatched_actors, std::uint32_t& unmatched_actors,
+    bool allow_unmatched_actors, bool preserve_lifecycle,
+    std::uint32_t& unmatched_actors,
     std::string& error) {
     unmatched_actors = 0U;
     if (rdram == nullptr || rdram_size < kRetailRdramSize ||
@@ -1085,6 +1086,22 @@ bool apply_authoritative_state_impl(
             return false;
         }
         word_writes.emplace_back(address, value);
+        if (preserve_lifecycle &&
+            address != revision_addresses::CurrentRngSeed &&
+            address != revision_addresses::PreviousRngSeed &&
+            address != revision_addresses::RaceStartTimer &&
+            address != revision_addresses::RaceStartProgress &&
+            address != revision_addresses::LogicUpdateRate) {
+            std::uint32_t local_value = 0U;
+            if (!read_word(rdram, rdram_size, address, local_value) ||
+                local_value != value ||
+                ((address == revision_addresses::RaceFinishTriggered ||
+                  address == revision_addresses::NumberOfFinishedRacers) &&
+                 value != 0U)) {
+                error = "Catch-up requires native race lifecycle work.";
+                return false;
+            }
+        }
     }
 
     std::uint16_t race_end_timer = 0U;
@@ -1100,6 +1117,19 @@ bool apply_authoritative_state_impl(
     }
     half_writes.emplace_back(revision_addresses::RaceEndTimer, race_end_timer);
     byte_writes.emplace_back(revision_addresses::RaceEndStage, race_end_stage);
+    if (preserve_lifecycle) {
+        std::uint16_t local_timer = 0U;
+        std::uint8_t local_stage = 0U;
+        if (!read_half(rdram, rdram_size, revision_addresses::RaceEndTimer,
+                       local_timer) ||
+            !read_byte(rdram, rdram_size, revision_addresses::RaceEndStage,
+                       local_stage) ||
+            race_end_timer != 0U || race_end_stage != 0U ||
+            local_timer != 0U || local_stage != 0U) {
+            error = "Catch-up cannot skip a native race-end transition.";
+            return false;
+        }
+    }
 
     for (const std::uint32_t address : roster_bytes()) {
         std::uint8_t value = 0U;
@@ -1110,6 +1140,14 @@ bool apply_authoritative_state_impl(
             return false;
         }
         byte_writes.emplace_back(address, value);
+        if (preserve_lifecycle) {
+            std::uint8_t local_value = 0U;
+            if (!read_byte(rdram, rdram_size, address, local_value) ||
+                local_value != value) {
+                error = "Catch-up cannot change the native player roster.";
+                return false;
+            }
+        }
     }
 
     if (!stage_water_state(rdram, rdram_size, snapshot, cursor,
@@ -1155,6 +1193,10 @@ bool apply_authoritative_state_impl(
         return false;
     }
     ActorSource previous_identity{};
+    if (preserve_lifecycle && actor_count != local_actors.size()) {
+        error = "Catch-up cannot skip native actor creation or retirement.";
+        return false;
+    }
     bool have_previous_identity = false;
     for (std::uint32_t actor_number = 0U; actor_number < actor_count;
          ++actor_number) {
@@ -1302,7 +1344,17 @@ bool apply_authoritative_state(std::uint8_t* rdram,
                                std::string& error) {
     std::uint32_t unmatched_actors = 0U;
     return apply_authoritative_state_impl(
-        rdram, rdram_size, snapshot, expected_frame, false,
+        rdram, rdram_size, snapshot, expected_frame, false, false,
+        unmatched_actors, error);
+}
+
+bool apply_catch_up_authoritative_state(
+    std::uint8_t* rdram, std::size_t rdram_size,
+    std::span<const std::uint8_t> snapshot, std::uint32_t expected_frame,
+    std::string& error) {
+    std::uint32_t unmatched_actors = 0U;
+    return apply_authoritative_state_impl(
+        rdram, rdram_size, snapshot, expected_frame, false, true,
         unmatched_actors, error);
 }
 
@@ -1311,7 +1363,7 @@ bool apply_live_authoritative_state(
     std::span<const std::uint8_t> snapshot, std::uint32_t expected_frame,
     std::uint32_t& unmatched_actors, std::string& error) {
     return apply_authoritative_state_impl(
-        rdram, rdram_size, snapshot, expected_frame, true,
+        rdram, rdram_size, snapshot, expected_frame, true, false,
         unmatched_actors, error);
 }
 

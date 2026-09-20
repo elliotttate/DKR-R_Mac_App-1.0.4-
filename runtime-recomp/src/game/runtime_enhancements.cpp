@@ -39,6 +39,7 @@ std::atomic<int> g_frustum_guard_percent{5};
 std::atomic<bool> g_fit_to_window_enabled{false};
 std::atomic<int> g_anisotropy_level{16};
 std::atomic<int> g_texture_lod_bias_hundredths{0};
+std::atomic<bool> g_generated_mipmaps_requested{false};
 std::atomic<bool> g_multiplayer_race_music_enabled{true};
 
 const std::uint32_t& kBlockMusicChangeAddress =
@@ -327,6 +328,14 @@ float dkr::runtime::enhancements::texture_lod_bias() {
 
 float dkr::runtime::enhancements::effective_texture_lod_bias() {
     return modern_presentation_enabled() ? texture_lod_bias() : 0.0F;
+}
+
+bool dkr::runtime::enhancements::generated_mipmaps_requested() {
+    return g_generated_mipmaps_requested.load(std::memory_order_acquire);
+}
+
+void dkr::runtime::enhancements::set_generated_mipmaps_requested(bool enabled) {
+    g_generated_mipmaps_requested.store(enabled, std::memory_order_release);
 }
 
 int dkr::runtime::enhancements::texture_lod_bias_hundredths() {

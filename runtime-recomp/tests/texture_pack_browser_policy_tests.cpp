@@ -8,7 +8,9 @@ dkr::runtime::texture_packs::PackInfo pack(
     const char* id, const char* name,
     dkr::runtime::texture_packs::Format format, bool enabled,
     bool compatible, bool hidden, std::uintmax_t size,
-    std::int64_t imported) {
+    std::int64_t imported,
+    dkr::runtime::texture_packs::Origin origin =
+        dkr::runtime::texture_packs::Origin::User) {
     dkr::runtime::texture_packs::PackInfo result{};
     result.id = id;
     result.name = name;
@@ -18,6 +20,7 @@ dkr::runtime::texture_packs::PackInfo pack(
     result.hidden = hidden;
     result.managed_size_bytes = size;
     result.imported_at_unix_seconds = imported;
+    result.origin = origin;
     return result;
 }
 
@@ -67,5 +70,33 @@ int main() {
     assert(responsive_column_count(528.0F, 8.0F) == 2);
     assert(responsive_column_count(1064.0F, 8.0F) == 4);
     assert(responsive_column_count(-1.0F, 8.0F) == 1);
+
+    // A pack that came with a custom track is kept out of every ordinary view
+    // and appears only under the "Track packs" filter.
+    const std::vector<texture_packs::PackInfo> with_track_pack{
+        pack("alpha", "alpha native", texture_packs::Format::NativeRt64,
+             true, true, false, 100U, 10),
+        pack("remix-hd", "Ancient Lake Remix HD",
+             texture_packs::Format::RiceRt64, true, true, false, 500U, 40,
+             texture_packs::Origin::TrackPack),
+    };
+    Filters track_filters{};
+    assert(select(with_track_pack, track_filters,
+                  SortMode::NameAscending).size() == 1U);
+    assert(select(with_track_pack, track_filters,
+                  SortMode::NameAscending)[0].id == "alpha");
+    track_filters.visibility = VisibilityFilter::All;
+    assert(select(with_track_pack, track_filters,
+                  SortMode::NameAscending).size() == 1U);
+    track_filters.visibility = VisibilityFilter::Hidden;
+    assert(select(with_track_pack, track_filters,
+                  SortMode::NameAscending).empty());
+    track_filters.visibility = VisibilityFilter::TrackPacks;
+    selected = select(with_track_pack, track_filters, SortMode::NameAscending);
+    assert(selected.size() == 1U && selected[0].id == "remix-hd");
+    // The other filters still narrow within the track-pack view.
+    track_filters.state = StateFilter::Inactive;
+    assert(select(with_track_pack, track_filters,
+                  SortMode::NameAscending).empty());
     return 0;
 }

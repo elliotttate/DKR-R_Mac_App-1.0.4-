@@ -93,6 +93,7 @@ struct AddressTable {
     std::uint32_t PlayerHud;
     std::uint32_t HudNumPlayers;
     std::uint32_t HudDisplayList;
+    std::uint32_t HudColour;
     std::uint32_t RumblePresent;
     std::uint32_t TitleDemoIndex;
     std::uint32_t TitleRevealTimer;
@@ -191,7 +192,8 @@ inline constexpr AddressTable kUsV77{
     0x80126CDCU,
     0x80126CE0U,
     0x80126D0CU,
-    0x80126D00U,
+    0x80126CFCU, // gHudDL (gHudMtx is the following word, not the display list)
+    0x800E2834U,
     0x801241E5U,
     0x80126864U,
     0x8012686CU,
@@ -290,7 +292,8 @@ inline constexpr AddressTable kUsV80{
     0x8012729CU,
     0x801272A0U,
     0x801272CCU,
-    0x801272C0U,
+    0x801272BCU, // gHudDL (gHudMtx is the following word, not the display list)
+    0x800E2DB4U,
     0x80124765U,
     0x80126E04U,
     0x80126E0CU,
@@ -390,6 +393,7 @@ inline std::uint32_t CurrentHud = kUsV77.CurrentHud;
 inline std::uint32_t PlayerHud = kUsV77.PlayerHud;
 inline std::uint32_t HudNumPlayers = kUsV77.HudNumPlayers;
 inline std::uint32_t HudDisplayList = kUsV77.HudDisplayList;
+inline std::uint32_t HudColour = kUsV77.HudColour;
 inline std::uint32_t RumblePresent = kUsV77.RumblePresent;
 inline std::uint32_t TitleDemoIndex = kUsV77.TitleDemoIndex;
 inline std::uint32_t TitleRevealTimer = kUsV77.TitleRevealTimer;
@@ -497,6 +501,7 @@ inline bool select(const rom::Revision revision) {
     PlayerHud = table.PlayerHud;
     HudNumPlayers = table.HudNumPlayers;
     HudDisplayList = table.HudDisplayList;
+    HudColour = table.HudColour;
     RumblePresent = table.RumblePresent;
     TitleDemoIndex = table.TitleDemoIndex;
     TitleRevealTimer = table.TitleRevealTimer;

@@ -3,12 +3,23 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIRECTORY="${DKR_LINUX_BUILD_DIR:-${PROJECT_ROOT}/build/dkr-runtime-linux}"
+if [[ -f "${BUILD_DIRECTORY}/CMakeCache.txt" ]] &&
+   grep -Eq '^DKR_LEGACY_QUALIFICATION:BOOL=(ON|1|TRUE|YES)[[:space:]]*$' "${BUILD_DIRECTORY}/CMakeCache.txt"; then
+  echo 'Refusing to package a private legacy-content qualification build. Reconfigure and rebuild with DKR_LEGACY_QUALIFICATION=OFF first.' >&2
+  exit 1
+fi
 BINARY="${BUILD_DIRECTORY}/bin/Release/DKR-R"
 INPUT_HOST_DIRECTORY="${BUILD_DIRECTORY}/bin/Release/libexec/dkr-r"
 INPUT_HOST="${INPUT_HOST_DIRECTORY}/DKR-R-InputHost"
+MOD_WORKER="${INPUT_HOST_DIRECTORY}/DKR-R-ModWorker"
 SDL3_LIBRARY="${INPUT_HOST_DIRECTORY}/libSDL3.so.0"
 VERSION_FILE_VALUE="$(tr -d '\r\n' < "${PROJECT_ROOT}/VERSION")"
 VERSION="${DKR_RELEASE_VERSION:-${VERSION_FILE_VALUE}}"
+# Explicit beta qualification deferral; normal release packaging still runs all checks.
+SKIP_RUNTIME_TESTS="${DKR_SKIP_RUNTIME_TESTS:-0}"
+[[ "${SKIP_RUNTIME_TESTS}" == 0 || "${SKIP_RUNTIME_TESTS}" == 1 ]] || {
+  echo 'DKR_SKIP_RUNTIME_TESTS must be 0 or 1' >&2; exit 1;
+}
 APPDIR="${DKR_APPDIR:-${PROJECT_ROOT}/dist/DKR-R-${VERSION}-Linux-x86_64.AppDir}"
 OUTPUT="${DKR_APPIMAGE_OUTPUT:-${PROJECT_ROOT}/dist/DKR-R-${VERSION}-Linux-x86_64.AppImage}"
 LINUXDEPLOY="${LINUXDEPLOY:-${PROJECT_ROOT}/.deps/tools/linuxdeploy-x86_64.AppImage}"
@@ -83,6 +94,7 @@ collect_linux_dependency_notices() {
 }
 
 [[ -x "${BINARY}" ]] || { echo "Missing Linux release binary: ${BINARY}" >&2; exit 1; }
+[[ -x "${MOD_WORKER}" ]] || { echo "Missing legacy importer: ${MOD_WORKER}" >&2; exit 1; }
 [[ -x "${INPUT_HOST}" ]] || { echo "Missing private SDL3 input host: ${INPUT_HOST}" >&2; exit 1; }
 [[ -f "${SDL3_LIBRARY}" ]] || { echo "Missing private SDL3 runtime: ${SDL3_LIBRARY}" >&2; exit 1; }
 [[ -x "${LINUXDEPLOY}" ]] || { echo "Missing linuxdeploy: ${LINUXDEPLOY}" >&2; exit 1; }
@@ -99,6 +111,8 @@ install -m 0755 "${BINARY}" "${BINARY_STAGE}/DKR-R"
 install -m 0644 "${PROJECT_ROOT}/LICENSE.md" "${APPDIR}/usr/share/doc/dkr-port/LICENSE.md"
 install -m 0644 "${PROJECT_ROOT}/THIRD_PARTY.md" "${APPDIR}/usr/share/doc/dkr-port/THIRD_PARTY.md"
 install -m 0644 "${PROJECT_ROOT}/docs/ONLINE_MULTIPLAYER.md" "${APPDIR}/usr/share/doc/dkr-port/ONLINE_MULTIPLAYER.md"
+install -m 0644 "${PROJECT_ROOT}/docs/ONLINE-STABILITY.md" "${APPDIR}/usr/share/doc/dkr-port/ONLINE-STABILITY.md"
+install -m 0644 "${PROJECT_ROOT}/docs/HUD-WORKSHOP.md" "${APPDIR}/usr/share/doc/dkr-port/HUD-WORKSHOP.md"
 install -m 0644 "${PROJECT_ROOT}/runtime-recomp/COPYING-NOTICE.md" "${APPDIR}/usr/share/doc/dkr-port/COPYING-NOTICE.md"
 install -m 0644 "${PROJECT_ROOT}/extern/rt64/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/RT64-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/rt64/src/contrib/imgui/LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/Dear-ImGui-LICENSE.txt"
@@ -107,10 +121,15 @@ install -m 0644 "${PROJECT_ROOT}/extern/sdl3/LICENSE.txt" "${APPDIR}/usr/share/d
 install -m 0644 "${PROJECT_ROOT}/extern/n64-modern-runtime/COPYING" "${APPDIR}/usr/share/doc/dkr-port/licenses/N64ModernRuntime-COPYING.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/n64-modern-runtime/N64Recomp/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/N64Recomp-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/Jumpman-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/Jumpman-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/Selawik-OFL.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/Selawik-OFL.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/CRT-FILTERS-NOTICE.md" "${APPDIR}/usr/share/doc/dkr-port/licenses/CRT-FILTERS-NOTICE.md"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/GEKKONET-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/GEKKONET-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/packaging/licenses/MONOCYPHER-LICENSE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/MONOCYPHER-LICENSE.txt"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/GOLDEN-BALLOON-NOTICE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/GOLDEN-BALLOON-NOTICE.txt"
+install -m 0644 "${PROJECT_ROOT}/packaging/licenses/LEGACY-MODS-NOTICE.txt" "${APPDIR}/usr/share/doc/dkr-port/licenses/LEGACY-MODS-NOTICE.txt"
+install -m 0644 "${PROJECT_ROOT}/docs/LEGACY-MODS-BETA.md" "${APPDIR}/usr/share/doc/dkr-port/LEGACY-MODS-BETA.md"
+install -m 0644 "${PROJECT_ROOT}/docs/LEGACY-MOD-COMPATIBILITY-BETA7.md" "${APPDIR}/usr/share/doc/dkr-port/LEGACY-MOD-COMPATIBILITY-BETA7.md"
 install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/LIBDATACHANNEL-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/mbedtls/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/MBEDTLS-LICENSE.txt"
 install -m 0644 "${PROJECT_ROOT}/extern/libdatachannel/deps/libjuice/LICENSE" "${APPDIR}/usr/share/doc/dkr-port/licenses/LIBJUICE-LICENSE.txt"
@@ -158,22 +177,31 @@ install -m 0644 "${PROJECT_ROOT}/assets/controllers/gamecontrollerdb.txt" \
 # used by the single launcher/game window. The helper has an $ORIGIN rpath and
 # therefore resolves only the private copy installed beside it.
 mkdir -p "${APPDIR}/usr/libexec/dkr-r"
+install -m 0755 "${MOD_WORKER}" "${APPDIR}/usr/libexec/dkr-r/DKR-R-ModWorker"
+patchelf --set-rpath '$ORIGIN/../../lib' "${APPDIR}/usr/libexec/dkr-r/DKR-R-ModWorker"
 install -m 0755 "${INPUT_HOST}" \
   "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost"
 install -m 0755 "${SDL3_LIBRARY}" \
   "${APPDIR}/usr/libexec/dkr-r/libSDL3.so.0"
 patchelf --set-rpath '$ORIGIN' \
   "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost"
+if [[ "${SKIP_RUNTIME_TESTS}" == 0 ]]; then
+timeout 15 "${APPDIR}/usr/libexec/dkr-r/DKR-R-ModWorker" --self-test
 LD_LIBRARY_PATH="${APPDIR}/usr/libexec/dkr-r${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
   "${APPDIR}/usr/libexec/dkr-r/DKR-R-InputHost" --self-test --mappings \
   "${APPDIR}/usr/bin/assets/controllers/gamecontrollerdb.txt"
+fi
 
 collect_linux_dependency_notices "${APPDIR}"
 validate_release_tree "${APPDIR}"
 "${APPIMAGE_PLUGIN}" --appdir "${APPDIR}"
 [[ -s "${OUTPUT}" ]] || { echo "AppImage output is missing or empty: ${OUTPUT}" >&2; exit 1; }
+if [[ "${SKIP_RUNTIME_TESTS}" == 0 ]]; then
 APPIMAGE_EXTRACT_AND_RUN=1 "${OUTPUT}" --self-test-pak "${PAK_TEST}"
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy APPIMAGE_EXTRACT_AND_RUN=1 \
   "${OUTPUT}" --self-test-input-switch "${INPUT_SWITCH_TEST}"
+else
+  echo 'WARNING: Runtime tests explicitly deferred; package runtime qualification remains pending.' >&2
+fi
 echo "Created ${OUTPUT}"
 sha256sum "${OUTPUT}"

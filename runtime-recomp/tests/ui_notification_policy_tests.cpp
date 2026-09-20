@@ -29,6 +29,14 @@ int main() {
     queue.push(Kind::LobbyInvite, "C", "three", start + 20s);
     assert(queue.size(start + 20s) == 2U);
     assert(queue.current(start + 20s)->title == "A");
+    assert(!queue.push(Kind::FriendOnline, "D", "presence must not evict invite", start + 20s));
+    assert(queue.current(start + 27s)->kind == Kind::LobbyInvite);
+    Queue invites{2};
+    assert(invites.push(Kind::LobbyInvite, "A", "first", start));
+    assert(invites.push(Kind::LobbyInvite, "B", "second", start));
+    assert(!invites.push(Kind::LobbyInvite, "C", "retry from inbox on next pass", start));
+    assert(invites.current(start + 7s)->title == "B");
+    assert(invites.push(Kind::LobbyInvite, "C", "retry succeeds", start + 7s));
 
     FriendOnlineTransitionGate initially_online;
     assert(!initially_online.update(true, start));

@@ -57,6 +57,7 @@ struct VirtualPak {
 };
 
 std::filesystem::path g_config_directory;
+std::filesystem::path g_session_directory;
 std::array<VirtualPak, 4> g_paks;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_self_test_allow_all{false};
@@ -90,7 +91,7 @@ std::uint32_t AlignToPage(std::uint32_t value) {
 }
 
 std::filesystem::path PakPath(int channel) {
-    return g_config_directory / ("controller-pak-" + std::to_string(channel + 1) + ".mpk");
+    return (g_session_directory.empty()?g_config_directory:g_session_directory) / ("controller-pak-" + std::to_string(channel + 1) + ".mpk");
 }
 
 std::uint32_t ReadU32(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
@@ -207,7 +208,7 @@ bool SavePakLocked(int channel, VirtualPak& pak) {
     WriteU32(bytes, 16U, Checksum(bytes));
 
     std::error_code error;
-    std::filesystem::create_directories(g_config_directory, error);
+    std::filesystem::create_directories(PakPath(channel).parent_path(), error);
     const std::filesystem::path path = PakPath(channel);
     const std::filesystem::path temporary = path.string() + ".tmp";
     const std::filesystem::path backup = path.string() + ".bak";
@@ -341,6 +342,15 @@ void dkr::runtime::pak::configure(const std::filesystem::path& config_directory)
     g_config_directory = config_directory;
 }
 
+void dkr::runtime::pak::begin_session_directory(const std::filesystem::path& directory) {
+    if(directory==g_session_directory)return;
+    for(auto& pak:g_paks) {
+        std::lock_guard lock(pak.mutex);
+        pak.loaded=false;pak.corrupt=false;pak.generation=0;pak.files={};
+    }
+    g_session_directory=directory;
+}
+
 bool dkr::runtime::pak::enabled() {
     return g_enabled.load(std::memory_order_acquire);
 }
@@ -442,6 +452,39 @@ bool dkr::runtime::pak::self_test(const std::filesystem::path& directory,
             recovered->files[0].data[0] != static_cast<std::uint8_t>(channel)) {
             error = "backup recovery returned the wrong generation";
             return false;
+        }
+    }
+    // Exercise the same between-session namespace switch used by offline
+    // custom mods. Cached files must never leak from one profile to another.
+    const auto mod_directory=directory/"mod-pak-test";
+    struct RestorePakRoute {~RestorePakRoute(){dkr::runtime::pak::begin_session_directory({});}} restore_route;
+    begin_session_directory(mod_directory);
+    for(int port=0;port<4;++port) {
+        VirtualPak* isolated=nullptr;
+        if(EnsureLoaded(port,isolated)!=kPfsOk || !isolated) {error="isolated Pak could not be opened";return false;}
+        std::lock_guard lock(isolated->mutex);
+        if(std::any_of(isolated->files.begin(),isolated->files.end(),[](const auto& f){return f.used;})) {
+            error="a normal Pak leaked into the mod namespace";return false;
+        }
+        isolated->files[0].used=true;isolated->files[0].data=std::vector<std::uint8_t>(256,0xA9);
+        if(!SavePakLocked(port,*isolated)){error="isolated Pak write failed";return false;}
+    }
+    begin_session_directory({});
+    for(int port=0;port<4;++port) {
+        VirtualPak* original=nullptr;
+        if(EnsureLoaded(port,original)!=kPfsOk || !original){error="normal Pak restore failed";return false;}
+        std::lock_guard lock(original->mutex);
+        if(!original->files[0].used || original->files[0].data.size()!=1024 || original->files[0].data[0]!=port) {
+            error="modded Pak data replaced the normal Pak";return false;
+        }
+    }
+    begin_session_directory(mod_directory);
+    for(int port=0;port<4;++port) {
+        VirtualPak* isolated=nullptr;
+        if(EnsureLoaded(port,isolated)!=kPfsOk || !isolated){error="modded Pak reload failed";return false;}
+        std::lock_guard lock(isolated->mutex);
+        if(!isolated->files[0].used || isolated->files[0].data.size()!=256 || isolated->files[0].data[0]!=0xA9) {
+            error="modded Pak did not retain its separate progress";return false;
         }
     }
     error.clear();

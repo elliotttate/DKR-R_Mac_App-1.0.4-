@@ -29,6 +29,7 @@ enum class FriendLobbyInviteStatus : std::uint8_t {
 };
 
 struct FriendView {
+    bool operator==(const FriendView&) const = default;
     std::string identity;
     std::string display_name;
     std::string nickname;
@@ -43,17 +44,22 @@ struct FriendView {
 };
 
 struct FriendRequestView {
+    bool operator==(const FriendRequestView&) const = default;
     std::uint64_t request_id = 0U;
     std::string identity;
     std::string display_name;
     bool incoming = false;
+    std::string delivery_status;
+    bool can_retry = false;
 };
 
 struct FriendInviteView {
+    bool operator==(const FriendInviteView&) const = default;
     std::uint64_t invite_id = 0U;
     std::string code;
     FriendInviteLifetime lifetime = FriendInviteLifetime::Permanent;
     std::uint64_t expires_unix = 0U;
+    std::string connection_status;
 };
 
 struct FriendLobbyAdvertisement {
@@ -67,6 +73,7 @@ struct FriendLobbyAdvertisement {
 };
 
 struct FriendLobbyInviteView {
+    bool operator==(const FriendLobbyInviteView&) const = default;
     std::uint64_t invite_id = 0U;
     std::string friend_identity;
     std::string friend_display_name;
@@ -82,6 +89,15 @@ struct FriendLobbyInviteView {
     bool incoming = false;
 };
 
+struct FriendServiceSnapshot {
+    std::vector<FriendView> friends;
+    std::vector<FriendRequestView> requests;
+    std::vector<FriendInviteView> invitations;
+    std::vector<FriendLobbyInviteView> incoming_lobby_invites;
+    std::vector<FriendLobbyInviteView> outgoing_lobby_invites;
+    bool operator==(const FriendServiceSnapshot&) const = default;
+};
+
 class FriendService {
 public:
     FriendService();
@@ -93,6 +109,7 @@ public:
                    std::string_view display_name);
     void shutdown();
     void pump(const FriendLobbyAdvertisement& advertisement);
+    std::shared_ptr<const FriendServiceSnapshot> snapshot() const;
 
     std::string display_name() const;
     bool set_display_name(std::string_view name, std::string& error);
@@ -111,6 +128,8 @@ public:
     std::vector<FriendInviteView> invitations() const;
 
     bool submit_friend_code(std::string_view code, std::string& error);
+    bool retry_request(std::uint64_t request_id, std::string& error);
+    std::string diagnostics() const;
     std::vector<FriendRequestView> pending_requests() const;
     bool accept_request(std::uint64_t request_id, std::string& error);
     bool reject_request(std::uint64_t request_id, bool block,
@@ -137,8 +156,9 @@ public:
     bool cancel_lobby_invite(std::uint64_t invite_id, std::string& error);
 
 private:
+    friend struct FriendServiceTestAccess;
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
 FriendService& friend_service();

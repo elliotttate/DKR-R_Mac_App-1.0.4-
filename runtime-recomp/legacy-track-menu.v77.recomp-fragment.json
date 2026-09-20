@@ -1,0 +1,446 @@
+{
+  "schema": 1,
+  "revision": "us.v77",
+  "abi": 3,
+  "fields": [
+    {
+      "name": "gTrackSelectCursorX",
+      "address": "0x801269c8",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectCursorY",
+      "address": "0x801269cc",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectX",
+      "address": "0x801269dc",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectY",
+      "address": "0x801269e4",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectTargetX",
+      "address": "0x801269e8",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectTargetY",
+      "address": "0x801269ec",
+      "size": 4
+    },
+    {
+      "name": "gSelectedTrackX",
+      "address": "0x801269f4",
+      "size": 4
+    },
+    {
+      "name": "gSelectedTrackY",
+      "address": "0x801269f8",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectViewportY",
+      "address": "0x80126480",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectViewPortHalfY",
+      "address": "0x80126478",
+      "size": 4
+    },
+    {
+      "name": "gTrackIdForPreview",
+      "address": "0x800df4c4",
+      "size": 4
+    },
+    {
+      "name": "gTrackmenuLoadedLevel",
+      "address": "0x801263d0",
+      "size": 4
+    },
+    {
+      "name": "gOpacityDecayTimer",
+      "address": "0x801263d8",
+      "size": 4
+    },
+    {
+      "name": "gFFLUnlocked",
+      "address": "0x80126918",
+      "size": 2
+    },
+    {
+      "name": "gTrackSelectRenderDetails",
+      "address": "0x80126930",
+      "size": 144
+    },
+    {
+      "name": "gMenuDelay",
+      "address": "0x800df47c",
+      "size": 4
+    },
+    {
+      "name": "gMenuButtons",
+      "address": "0x801267d8",
+      "size": 20
+    },
+    {
+      "name": "gMenuStickX",
+      "address": "0x80126818",
+      "size": 10
+    },
+    {
+      "name": "gMenuStickY",
+      "address": "0x80126830",
+      "size": 10
+    },
+    {
+      "name": "gTrackSelectRow",
+      "address": "0x800df4c8",
+      "size": 4
+    },
+    {
+      "name": "gTrackSelectIDs",
+      "address": "0x801268e8",
+      "size": 48
+    },
+    {
+      "name": "gTrackNameVoiceDelay",
+      "address": "0x800e0980",
+      "size": 4
+    },
+    {
+      "name": "gTrackmenuType",
+      "address": "0x801267d0",
+      "size": 4
+    },
+    {
+      "name": "gIsInTracksMenu",
+      "address": "0x800e097c",
+      "size": 4
+    },
+    {
+      "name": "gTrackIdToLoad",
+      "address": "0x800df4d4",
+      "size": 4
+    },
+    {
+      "name": "gThread30NeedToLoadLevel",
+      "address": "0x800e3770",
+      "size": 4
+    },
+    {
+      "name": "gTitleScreenLoaded",
+      "address": "0x800df488",
+      "size": 4
+    }
+  ],
+  "functions": {
+    "bgload_start": {
+      "vram": "0x800c7458",
+      "size": 72,
+      "sha256": "c0f84c111fe8b3ea485fe86d2f02e3636d0794eb7b9d7159dc45e873a1a113fd"
+    },
+    "trackmenu_track_view": {
+      "vram": "0x800904e8",
+      "size": 1072,
+      "sha256": "4fe12daf9fbc8f3194add04ea8b2c99ced832f6a0e9ee8a9108c83ab86855d52"
+    },
+    "menu_track_select_init": {
+      "vram": "0x8008e7a0",
+      "size": 2156,
+      "sha256": "9d4307b6b2203f17024376aca7ca6e90b91cbbc591d438bd685a2b771a0eebf6"
+    },
+    "leveltable_vehicle_default": {
+      "vram": "0x8006b0ac",
+      "size": 76,
+      "sha256": "16cf8a98c153525bf195146e0d260f59c5bca73a2f6ed6b13911c6e28448c011"
+    },
+    "trackmenu_assets": {
+      "vram": "0x8008f00c",
+      "size": 552,
+      "sha256": "2350cef04f955d4bf3d69af7aadfc1972126574e0416cd7f643cbfe358c71168"
+    },
+    "trackmenu_render_names": {
+      "vram": "0x8008ff1c",
+      "size": 1484,
+      "sha256": "2a599adfee83d0994770b504cc1a11e45110158fe9c29b3b0cfcd51a3c81108d"
+    },
+    "func_8008F618": {
+      "vram": "0x8008f618",
+      "size": 1084,
+      "sha256": "6cfd9699784e48bbf9b748761c8fc7c260bf7ee8216ca80c9849ed1089bbfa1c"
+    },
+    "level_name": {
+      "vram": "0x8006bddc",
+      "size": 288,
+      "sha256": "8ea42bfe54410727a29a75fd45cae413be110a4a4444bce2cb17ec94a9a5495c"
+    },
+    "leveltable_vehicle_usable": {
+      "vram": "0x8006b0f8",
+      "size": 84,
+      "sha256": "688b28f85980e67661484c045946f13e10ad0fda671e6b03e17f69921a1633dd"
+    },
+    "func_80092188": {
+      "vram": "0x80092188",
+      "size": 2648,
+      "sha256": "03e78a1da4ebf7ee59b07802f1941743f3776b2885946c8615974ce4cda537f0"
+    },
+    "load_level_game": {
+      "vram": "0x8006cb58",
+      "size": 188,
+      "sha256": "4b94d3fd71359b4cb0026986ef1ed00301882d210a7ef3253da6aedc165aa542"
+    },
+    "menu_init": {
+      "vram": "0x800813d0",
+      "size": 468,
+      "sha256": "1e5a12222e02d003590fc16edf530a002bbb24493dc915a3f105ab5efc93be9a"
+    },
+    "load_level_for_menu": {
+      "vram": "0x8006e2e8",
+      "size": 212,
+      "sha256": "8d882096ad66310eee2c3c76eeb8352bc0ce58b268ef234e03d3ad2cc90eb027"
+    },
+    "trackmenu_input": {
+      "vram": "0x80090918",
+      "size": 1472,
+      "sha256": "ff1b1ed844122dca99e117efe39c0c537a40d4d625240b094dd085b98b702bfb"
+    }
+  },
+  "hooks": [
+    {
+      "function": "menu_track_select_init",
+      "vram": "0x8008e7a0",
+      "event": 0,
+      "returns": false,
+      "expectedAt": "0x8008e7a0",
+      "expected": [
+        "0x27bdff80",
+        "0xafbf0044",
+        "0xafbe0040"
+      ]
+    },
+    {
+      "function": "menu_track_select_init",
+      "vram": "0x8008f004",
+      "event": 1,
+      "returns": false,
+      "expectedAt": "0x8008f000",
+      "expected": [
+        "0x27bd0080",
+        "0x3e00008",
+        "0xac2b6548"
+      ]
+    },
+    {
+      "function": "trackmenu_input",
+      "vram": "0x80090918",
+      "event": 2,
+      "returns": false,
+      "expectedAt": "0x80090918",
+      "expected": [
+        "0x3c03800e",
+        "0x8c63f47c",
+        "0x27bdffb8"
+      ]
+    },
+    {
+      "function": "trackmenu_input",
+      "vram": "0x80090ed0",
+      "event": 3,
+      "returns": false,
+      "expectedAt": "0x80090ecc",
+      "expected": [
+        "0x27bd0048",
+        "0x3e00008",
+        "0x0"
+      ]
+    },
+    {
+      "function": "trackmenu_render_names",
+      "vram": "0x800903a0",
+      "event": 4,
+      "returns": false,
+      "expectedAt": "0x800903a0",
+      "expected": [
+        "0xc019a25",
+        "0x24050001",
+        "0xc026f57"
+      ]
+    },
+    {
+      "function": "trackmenu_track_view",
+      "vram": "0x800904e8",
+      "event": 5,
+      "returns": false,
+      "expectedAt": "0x800904e8",
+      "expected": [
+        "0x27bdffb8",
+        "0xafbf001c",
+        "0xc031cfc"
+      ]
+    },
+    {
+      "function": "bgload_start",
+      "vram": "0x800c7458",
+      "event": 6,
+      "returns": false,
+      "expectedAt": "0x800c7458",
+      "expected": [
+        "0x3c03800e",
+        "0x24633770",
+        "0x8c6e0000"
+      ]
+    },
+    {
+      "function": "bgload_start",
+      "vram": "0x800c748c",
+      "event": 7,
+      "returns": false,
+      "expectedAt": "0x800c748c",
+      "expected": [
+        "0x3e00008",
+        "0x24020001",
+        "0x1025"
+      ],
+      "observedReturn": 1
+    },
+    {
+      "function": "bgload_start",
+      "vram": "0x800c7498",
+      "event": 7,
+      "returns": false,
+      "expectedAt": "0x800c7494",
+      "expected": [
+        "0x1025",
+        "0x3e00008",
+        "0x0"
+      ],
+      "observedReturn": 0
+    },
+    {
+      "function": "load_level_for_menu",
+      "vram": "0x8006e2e8",
+      "event": 8,
+      "returns": false,
+      "expectedAt": "0x8006e2e8",
+      "expected": [
+        "0x27bdffe0",
+        "0x3c0e8012",
+        "0x81ce3514"
+      ]
+    },
+    {
+      "function": "level_name",
+      "vram": "0x8006bddc",
+      "event": 9,
+      "returns": true,
+      "expectedAt": "0x8006bddc",
+      "expected": [
+        "0x27bdffe0",
+        "0xafbf0014",
+        "0x802825"
+      ]
+    },
+    {
+      "function": "leveltable_vehicle_default",
+      "vram": "0x8006b0ac",
+      "event": 10,
+      "returns": true,
+      "expectedAt": "0x8006b0ac",
+      "expected": [
+        "0x1880000f",
+        "0x3c0e8012",
+        "0x8dce1170"
+      ]
+    },
+    {
+      "function": "leveltable_vehicle_usable",
+      "vram": "0x8006b0f8",
+      "event": 11,
+      "returns": true,
+      "expectedAt": "0x8006b0f8",
+      "expected": [
+        "0x18800011",
+        "0x3c0e8012",
+        "0x8dce1170"
+      ]
+    },
+    {
+      "function": "trackmenu_assets",
+      "vram": "0x8008f00c",
+      "event": 12,
+      "returns": false,
+      "expectedAt": "0x8008f00c",
+      "expected": [
+        "0x3c058012",
+        "0x24a567d0",
+        "0x8ca20000"
+      ]
+    },
+    {
+      "function": "func_80092188",
+      "vram": "0x80092188",
+      "event": 13,
+      "returns": false,
+      "expectedAt": "0x80092188",
+      "expected": [
+        "0x3c0e800e",
+        "0x8dcef47c",
+        "0x27bdffa8"
+      ]
+    },
+    {
+      "function": "load_level_game",
+      "vram": "0x8006cb58",
+      "event": 14,
+      "returns": false,
+      "expectedAt": "0x8006cb58",
+      "expected": [
+        "0x27bdffe0",
+        "0xafbf001c",
+        "0xafa40020"
+      ]
+    },
+    {
+      "function": "menu_init",
+      "vram": "0x800813d0",
+      "event": 15,
+      "returns": false,
+      "expectedAt": "0x800813d0",
+      "expected": [
+        "0x27bdffe8",
+        "0xafbf0014",
+        "0x3c01800e"
+      ]
+    },
+    {
+      "function": "func_8008F618",
+      "vram": "0x8008f618",
+      "event": 16,
+      "returns": false,
+      "expectedAt": "0x8008f618",
+      "expected": [
+        "0x27bdff80",
+        "0xafb60030",
+        "0xafb00018"
+      ]
+    },
+    {
+      "function": "func_8008F618",
+      "vram": "0x8008fa4c",
+      "event": 17,
+      "returns": false,
+      "expectedAt": "0x8008fa48",
+      "expected": [
+        "0x8fbe0038",
+        "0x3e00008",
+        "0x27bd0080"
+      ]
+    }
+  ]
+}

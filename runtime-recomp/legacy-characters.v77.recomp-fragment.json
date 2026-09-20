@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "revision": "us.v77",
+  "abi": 1,
+  "fields": [
+    {
+      "name": "gCharacterIdSlots",
+      "address": "0x801263f0",
+      "size": 8
+    }
+  ],
+  "functions": {
+    "spawn_object": {
+      "vram": "0x8000ea54",
+      "size": 3060,
+      "sha256": "d38a200b5c1c45e056c1e152dc3839fc4aab19b992c96b95b098613d97bfe1c9"
+    },
+    "charselect_assign_ai": {
+      "vram": "0x8008bb3c",
+      "size": 488,
+      "sha256": "439714154c6e642b088683918fdefbc67670220ebfe359d3d312c4636e56dabb"
+    },
+    "menu_character_select_init": {
+      "vram": "0x8008afcc",
+      "size": 576,
+      "sha256": "1d0179092c7d49c0616f193c79a863691754a6186e14c27f2e64edda2081e52d"
+    }
+  },
+  "hooks": [
+    {
+      "function": "spawn_object",
+      "vram": "0x8000eb24",
+      "event": 0,
+      "expected": [
+        "0xa7a4004e",
+        "0xc0031c6",
+        "0xafa3002c"
+      ]
+    },
+    {
+      "function": "charselect_assign_ai",
+      "vram": "0x8008bb3c",
+      "event": 1,
+      "expected": [
+        "0x27bdffc8",
+        "0xafbf0034",
+        "0xafb60030"
+      ]
+    },
+    {
+      "function": "menu_character_select_init",
+      "vram": "0x8008afcc",
+      "event": 2,
+      "expected": [
+        "0x27bdffd0",
+        "0xafbf002c",
+        "0xafb1001c"
+      ]
+    }
+  ]
+}

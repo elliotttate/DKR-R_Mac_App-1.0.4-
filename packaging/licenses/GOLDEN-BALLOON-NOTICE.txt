@@ -1,0 +1,40 @@
+Golden Balloon HUD reference
+https://github.com/akratch/goldenballoon
+Reference revision: 83a847ccbd3e6334c9cc9c697122d5b3cddb91c1
+
+DKR-R adapts the explicit HUD anchor classification and draw-only slide
+behavior in game/src/game_ui.c, and the horizontal-offset rule in
+platform/hud_layout.c, into its own recomp patch callbacks and RT64 adapter.
+Permission to use this work was supplied by the DKR-R project owner, who
+reports permission from Golden Balloon's owner. No game assets are included.
+Golden Balloon is credited in About DKR-R and THIRD_PARTY.md.
+
+Upstream provenance distinction: platform/ is first-party MIT work. game/
+derives from the Diddy Kong Racing decompilation, with Golden Balloon's
+NATIVE_PORT adaptations; upstream explicitly does not place game/ under
+its first-party MIT license. The original game remains under its respective
+rights holders' ownership. This notice does not relicense that game code.
+
+First-party Golden Balloon license:
+
+MIT License
+
+Copyright (c) 2026 Golden Balloon contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

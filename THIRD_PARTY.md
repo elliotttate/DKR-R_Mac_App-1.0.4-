@@ -55,11 +55,45 @@ overlay. Its supplied licence is packaged as `Jumpman-LICENSE.txt`; source
 SHA-256 is
 `36D473DF3E85F93AEECB619EF06432F4F6DCC572773AAB668D09C8AD9A04C334`.
 
+Selawik by Microsoft Corporation (<https://github.com/microsoft/Selawik>,
+release 1.01) is the embedded reading face of the MODS / HACKS page. It is an
+open-source, metric-compatible stand-in for Segoe UI, licensed under the SIL
+Open Font License 1.1, packaged as `Selawik-OFL.txt`. The Regular and Semibold
+TTF sources have SHA-256
+`E9D98518D8AC2817782A9A382430463A2E0793EA68350B695BB727D9A830EE1C` and
+`0A9E9D0549A10F24BEF9B3A29E06FE6E0B5C21E7A784C503B048A307841A7783`.
+Segoe UI itself is never bundled: on Windows the launcher reads the copy the
+operating system installed, and uses Selawik when it is absent.
+
 ## CRT masks
 
 Six optional PNG display masks are included for Modern presentation. They are
 not game assets. Provenance, hashes and redistribution notes are in
 `assets/filters/README.md` and `packaging/licenses/CRT-FILTERS-NOTICE.md`.
+
+## Legacy mod importer dependencies
+
+The separate legacy importer uses xdelta 3.2.0 (Apache-2.0), pinned at
+`ff322e592383227b0d65ddfde7e0e5bbc504dc15`, and liblzma from XZ Utils 5.8.1
+(0BSD). Sources and archive hashes are pinned in `runtime-recomp/cmake/LegacyMods.cmake`.
+Only the decoding library is used; no external decompression commands or
+user-supplied executable code are run. The private worker has resource and
+cancellation limits, not a complete OS security sandbox. Compression/ZIP and
+hashing reuse the existing miniz and Mbed TLS implementations. Notices are in
+`LEGACY-MODS-NOTICE.txt` in both packages. No game or mod assets are bundled.
+
+## Golden Balloon HUD reference
+
+Golden Balloon (<https://github.com/akratch/goldenballoon>), revision
+`83a847ccbd3e6334c9cc9c697122d5b3cddb91c1`, informed the one/two-player HUD
+grouping, edge-placement and animation regression criteria. Thanks to all
+developers and contributors. The explicit mode/element anchor classification,
+horizontal-offset rule and draw-only slide behavior are adapted in
+`hud_reference_layout.hpp`; Golden Balloon is not a linked runtime dependency.
+Its first-party MIT license and the separate provenance of its decomp-derived
+`game/` adaptations are documented in `GOLDEN-BALLOON-NOTICE.txt`, included in
+both platform packages. Permission was reported by the DKR-R project owner.
+No Golden Balloon game assets are redistributed here.
 
 Nintendo, Rare, Diddy Kong Racing and related names and assets belong to their
 respective owners. DKR-R includes no game ROM or extracted game assets.

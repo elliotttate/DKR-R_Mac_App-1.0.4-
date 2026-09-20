@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
+#include <string>
 #include <string_view>
 
 namespace dkr::runtime::netplay {
@@ -52,6 +53,7 @@ public:
                 std::string_view detail = {});
     void dump(std::FILE* stream = stderr,
               std::size_t maximum_events = 256U) const;
+    std::string snapshot_text(std::size_t maximum_events = 256U) const;
     void clear();
 
 private:

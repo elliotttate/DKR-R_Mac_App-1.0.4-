@@ -2,14 +2,16 @@ diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuf
 index 9fae0d4..639e87e 100644
 --- a/src/render/rt64_framebuffer_renderer.cpp
 +++ b/src/render/rt64_framebuffer_renderer.cpp
-@@ -572,6 +572,7 @@ namespace RT64 {
-                 }
-                 
-                 rasterParams.renderIndex = i;
-+                rasterParams.mipLODBias = shaderLibrary->samplerMipLODBias;
-                 rasterParams.screenScale = triangles.screenScale;
-                 rasterParams.screenOffset = triangles.screenOffset;
-                 worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+@@ -475,7 +475,8 @@ namespace RT64 {
+         bool previousVertexTestZ = false;
+         const RenderPipeline *previousPipeline = nullptr;
+         RenderRect previousScissor;
+-        interop::RasterParams rasterParams;
++        interop::RasterParams rasterParams{};
++        rasterParams.mipLODBias = getDefaultSamplerMipLODBias();
+         RenderDescriptorSet *descRealFbSet = framebuffer.descRealFbSet->get();
+         RenderDescriptorSet *descDummyFbSet = framebuffer.descDummyFbSet->get();
+ 
 diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
 index d310c96..33ff1f6 100644
 --- a/src/render/rt64_shader_library.cpp
@@ -22,7 +24,7 @@ index d310c96..33ff1f6 100644
      }
  
      void setDefaultSamplerAnisotropy(uint32_t level) {
-@@ -190,11 +191,21 @@ namespace RT64 {
+@@ -190,11 +191,20 @@ namespace RT64 {
          return gDefaultSamplerAnisotropy.load(std::memory_order_acquire);
      }
  
@@ -40,7 +42,6 @@ index d310c96..33ff1f6 100644
      ShaderLibrary::ShaderLibrary(bool usesHDR, bool usesHardwareResolve) {
          this->usesHDR = usesHDR;
          this->usesHardwareResolve = usesHardwareResolve;
-+        this->samplerMipLODBias = getDefaultSamplerMipLODBias();
      }
  
      ShaderLibrary::~ShaderLibrary() { }
@@ -50,8 +51,8 @@ index d310c96..33ff1f6 100644
  
 -            // This matches the bias used in the shader when native samplers are not used.
 -            samplerDesc.mipLODBias = -0.25f;
-+            // Keep native sampler selection aligned with the manual mip path.
-+            samplerDesc.mipLODBias = samplerMipLODBias;
++            // Bias is applied to shader gradients, so immutable samplers stay neutral.
++            samplerDesc.mipLODBias = 0.0f;
  
              // WRAP.
              samplerDesc.addressU = RenderTextureAddressMode::WRAP;
@@ -68,14 +69,6 @@ index 570b0a4..1dda349 100644
  
      struct ShaderRecord {
          std::unique_ptr<RenderPipeline> pipeline;
-@@ -19,6 +21,7 @@ namespace RT64 {
-         SamplerLibrary samplerLibrary;
-         bool usesHDR = false;
-         bool usesHardwareResolve = false;
-+        float samplerMipLODBias = 0.0f;
- 
-         // All shaders.
-         ShaderRecord bicubicScaling;
 diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
 index e7895c3..a2aa70c 100644
 --- a/src/shaders/RasterPS.hlsl
@@ -126,6 +119,19 @@ index 1ceb2ce..ab21edb 100644
              numRDPSamples = 2;
          }
          else {
+@@ -291,7 +290,10 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug) {
+             float2 nativeUVCoord = uvCoord / gpuTile.textureDimensions.xy;
+             float2 originalSize = gpuTile.textureDimensions.xy / gpuTile.tcScale;
+-            float2 ddxUVNorm = ddxUV / originalSize;
+-            float2 ddyUVNorm = ddyUV / originalSize;
++            // A 2^bias gradient scale adds bias to the selected mip level.
++            // Scale both axes equally to preserve the anisotropic footprint ratio.
++            const float lodGradientScale = exp2(mipLODBias);
++            float2 ddxUVNorm = (ddxUV / originalSize) * lodGradientScale;
++            float2 ddyUVNorm = (ddyUV / originalSize) * lodGradientScale;
+             
+             // Choose the native sampler that was determined to be compatible.
+             switch (nativeSampler) {
 diff --git a/src/shared/rt64_raster_params.h b/src/shared/rt64_raster_params.h
 index 0a5c332..39c8590 100644
 --- a/src/shared/rt64_raster_params.h

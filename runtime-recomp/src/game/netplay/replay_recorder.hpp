@@ -20,6 +20,7 @@ public:
     void begin(const Room& room);
     void record(std::uint32_t frame, const FrameInputs& inputs);
     bool finalize(std::string& error);
+    ReplayRecorder detach();
     void reset();
     bool active() const { return active_; }
     const std::filesystem::path& last_path() const { return last_path_; }

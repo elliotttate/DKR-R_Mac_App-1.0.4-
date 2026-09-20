@@ -4,7 +4,9 @@ param(
     [ValidateSet('Release')]
     [string]$Configuration = 'Release',
     [string]$BuildDirectory = 'build\dkr-runtime-rt64',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    # For explicitly deferred beta qualification only; release checks remain on by default.
+    [switch]$SkipRuntimeTests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,10 +28,15 @@ if ([IO.Path]::IsPathRooted($BuildDirectory)) {
     $resolvedBuild = Join-Path $projectRoot $BuildDirectory
 }
 $stage = Join-Path $distRoot "DKR-R-$Version-Windows-x64"
+if (Test-Path -LiteralPath (Join-Path $resolvedBuild 'CMakeCache.txt')) {
+    if (Select-String -LiteralPath (Join-Path $resolvedBuild 'CMakeCache.txt') -Pattern '^DKR_LEGACY_QUALIFICATION:BOOL=(ON|1|TRUE|YES)$' -Quiet) {
+        throw 'Refusing to package a private legacy-content qualification build. Reconfigure and rebuild with DKR_LEGACY_QUALIFICATION=OFF first.'
+    }
+}
 $zip = "$stage.zip"
 $deniedExtensions = @('.z64', '.v64', '.n64', '.eep', '.mpk', '.sra', '.fla', '.o2r', '.otr')
 $runtimeFiles = @('DKR-R.exe', 'SDL2.dll', 'dxcompiler.dll', 'dxil.dll')
-$inputHostFiles = @('DKR-R-InputHost.exe', 'SDL3.dll')
+$inputHostFiles = @('DKR-R-InputHost.exe', 'SDL3.dll', 'DKR-R-ModWorker.exe')
 
 if (Test-Path -LiteralPath $stage) {
     throw "Refusing to overwrite existing release directory: $stage"
@@ -88,6 +95,10 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'assets\controllers\gamecontrolle
     -Destination (Join-Path $controllerDirectory 'gamecontrollerdb.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\RELEASE-README.md') -Destination (Join-Path $stage 'README.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\ONLINE_MULTIPLAYER.md') -Destination (Join-Path $stage 'ONLINE_MULTIPLAYER.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\ONLINE-STABILITY.md') -Destination (Join-Path $stage 'ONLINE-STABILITY.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\HUD-WORKSHOP.md') -Destination (Join-Path $stage 'HUD-WORKSHOP.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\LEGACY-MODS-BETA.md') -Destination (Join-Path $stage 'LEGACY-MODS-BETA.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'docs\LEGACY-MOD-COMPATIBILITY-BETA7.md') -Destination (Join-Path $stage 'LEGACY-MOD-COMPATIBILITY-BETA7.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE.md') -Destination (Join-Path $stage 'LICENSE.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'THIRD_PARTY.md') -Destination (Join-Path $stage 'THIRD_PARTY.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'runtime-recomp\COPYING-NOTICE.md') -Destination (Join-Path $stage 'COPYING-NOTICE.md')
@@ -102,10 +113,13 @@ $noticeFiles = [ordered]@{
     'N64Recomp-LICENSE.txt' = 'extern\n64-modern-runtime\N64Recomp\LICENSE'
     'DXC-NOTICE.md' = 'packaging\licenses\DXC-NOTICE.md'
     'Jumpman-LICENSE.txt' = 'packaging\licenses\Jumpman-LICENSE.txt'
+    'Selawik-OFL.txt' = 'packaging\licenses\Selawik-OFL.txt'
     'CRT-FILTERS-NOTICE.md' = 'packaging\licenses\CRT-FILTERS-NOTICE.md'
     'SDL-GAMECONTROLLERDB-LICENSE.txt' = 'packaging\licenses\SDL-GAMECONTROLLERDB-LICENSE.txt'
     'GEKKONET-LICENSE.txt' = 'packaging\licenses\GEKKONET-LICENSE.txt'
     'MONOCYPHER-LICENSE.txt' = 'packaging\licenses\MONOCYPHER-LICENSE.txt'
+    'GOLDEN-BALLOON-NOTICE.txt' = 'packaging\licenses\GOLDEN-BALLOON-NOTICE.txt'
+    'LEGACY-MODS-NOTICE.txt' = 'packaging\licenses\LEGACY-MODS-NOTICE.txt'
     'LIBDATACHANNEL-LICENSE.txt' = 'extern\libdatachannel\LICENSE'
     'MBEDTLS-LICENSE.txt' = 'extern\mbedtls\LICENSE'
     'LIBJUICE-LICENSE.txt' = 'extern\libdatachannel\deps\libjuice\LICENSE'
@@ -117,6 +131,20 @@ $noticeFiles = [ordered]@{
 # SDL3 is deliberately private to the controller helper. Exercise it from the
 # exact release path before the public launcher is tested; this catches a
 # missing SDL3.dll without ever loading SDL3 into the launcher/game process.
+if (-not $SkipRuntimeTests) {
+$modWorkerTestInfo = [Diagnostics.ProcessStartInfo]::new()
+$modWorkerTestInfo.FileName = Join-Path $stagedInputHostDirectory 'DKR-R-ModWorker.exe'
+$modWorkerTestInfo.Arguments = '--self-test'
+$modWorkerTestInfo.UseShellExecute = $false
+$modWorkerTestInfo.CreateNoWindow = $true
+$modWorkerTest = [Diagnostics.Process]::Start($modWorkerTestInfo)
+try {
+    if (-not $modWorkerTest.WaitForExit(15000)) {
+        $modWorkerTest.Kill()
+        throw 'The staged legacy importer self-test timed out.'
+    }
+    if ($modWorkerTest.ExitCode -ne 0) { throw 'The staged legacy importer self-test failed.' }
+} finally { $modWorkerTest.Dispose() }
 $inputHostTest = [Diagnostics.Process]::Start(
     $stagedInputHost,
     "--self-test --mappings `"$(Join-Path $controllerDirectory 'gamecontrollerdb.txt')`"")
@@ -127,6 +155,7 @@ if ($inputHostTest.ExitCode -ne 0) {
     throw "The staged private SDL3 input host failed its self-test with exit code $exitCode."
 }
 $inputHostTest.Dispose()
+}
 foreach ($entry in $noticeFiles.GetEnumerator()) {
     $source = Join-Path $projectRoot $entry.Value
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
@@ -138,6 +167,7 @@ foreach ($entry in $noticeFiles.GetEnumerator()) {
 # Exercise the binary from the exact staged package, not only from the build
 # tree. This catches a missing DLL or packaging-path regression before ZIP
 # creation while keeping all test data outside the release directory.
+if (-not $SkipRuntimeTests) {
 $pakTest = Join-Path ([IO.Path]::GetTempPath()) `
     ("dkr-r-packaged-pak-" + [Guid]::NewGuid().ToString('N'))
 $selfTestProcess = $null
@@ -190,17 +220,22 @@ try {
     }
 }
 
+} else {
+    Write-Warning 'Runtime tests explicitly deferred. This package still requires runtime qualification.'
+}
+
 $packagedFiles = Get-ChildItem -LiteralPath $stage -Recurse -File
 $executables = @($packagedFiles | Where-Object { $_.Extension -ieq '.exe' })
 $expectedExecutables = @(
     [IO.Path]::GetFullPath($stagedRuntime),
-    [IO.Path]::GetFullPath($stagedInputHost)
+    [IO.Path]::GetFullPath($stagedInputHost),
+    [IO.Path]::GetFullPath((Join-Path $stagedInputHostDirectory 'DKR-R-ModWorker.exe'))
 )
 $unexpectedExecutables = @($executables | Where-Object {
     $expectedExecutables -notcontains [IO.Path]::GetFullPath($_.FullName)
 })
-if ($executables.Count -ne 2 -or $unexpectedExecutables.Count -ne 0) {
-    throw "The Windows release must contain one public DKR-R.exe and one private libexec input host. Found: $($executables.FullName -join ', ')"
+if ($executables.Count -ne $expectedExecutables.Count -or $unexpectedExecutables.Count -ne 0) {
+    throw "The Windows release must contain one public DKR-R.exe and the two private libexec helpers (input and mod importer). Found: $($executables.FullName -join ', ')"
 }
 $denied = @($packagedFiles | Where-Object { $deniedExtensions -contains $_.Extension.ToLowerInvariant() })
 if ($denied.Count -ne 0) {

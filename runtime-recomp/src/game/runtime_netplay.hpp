@@ -48,6 +48,7 @@ std::uint32_t authored_simulation_pacing_scale_milli();
 // non-blocking wait instead of making a synchronized transition look frozen.
 OnlineWaitReason online_wait_reason();
 std::uint64_t online_wait_generation();
+std::uint64_t online_wait_episode();
 bool online_wait_active();
 bool physical_input_poll_allowed();
 void begin_presentation_random_scope();

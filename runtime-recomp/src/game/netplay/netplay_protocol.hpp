@@ -98,6 +98,10 @@ enum class MessageType : std::uint8_t {
     PreflightResult,
     OnlineSaveReady,
     OnlineSaveReadyAck,
+    PreflightCheckpointProbe,
+    // Advisory roster status; appended so existing gameplay IDs stay stable.
+    // Older peers safely discard this unknown message and retain Ready/Ack.
+    OnlineSaveStatus,
 };
 
 struct Header {
@@ -128,6 +132,10 @@ struct InputBatch {
     // scoped meaning; older peers are rejected during compatibility setup.
     std::uint32_t simulation_scene_epoch = 0U;
     std::uint32_t simulation_completed_frame = 0U;
+    // Per epoch/slot/frame revisions. Live and reliable repair can arrive in
+    // either order; packet sequence alone cannot order overlapping histories.
+    // An empty vector encodes initial revision 1 for every supplied sample.
+    std::vector<std::uint32_t> revisions;
 };
 
 // Reports both the newest guest input observed and the first input frame that
@@ -314,6 +322,13 @@ struct OnlineSaveReadyPayload {
     std::uint8_t player_slot = 0U;
     std::uint32_t generation = 0U;
     std::uint64_t hash = 0U;
+};
+
+struct OnlineSaveStatusPayload {
+    std::uint64_t room_generation = 0U;
+    std::uint32_t save_generation = 0U;
+    std::uint64_t save_hash = 0U;
+    std::uint8_t verified_mask = 0U;
 };
 
 struct LobbyPlayerPayload {
@@ -531,6 +546,9 @@ std::vector<std::uint8_t> encode_online_save_ready(
 bool decode_online_save_ready(std::span<const std::uint8_t> bytes,
                               OnlineSaveReadyPayload& payload,
                               std::string& error);
+std::vector<std::uint8_t> encode_online_save_status(const OnlineSaveStatusPayload& payload);
+bool decode_online_save_status(std::span<const std::uint8_t> bytes,
+                               OnlineSaveStatusPayload& payload, std::string& error);
 std::vector<std::uint8_t> encode_lobby_state(const LobbyStatePayload& payload);
 bool decode_lobby_state(std::span<const std::uint8_t> bytes,
                         LobbyStatePayload& payload, std::string& error);

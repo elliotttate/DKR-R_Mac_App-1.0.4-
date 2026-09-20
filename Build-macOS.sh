@@ -14,6 +14,16 @@ for tool in cmake ninja ditto codesign file install_name_tool otool; do
   }
 done
 
+payload_dir="${DKR_MAC_PAYLOAD_DIR:-}"
+policy_v77="${project_root}/runtime-recomp/dkr.us.v77.recomp-policy.json"
+policy_v80="${project_root}/runtime-recomp/dkr.us.v80.recomp-policy.json"
+if [[ -n "${payload_dir}" ]]; then
+  payload_dir="$(cd "${payload_dir}" && pwd)"
+  export DKR_MAC_GENERATED_SOURCE="${payload_dir}/generated-v77"
+  export DKR_MAC_V80_GENERATED_SOURCE="${payload_dir}/generated-v80"
+  policy_v77="${payload_dir}/v77.policy.json"
+  policy_v80="${payload_dir}/v80.policy.json"
+fi
 generated_source="${DKR_MAC_GENERATED_SOURCE:-${project_root}/runtime-recomp/RecompiledFuncs}"
 [[ -d "${generated_source}" ]] || {
   echo "US v1.0/v77 Patch Pipeline output is missing: ${generated_source}" >&2
@@ -64,6 +74,8 @@ cmake -S "${project_root}/runtime-recomp" -B "${build_dir}" -G Ninja \
   -DDKR_RELEASE_VERSION="${version}" \
   -DDKR_RUNTIME_BUILD_GENERATED=ON \
   -DDKR_RUNTIME_BUILD_RT64=ON \
+  -DDKR_PATCH_POLICY_V77="${policy_v77}" \
+  -DDKR_PATCH_POLICY_V80="${policy_v80}" \
   -DDKR_GENERATED_SOURCE_V77="${generated_source}" \
   -DDKR_GENERATED_SOURCE_V80="${revision_80_generated}"
 cmake --build "${build_dir}" --parallel "$(sysctl -n hw.logicalcpu)"
@@ -126,6 +138,12 @@ ditto "${input_host_source}/DKR-R-InputHost" \
   "${input_host_bundled}/DKR-R-InputHost"
 ditto "${input_host_source}/libSDL3.0.dylib" \
   "${input_host_bundled}/libSDL3.0.dylib"
+[[ -x "${input_host_source}/DKR-R-ModWorker" ]] || {
+  echo "The legacy mod importer was not produced under ${input_host_source}." >&2
+  exit 1
+}
+ditto "${input_host_source}/DKR-R-ModWorker" "${input_host_bundled}/DKR-R-ModWorker"
+"${input_host_bundled}/DKR-R-ModWorker" --self-test
 
 # Reject release artifacts that would still depend on a package manager or
 # another absolute, non-system path on the build machine.
@@ -161,6 +179,8 @@ install -m 0644 "${project_root}/extern/n64-modern-runtime/N64Recomp/LICENSE" \
   "${notices}/N64Recomp-LICENSE.txt"
 install -m 0644 "${project_root}/packaging/licenses/Jumpman-LICENSE.txt" \
   "${notices}/Jumpman-LICENSE.txt"
+install -m 0644 "${project_root}/packaging/licenses/Selawik-OFL.txt" \
+  "${notices}/Selawik-OFL.txt"
 install -m 0644 "${project_root}/packaging/licenses/CRT-FILTERS-NOTICE.md" \
   "${notices}/CRT-FILTERS-NOTICE.md"
 install -m 0644 "${project_root}/packaging/licenses/GEKKONET-LICENSE.txt" \
@@ -173,6 +193,15 @@ install -m 0644 "${project_root}/packaging/licenses/SDL3-LICENSE.txt" \
   "${notices}/SDL3-LICENSE.txt"
 install -m 0644 "${project_root}/packaging/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt" \
   "${notices}/SDL-GAMECONTROLLERDB-LICENSE.txt"
+for notice in GOLDEN-BALLOON-NOTICE.txt LEGACY-MODS-NOTICE.txt; do
+  install -m 0644 "${project_root}/packaging/licenses/${notice}" "${notices}/${notice}"
+done
+install -m 0644 "${project_root}/extern/libdatachannel/LICENSE" "${notices}/LIBDATACHANNEL-LICENSE.txt"
+install -m 0644 "${project_root}/extern/mbedtls/LICENSE" "${notices}/MBEDTLS-LICENSE.txt"
+install -m 0644 "${project_root}/extern/libdatachannel/deps/libjuice/LICENSE" "${notices}/LIBJUICE-LICENSE.txt"
+install -m 0644 "${project_root}/extern/libdatachannel/deps/usrsctp/LICENSE.md" "${notices}/USRSCTP-LICENSE.txt"
+install -m 0644 "${project_root}/extern/libdatachannel/deps/json/LICENSE.MIT" "${notices}/NLOHMANN-JSON-LICENSE.txt"
+install -m 0644 "${project_root}/extern/libdatachannel/deps/plog/LICENSE" "${notices}/PLOG-LICENSE.txt"
 
 # Generate a native icon from the approved DKR-R artwork when the standard
 # macOS image utilities are available. The app remains valid without it.

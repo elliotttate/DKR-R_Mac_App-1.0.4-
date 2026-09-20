@@ -14,6 +14,8 @@ int main() {
     assert(Racers == 0x8011B464U);
     assert(RaceStartTimer == 0x8011DAC0U);
     assert(TextureCache == 0x801268C8U);
+    assert(HudDisplayList == 0x801272BCU);
+    assert(HudColour == 0x800E2DB4U);
     assert(IsInTracksMenu == 0x800E0EFCU);
     assert(GameMode == 0x80123A6CU);
     assert(MenuStage == 0x80126980U);
@@ -28,6 +30,8 @@ int main() {
     assert(Racers == 0x8011AEE4U);
     assert(RaceStartTimer == 0x8011D540U);
     assert(TextureCache == 0x80126328U);
+    assert(HudDisplayList == 0x80126CFCU);
+    assert(HudColour == 0x800E2834U);
     assert(IsInTracksMenu == 0x800E097CU);
     assert(GameMode == 0x801234ECU);
     assert(MenuStage == 0x801263E0U);

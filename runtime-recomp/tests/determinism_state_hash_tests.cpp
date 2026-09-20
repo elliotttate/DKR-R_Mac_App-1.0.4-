@@ -306,6 +306,57 @@ int main() {
     constexpr std::uint32_t snapshot_frame = 777U;
     assert(capture_authoritative_state(first.data(), first.size(),
                                        snapshot_frame, snapshot, error));
+    // Debt reduction must not bypass the retail finish/roster/actor lifecycle.
+    // All rejected installations preserve the entire emulated memory image.
+    auto catch_up_target = first;
+    write_word(catch_up_target, CurrentRngSeed, 0xDEADBEEFU);
+    assert(apply_catch_up_authoritative_state(
+        catch_up_target.data(), catch_up_target.size(), snapshot,
+        snapshot_frame, error));
+    assert(catch_up_target == first);
+    for (const auto address : {IsInRace, TracksMode, NumberOfActivePlayers,
+                               ActiveMagicCodes, PathUpdateOff,
+                               RaceFinishTriggered, NumberOfFinishedRacers}) {
+        auto lifecycle_host = first;
+        write_word(lifecycle_host, address, 123U);
+        std::vector<std::uint8_t> lifecycle_snapshot;
+        assert(capture_authoritative_state(
+            lifecycle_host.data(), lifecycle_host.size(), snapshot_frame,
+            lifecycle_snapshot, error));
+        catch_up_target = first;
+        assert(!apply_catch_up_authoritative_state(
+            catch_up_target.data(), catch_up_target.size(), lifecycle_snapshot,
+            snapshot_frame, error));
+        assert(catch_up_target == first);
+    }
+    for (const bool timer : {false, true}) {
+        catch_up_target = first;
+        if (timer) write_half(catch_up_target, RaceEndTimer, 1U);
+        else write_byte(catch_up_target, RaceEndStage, 1U);
+        const auto before = catch_up_target;
+        assert(!apply_catch_up_authoritative_state(
+            catch_up_target.data(), catch_up_target.size(), snapshot,
+            snapshot_frame, error));
+        assert(catch_up_target == before);
+    }
+    catch_up_target = first;
+    write_byte(catch_up_target, PlayerIdMap, 3U);
+    const auto before_roster = catch_up_target;
+    assert(!apply_catch_up_authoritative_state(
+        catch_up_target.data(), catch_up_target.size(), snapshot,
+        snapshot_frame, error));
+    assert(catch_up_target == before_roster);
+    auto retired_actor_host = first;
+    write_word(retired_actor_host, ObjectCount, 0U);
+    std::vector<std::uint8_t> retired_actor_snapshot;
+    assert(capture_authoritative_state(
+        retired_actor_host.data(), retired_actor_host.size(), snapshot_frame,
+        retired_actor_snapshot, error));
+    catch_up_target = first;
+    assert(!apply_catch_up_authoritative_state(
+        catch_up_target.data(), catch_up_target.size(), retired_actor_snapshot,
+        snapshot_frame, error));
+    assert(catch_up_target == first);
     std::vector<std::uint8_t> target = first;
     // Logical track actors may be allocated at different RDRAM addresses on
     // another process/platform. Recovery must resolve the immutable map-entry
@@ -360,6 +411,29 @@ int main() {
     assert(!apply_authoritative_state(target.data(), target.size(), snapshot,
                                       snapshot_frame, error));
     assert(target == before_bad_pointer);
+
+    // The existing portable codec already supports a legitimate empty racer
+    // roster. Prove the cinematic baseline does not dereference the old racer
+    // array, and remains transactional when returning to a populated hub.
+    auto cinematic_host = first;
+    auto cinematic_client = first;
+    write_word(cinematic_host, NumberOfRacers, 0U);
+    write_word(cinematic_client, NumberOfRacers, 0U);
+    write_word(cinematic_host, Racers, 0U);
+    write_word(cinematic_client, Racers, 0U);
+    write_word(cinematic_client, CurrentRngSeed, 0xBADC0DEU);
+    std::vector<std::uint8_t> cinematic_snapshot, cinematic_installed;
+    assert(capture_authoritative_state(cinematic_host.data(), cinematic_host.size(),
+                                       0U, cinematic_snapshot, error));
+    assert(apply_authoritative_state(cinematic_client.data(), cinematic_client.size(),
+                                     cinematic_snapshot, 0U, error));
+    assert(capture_authoritative_state(cinematic_client.data(), cinematic_client.size(),
+                                       0U, cinematic_installed, error));
+    assert(cinematic_installed == cinematic_snapshot);
+    const auto populated_hub = first;
+    assert(!apply_authoritative_state(first.data(), first.size(),
+                                      cinematic_snapshot, 0U, error));
+    assert(first == populated_hub);
 
     // Procedural water is gameplay state for hovercraft buoyancy. Synchronize
     // its compact phase rather than generated wave vertices: an in-sync live

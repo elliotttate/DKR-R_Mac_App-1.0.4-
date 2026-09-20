@@ -26,9 +26,12 @@ int main() {
     recorder.record(0U, inputs);
     recorder.record(1U, inputs);
     std::string error;
-    assert(recorder.finalize(error));
-    assert(std::filesystem::is_regular_file(recorder.last_path()));
-    assert(std::filesystem::file_size(recorder.last_path()) > 32U);
+    auto detached = recorder.detach();
+    assert(!recorder.active() && detached.active());
+    recorder.begin(room); // a new session cannot mutate the detached recording
+    assert(detached.finalize(error));
+    assert(std::filesystem::is_regular_file(detached.last_path()));
+    assert(std::filesystem::file_size(detached.last_path()) > 32U);
     std::filesystem::remove_all(directory, cleanup_error);
     std::cout << "replay recorder tests passed\n";
 }

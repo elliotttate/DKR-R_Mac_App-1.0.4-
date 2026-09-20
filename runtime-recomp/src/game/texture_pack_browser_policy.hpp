@@ -37,6 +37,7 @@ enum class VisibilityFilter : int {
     Visible = 0,
     All,
     Hidden,
+    TrackPacks,   // only the <track>-hd.zip packs, for auditing
 };
 
 struct Filters {
@@ -73,6 +74,16 @@ inline bool matches(const texture_packs::PackInfo& pack,
         const std::string haystack = lower_ascii(
             pack.name + " " + format_search_text(pack.format));
         if (haystack.find(query) == std::string::npos) return false;
+    }
+    // A pack that shipped with a custom track is filed against that track, not
+    // browsed here. It shows only under the explicit "Track packs" filter; the
+    // ordinary Visible / All / Hidden views never list it.
+    const bool is_track_pack =
+        pack.origin == texture_packs::Origin::TrackPack;
+    if (filters.visibility == VisibilityFilter::TrackPacks) {
+        if (!is_track_pack) return false;
+    } else if (is_track_pack) {
+        return false;
     }
     if (filters.state == StateFilter::Active && !pack.enabled) return false;
     if (filters.state == StateFilter::Inactive && pack.enabled) return false;

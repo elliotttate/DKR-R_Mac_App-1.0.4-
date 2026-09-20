@@ -10,6 +10,18 @@
 using namespace dkr::runtime;
 
 int main() {
+    for (int layout : {0, 1, 2, 3}) {
+        for (int owner = -1; owner <= 4; ++owner) {
+            for (std::size_t element = 0; element < 59; ++element) {
+                const bool expected = layout >= 2 && owner >= 0 && owner < 4 &&
+                    (element < 2 || element == 2 || element == 49);
+                const auto anchor = hud::quadrant_counter_anchor(true, layout, owner, element);
+                assert((anchor != 0) == expected);
+                if (expected) assert(anchor == ((owner & 1) ? hud::kHudAnchorRight : hud::kHudAnchorLeft));
+                assert(hud::quadrant_counter_anchor(false, layout, owner, element) == 0);
+            }
+        }
+    }
     static_assert(hud::kElements.size() == 59);
     static_assert(hud::kSupplementalElements.size() == 2);
     static_assert(hud::clamp_hud_scale(0.1F) == 0.5F);
@@ -227,6 +239,18 @@ int main() {
     static_assert(pak::policy::expose_rumble_pak(true, true));
     static_assert(!pak::policy::expose_rumble_pak(false, true));
     static_assert(!pak::policy::expose_rumble_pak(true, false));
+    // Race-position bounce animates scale away from one. Those immediate
+    // frames must keep the original XLU sentinel, never become OPA draws.
+    for (float scale : {0.5F, 0.75F, 1.0F, 1.01F, 1.25F, 1.5F, 2.0F}) {
+        assert(hud::counter_requires_immediate_texture_draw(scale, 0xFFFFFFFEU) ==
+               (scale == 1.0F));
+        assert(!hud::counter_requires_immediate_texture_draw(scale, 0xFFFFFFFFU));
+        assert(!hud::counter_requires_immediate_texture_draw(scale, 0xFFFFFF80U));
+        assert(!hud::counter_requires_immediate_texture_draw(scale, 0xFFFFFF00U));
+    }
+    // Respect the effective scale when the selected HUD scale is not one.
+    assert(!hud::counter_requires_immediate_texture_draw(1.0F * 1.25F, 0xFFFFFFFEU));
+    assert(hud::counter_requires_immediate_texture_draw(0.5F * 2.0F, 0xFFFFFFFEU));
     std::puts("[test][hud-layout-policy] PASS");
     return 0;
 }

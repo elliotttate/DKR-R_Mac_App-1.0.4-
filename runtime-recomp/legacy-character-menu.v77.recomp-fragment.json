@@ -1,0 +1,240 @@
+{
+  "schema": 1,
+  "revision": "us.v77",
+  "abi": 3,
+  "fields": [
+    {
+      "name": "gActivePlayersArray",
+      "address": "0x801263d4",
+      "size": 4
+    },
+    {
+      "name": "gCharselectStatus",
+      "address": "0x801263dc",
+      "size": 4
+    },
+    {
+      "name": "gPlayersCharacterArray",
+      "address": "0x801263e8",
+      "size": 8
+    },
+    {
+      "name": "gCharacterIdSlots",
+      "address": "0x801263f0",
+      "size": 8
+    },
+    {
+      "name": "gMenuButtons",
+      "address": "0x801267d8",
+      "size": 20
+    },
+    {
+      "name": "gMenuStickX",
+      "address": "0x80126818",
+      "size": 10
+    },
+    {
+      "name": "gMenuStickY",
+      "address": "0x80126830",
+      "size": 10
+    },
+    {
+      "name": "gNumberOfReadyPlayers",
+      "address": "0x800df480",
+      "size": 4
+    },
+    {
+      "name": "gNumberOfActivePlayers",
+      "address": "0x800df4bc",
+      "size": 4
+    },
+    {
+      "name": "gMenuDelay",
+      "address": "0x800df47c",
+      "size": 4
+    },
+    {
+      "name": "sMenuCurrDisplayList",
+      "address": "0x801263a0",
+      "size": 4
+    },
+    {
+      "name": "gCurrCharacterSelectData",
+      "address": "0x801263cc",
+      "size": 4
+    },
+    {
+      "name": "dDialogueBoxBegin",
+      "address": "0x800e3690",
+      "size": 56
+    },
+    {
+      "name": "dDialogueBoxDrawModes",
+      "address": "0x800e36c8",
+      "size": 32
+    },
+    {
+      "name": "gMenuSoundMasks",
+      "address": "0x80126808",
+      "size": 16
+    },
+    {
+      "name": "gMenuCurrentCharacter",
+      "address": "0x801263c0",
+      "size": 4
+    },
+    {
+      "name": "gObjectCount",
+      "address": "0x8011ae5c",
+      "size": 4
+    },
+    {
+      "name": "gFreeListCount",
+      "address": "0x8011aec8",
+      "size": 4
+    }
+  ],
+  "functions": {
+    "menu_character_select_init": {
+      "vram": "0x8008afcc",
+      "size": 576,
+      "sha256": "1d0179092c7d49c0616f193c79a863691754a6186e14c27f2e64edda2081e52d"
+    },
+    "menu_character_select_loop": {
+      "vram": "0x8008bd24",
+      "size": 708,
+      "sha256": "0ed58017e4b0d6a43a77313de07fa44708a49f1461e477c33e55a4ec43ff7155"
+    },
+    "charselect_render_text": {
+      "vram": "0x8008b20c",
+      "size": 332,
+      "sha256": "528842bb4585aac538899f7f5c5cb7481c903821e7ee4b8e6b349e03e0a36c83"
+    },
+    "charselect_free": {
+      "vram": "0x8008c128",
+      "size": 64,
+      "sha256": "c2b40dd85597edce518b89f617e363086dfb227adb67f2f61a4290d649d396e1"
+    },
+    "charselect_assign_ai": {
+      "vram": "0x8008bb3c",
+      "size": 488,
+      "sha256": "439714154c6e642b088683918fdefbc67670220ebfe359d3d312c4636e56dabb"
+    },
+    "charselect_move": {
+      "vram": "0x8008bfe8",
+      "size": 320,
+      "sha256": "f995e65382b48be645c3eb86f44b7f1a452d3656c2bf0f2536530e72a2cd4430"
+    },
+    "obj_loop_char_select": {
+      "vram": "0x8003833c",
+      "size": 980,
+      "sha256": "f1aca15d2844919917cdc61677b15fcf12793f171641286544f582e1765415dc"
+    },
+    "sound_play": {
+      "vram": "0x80001d04",
+      "size": 420,
+      "sha256": "bcab38e3887f719f2c6a52a4976de6cf829d902d50947c3dd40906e6ee5d9bee"
+    }
+  },
+  "hooks": [
+    {
+      "function": "menu_character_select_init",
+      "vram": "0x8008b204",
+      "event": 0,
+      "expectedAt": "0x8008b200",
+      "expected": [
+        "0x8fb40028",
+        "0x3e00008",
+        "0x27bd0030"
+      ]
+    },
+    {
+      "function": "menu_character_select_loop",
+      "vram": "0x8008bd48",
+      "event": 1,
+      "expectedAt": "0x8008bd48",
+      "expected": [
+        "0x3c028012",
+        "0x3c048012",
+        "0x248463e0"
+      ]
+    },
+    {
+      "function": "charselect_render_text",
+      "vram": "0x8008b350",
+      "event": 2,
+      "expectedAt": "0x8008b34c",
+      "expected": [
+        "0x27bd0020",
+        "0x3e00008",
+        "0x0"
+      ]
+    },
+    {
+      "function": "charselect_free",
+      "vram": "0x8008c128",
+      "event": 3,
+      "expectedAt": "0x8008c128",
+      "expected": [
+        "0x27bdffe8",
+        "0xafbf0014",
+        "0x3c04800e"
+      ]
+    },
+    {
+      "function": "charselect_assign_ai",
+      "vram": "0x8008bb3c",
+      "event": 4,
+      "expectedAt": "0x8008bb3c",
+      "expected": [
+        "0x27bdffc8",
+        "0xafbf0034",
+        "0xafb60030"
+      ]
+    },
+    {
+      "function": "charselect_move",
+      "vram": "0x8008bfe8",
+      "event": 5,
+      "expectedAt": "0x8008bfe8",
+      "expected": [
+        "0x27bdffc8",
+        "0xafb6002c",
+        "0xafb40024"
+      ]
+    },
+    {
+      "function": "obj_loop_char_select",
+      "vram": "0x8003833c",
+      "event": 6,
+      "expectedAt": "0x8003833c",
+      "expected": [
+        "0x27bdff88",
+        "0xafbf0024",
+        "0xafb2001c"
+      ]
+    },
+    {
+      "function": "obj_loop_char_select",
+      "vram": "0x80038468",
+      "event": 7,
+      "expectedAt": "0x80038468",
+      "expected": [
+        "0x8fa50070",
+        "0x93a3004f",
+        "0x14450006"
+      ]
+    },
+    {
+      "function": "sound_play",
+      "vram": "0x80001d04",
+      "event": 8,
+      "expectedAt": "0x80001d04",
+      "expected": [
+        "0x3c0f8011",
+        "0x8def5d20",
+        "0x27bdffd8"
+      ]
+    }
+  ]
+}

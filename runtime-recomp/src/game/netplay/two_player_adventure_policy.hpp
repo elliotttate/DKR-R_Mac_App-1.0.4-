@@ -3,6 +3,7 @@
 #include "netplay_pacing_policy.hpp"
 
 #include <cstdint>
+#include <span>
 
 namespace dkr::runtime::netplay {
 
@@ -14,6 +15,38 @@ inline constexpr int kBossRaceType = 8;
 inline constexpr int kChallengeRaceTypeMask = 0x40;
 inline constexpr std::uint32_t kTwoPlayerAdventureRaceRacerCount = 6U;
 inline constexpr std::uint32_t kTwoPlayerAdventureChallengeRacerCount = 4U;
+
+// Retail ASSET_MISC_67 contains ten boss -> introduction pairs. Read the
+// active ROM's table, not guessed map IDs shared across ROM revisions.
+inline constexpr bool boss_introduction_redirect_matches(
+    std::span<const std::uint8_t> pairs, std::uint32_t requested,
+    std::uint32_t resolved) {
+    if (pairs.size() != 20U || requested == resolved) return false;
+    for (std::size_t i = 0; i < pairs.size(); i += 2U) {
+        if (pairs[i] == requested) return pairs[i + 1U] == resolved;
+    }
+    return false;
+}
+
+// level_load redirects hub requests into key-door cinematics before returning
+// to that same hub. These legitimate scenes have zero racer objects. They
+// still require a load/epoch handshake, but must resume on the frontend input
+// timeline, not enable racer validation or masquerade as a playable race.
+inline constexpr bool two_player_adventure_empty_cutscene_ready(
+    bool online_running, bool assigned_ports_released,
+    bool adventure_selected, int requested_race_type,
+    int resolved_race_type, std::uint32_t active_players,
+    std::uint32_t racer_count, std::uint8_t expected_players) {
+    const bool cinematic = resolved_race_type == kCutsceneRaceType1 ||
+                           resolved_race_type == kCutsceneRaceType2;
+    const bool scripted_destination = requested_race_type == kHubWorldRaceType ||
+        requested_race_type == kBossRaceType ||
+        requested_race_type == kCutsceneRaceType1 ||
+        requested_race_type == kCutsceneRaceType2;
+    return online_running && assigned_ports_released && adventure_selected &&
+           expected_players == 2U && active_players == 1U &&
+           racer_count == 0U && cinematic && scripted_destination;
+}
 
 // DKR's JOINTVENTURE mode uses one visible overworld racer and swaps the
 // retail controller-ID table when Player 2 becomes the lead. Online play must
@@ -115,7 +148,8 @@ inline constexpr bool two_player_adventure_boss_topology_ready(
     bool online_running, bool assigned_ports_released,
     bool two_player_adventure, int requested_race_type,
     int resolved_race_type, std::uint32_t active_players,
-    std::uint32_t racer_count, std::uint8_t expected_players) {
+    std::uint32_t racer_count, std::uint8_t expected_players,
+    bool verified_boss_introduction = false) {
     if (!online_running || !assigned_ports_released ||
         !two_player_adventure || requested_race_type != kBossRaceType ||
         expected_players != 2U || active_players != 1U) {
@@ -123,6 +157,11 @@ inline constexpr bool two_player_adventure_boss_topology_ready(
     }
     if (resolved_race_type == kBossRaceType) {
         return racer_count == 2U;
+    }
+    // Boss fly-ins are authored as HUBWORLD in retail. Admit only the exact
+    // redirect from the ROM's boss table and its one-racer shared topology.
+    if (resolved_race_type == kHubWorldRaceType) {
+        return verified_boss_introduction && racer_count == 1U;
     }
     const bool boss_introduction =
         resolved_race_type == kCutsceneRaceType1 ||

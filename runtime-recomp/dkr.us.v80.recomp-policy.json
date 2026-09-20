@@ -81,6 +81,102 @@
   ],
   "functionHooks": [
     {
+      "function": "generate_track",
+      "beforeVram": "0x8002C13C",
+      "text": "extern void dkr_custom_tracks_track_heap(uint8_t*, recomp_context*); dkr_custom_tracks_track_heap(rdram, ctx);",
+      "reason": "The same instruction in generate_track for this revision, at the identical offset from the function's start (0x8002C104 + 0x38); the prologue is instruction-for-instruction the same as US v1.0's. The hook refuses to write unless s5 already holds the retail 0x82A00, so a prologue that differs keeps the retail heap instead."
+    },
+    {
+      "function": "texrect_draw",
+      "beforeVram": "0x80078F08",
+      "text": "extern void dkr_hud_rect_begin(uint8_t*, recomp_context*, int); dkr_hud_rect_begin(rdram, ctx, 0);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "texrect_draw",
+      "beforeVram": "0x80079148",
+      "text": "extern void dkr_hud_rect_end(uint8_t*, recomp_context*); dkr_hud_rect_end(rdram, ctx);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "texrect_draw_scaled",
+      "beforeVram": "0x80079150",
+      "text": "extern void dkr_hud_rect_begin(uint8_t*, recomp_context*, int); dkr_hud_rect_begin(rdram, ctx, 1);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "texrect_draw_scaled",
+      "beforeVram": "0x80079190",
+      "text": "extern void dkr_hud_rect_extent(uint8_t*, recomp_context*); dkr_hud_rect_extent(rdram, ctx);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "texrect_draw_scaled",
+      "beforeVram": "0x8007978C",
+      "text": "extern void dkr_hud_rect_end(uint8_t*, recomp_context*); dkr_hud_rect_end(rdram, ctx);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "draw_text",
+      "beforeVram": "0x800C49A0",
+      "text": "extern void dkr_hud_text_begin(uint8_t*, recomp_context*); dkr_hud_text_begin(rdram, ctx);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "draw_text",
+      "beforeVram": "0x800C4A18",
+      "text": "extern void dkr_hud_text_end(uint8_t*, recomp_context*); dkr_hud_text_end(rdram, ctx);",
+      "reason": "Qualified single/two-player HUD draw boundary: retain retail rectangle alpha/sampling with reversible unsigned-coordinate bias, or scope raw HUD text by independently verified caller identity. Other rendering remains unchanged."
+    },
+    {
+      "function": "hud_race_time",
+      "beforeVram": "0x800A8478",
+      "text": "extern void dkr_hud_timer_select(uint8_t*, recomp_context*, int); dkr_hud_timer_select(rdram, ctx, 0);",
+      "reason": "Tag temporary timer glyphs by the verified HUD caller (race, lap bank or finish), not their stack address. Presentation-only; one/two-player eligibility is guarded in the runtime."
+    },
+    {
+      "function": "hud_race_time",
+      "beforeVram": "0x800A84DC",
+      "text": "extern void dkr_hud_timer_select(uint8_t*, recomp_context*, int); dkr_hud_timer_select(rdram, ctx, 0);",
+      "reason": "Tag temporary timer glyphs by the verified HUD caller (race, lap bank or finish), not their stack address. Presentation-only; one/two-player eligibility is guarded in the runtime."
+    },
+    {
+      "function": "hud_main_time_trial",
+      "beforeVram": "0x800A33B4",
+      "text": "extern void dkr_hud_timer_select(uint8_t*, recomp_context*, int); dkr_hud_timer_select(rdram, ctx, 1);",
+      "reason": "Tag temporary timer glyphs by the verified HUD caller (race, lap bank or finish), not their stack address. Presentation-only; one/two-player eligibility is guarded in the runtime."
+    },
+    {
+      "function": "hud_finish_position",
+      "beforeVram": "0x800A6630",
+      "text": "extern void dkr_hud_timer_select(uint8_t*, recomp_context*, int); dkr_hud_timer_select(rdram, ctx, 2);",
+      "reason": "Tag temporary timer glyphs by the verified HUD caller (race, lap bank or finish), not their stack address. Presentation-only; one/two-player eligibility is guarded in the runtime."
+    },
+    {
+      "function": "hud_finish_position",
+      "beforeVram": "0x800A670C",
+      "text": "extern void dkr_hud_timer_select(uint8_t*, recomp_context*, int); dkr_hud_timer_select(rdram, ctx, 2);",
+      "reason": "Tag temporary timer glyphs by the verified HUD caller (race, lap bank or finish), not their stack address. Presentation-only; one/two-player eligibility is guarded in the runtime."
+    },
+    {
+      "function": "hud_timer_render",
+      "beforeVram": "0x800A8908",
+      "text": "extern void dkr_hud_timer_end(uint8_t*, recomp_context*); dkr_hud_timer_end(rdram, ctx);",
+      "reason": "Clear timer widget ownership at the common return so later transient elements cannot inherit a timer group."
+    },
+    {
+      "function": "divider_draw",
+      "beforeVram": "0x800775D8",
+      "text": "extern void dkr_three_player_panel_begin(uint8_t*, recomp_context*); dkr_three_player_panel_begin(rdram, ctx);",
+      "reason": "Cover the complete unused fourth quadrant only after retail selects its black panel; retain the original decision to render a T.T. camera instead."
+    },
+    {
+      "function": "divider_draw",
+      "beforeVram": "0x80077620",
+      "text": "extern void dkr_three_player_panel_end(uint8_t*, recomp_context*); dkr_three_player_panel_end(rdram, ctx);",
+      "reason": "Restore rectangle aspect before divider lines and HUD; no four-player view or counter inherits the background-only stretch."
+    },
+    {
       "function": "render_dialogue_boxes",
       "beforeVram": "0x800C5C5C",
       "text": "extern void dkr_hud_dialogue_pass_begin(uint8_t*, recomp_context*); dkr_hud_dialogue_pass_begin(rdram, ctx);",
@@ -232,12 +328,6 @@
     },
     {
       "function": "initialise_player_viewport_vars",
-      "beforeVram": "0x80028E18",
-      "text": "extern void dkr_presentation_viewport_camera_mode(uint8_t*, recomp_context*); dkr_presentation_viewport_camera_mode(rdram, ctx);",
-      "reason": "Classify every submitted viewport from gSceneActiveCamera->mode after the active camera is established. Fixed challenge/race spectator tasks are excluded from interpolation even while the unrelated post-race viewport flag remains clear."
-    },
-    {
-      "function": "initialise_player_viewport_vars",
       "beforeVram": "0x80028F1C",
       "text": "extern void dkr_anchor_persistent_water_to_camera(uint8_t*, recomp_context*); dkr_anchor_persistent_water_to_camera(rdram, ctx);",
       "reason": "Keep the maximum safe HQ water window centred on the active view when scenery persistence is enabled, while the existing BSP policy preserves all water-bearing level segments at extended distances."
@@ -257,8 +347,20 @@
     {
       "function": "main_game_loop",
       "beforeVram": "0x8006CB4C",
-      "text": "extern void dkr_netplay_authoritative_frame_commit(uint8_t*, recomp_context*); dkr_netplay_authoritative_frame_commit(rdram, ctx);",
-      "reason": "At the common post-mode boundary, capture a complete portable state only when an explicit synchronized recovery checkpoint is due. Ordinary frames are owned exclusively by Player 1's immutable input-commit ledger."
+      "text": "extern void dkr_netplay_authoritative_frame_commit(uint8_t*, recomp_context*); extern void dkr_magic_codes_frame_complete(uint8_t*, recomp_context*); dkr_netplay_authoritative_frame_commit(rdram, ctx); dkr_magic_codes_frame_complete(rdram, ctx);",
+      "reason": "At the common post-mode boundary, retain the existing netplay commit unchanged, then acknowledge only branch-observed native Magic Code actions after the retail mode returns. Replay cannot acknowledge persistent queues."
+    },
+    {
+      "function": "menu_magic_codes_loop",
+      "beforeVram": "0x8008A934",
+      "text": "extern void dkr_magic_code_credits_started(uint8_t*, recomp_context*); dkr_magic_code_credits_started(rdram, ctx);",
+      "reason": "Observe the exclusive WHODIDTHIS branch immediately after native menu_init(MENU_CREDITS) returns. Toggling or clearing a code elsewhere is not completion. No registers or game memory are changed."
+    },
+    {
+      "function": "menu_file_select_loop",
+      "beforeVram": "0x8008E7AC",
+      "text": "extern void dkr_magic_code_balloon_awarded(uint8_t*, recomp_context*); dkr_magic_code_balloon_awarded(rdram, ctx);",
+      "reason": "Observe the exclusive EOLAOBFENRLONE branch before its final balloon-count store. Acknowledge only at the post-mode boundary, after this store executes. Leave native save selection, increment and EEPROM scheduling untouched."
     },
     {
       "function": "main_game_loop",
@@ -279,10 +381,10 @@
       "reason": "Bind each completed world-origin root matrix to the active scene and camera while its Mtx pointer is still available, so terrain, cliffs, foliage and procedural water interpolate as one stable world."
     },
     {
-      "function": "update_player_camera",
-      "beforeVram": "0x80057BB0",
-      "text": "extern void dkr_presentation_finish_camera_enter(uint8_t*, recomp_context*); dkr_presentation_finish_camera_enter(rdram, ctx);",
-      "reason": "Disable semantic interpolation for the complete authored finish-camera task before the retail post-race flag is committed, preventing incompatible spectator display-list topology from pairing while leaving gameplay interpolation untouched."
+      "function": "update_camera_finish_race",
+      "beforeVram": "0x80058E04",
+      "text": "extern void dkr_presentation_finish_camera_node(uint8_t*, recomp_context*); dkr_presentation_finish_camera_node(rdram, ctx);",
+      "reason": "Observe the actual non-null spectator node and owner per camera. Root-matrix recording separates real shot changes, while repeated finish-mode updates retain interpolation; no task-wide finish disable."
     },
     {
       "function": "waves_render",
@@ -527,8 +629,14 @@
     {
       "function": "postrace_start",
       "beforeVram": "0x80094B8C",
-      "text": "extern void dkr_netplay_postrace_barrier(uint8_t*, recomp_context*); dkr_netplay_postrace_barrier(rdram, ctx);",
+      "text": "extern void dkr_netplay_postrace_barrier(uint8_t*, recomp_context*); dkr_netplay_postrace_barrier(rdram, ctx); extern void dkr_postrace_presentation_start(uint8_t*, recomp_context*); dkr_postrace_presentation_start(rdram, ctx);",
       "reason": "Seal the shared finish transition before post-race code compacts racer objects. The already-consumed immutable frame ledger remains the sole race authority; no competing late state snapshot is installed during teardown."
+    },
+    {
+      "function": "postrace_viewport",
+      "beforeVram": "0x80095AF4",
+      "text": "extern void dkr_postrace_wooden_frame_draw(uint8_t*, recomp_context*); dkr_postrace_wooden_frame_draw(rdram, ctx);",
+      "reason": "Observe the actual wooden-frame draw after retail asset/stage gates and viewport updates. Release the full-width world only after its first contracted frame is submitted, placing the 4:3 switch on the second authored zoom frame."
     },
     {
       "function": "race_finish_adventure",
@@ -802,6 +910,42 @@
     },
     {
       "function": "asset_table_load",
+      "beforeVram": "0x80076EE4",
+      "text": "extern void dkr_custom_tracks_table_load_begin(uint8_t*, recomp_context*); dkr_custom_tracks_table_load_begin(rdram, ctx);",
+      "reason": "Record the requested asset section at asset_table_load's entry. The argument register is reused before the epilogue, so the section cannot be recovered later."
+    },
+    {
+      "function": "asset_table_load",
+      "beforeVram": "0x80076FA0",
+      "text": "extern void dkr_custom_tracks_table_load_end(uint8_t*, recomp_context*); dkr_custom_tracks_table_load_end(rdram, ctx);",
+      "reason": "asset_table_load diverges between revisions (symbol_addrs marks it \"has a diff from v1\"), so the offset-translated site landed on the allocation-failure path instead of the common epilogue. 0x80076FA0 is where both paths converge with the result in v0, read from the v1.1 disassembly. At the common epilogue, publish a longer ASSET_LEVEL_HEADERS table when custom tracks are installed. level_global_init counts to the -1 terminator and derives both the retail range check and gNumberOfWorlds from the table, so a longer table adds levels and worlds without patching a single bounds check."
+    },
+    {
+      "function": "asset_load",
+      "beforeVram": "0x80077190",
+      "text": "extern void dkr_custom_tracks_asset_load_begin(uint8_t*, recomp_context*); dkr_custom_tracks_asset_load_begin(rdram, ctx);",
+      "reason": "Capture asset_load's four arguments at entry. dmacopy clobbers the destination register before the DMA path's epilogue is reached."
+    },
+    {
+      "function": "asset_load",
+      "beforeVram": "0x80077214",
+      "text": "extern void dkr_custom_tracks_asset_load_end(uint8_t*, recomp_context*); dkr_custom_tracks_asset_load_end(rdram, ctx);",
+      "reason": "asset_load diverges between revisions and calls dmacopy_v1 rather than dmacopy, so the offset-translated site landed mid index computation. 0x80077214 is the instruction after the DMA and its delay slot, matching the v1.0 hook semantics. Reached only on asset_load's DMA path. Custom level header offsets sit just past the retail section, so the authored DMA has read unrelated but in-ROM bytes; replacing them here serves the mod payload without patching the retail loader."
+    },
+    {
+      "function": "get_track_id_to_load",
+      "beforeVram": "0x8009C760",
+      "text": "extern void dkr_custom_tracks_track_id_override(uint8_t*, recomp_context*); dkr_custom_tracks_track_id_override(rdram, ctx);",
+      "reason": "Common return convergence of get_track_id_to_load. Track Lab replaces the chosen level id here so an author can reach a custom track without walking the retail menus, reusing the same return value that Track Select and Trophy Race already drive through gTrackIdToLoad rather than adding a second selection path."
+    },
+    {
+      "function": "mode_menu",
+      "beforeVram": "0x8006DFB0",
+      "text": "extern void dkr_custom_tracks_auto_boot(uint8_t*, recomp_context*); dkr_custom_tracks_auto_boot(rdram, ctx);",
+      "reason": "Immediately after mode_menu reads menu_loop result, before the MENU_RESULT_FLAGS_200 test. Track Lab auto boot answers with the same value the menus produce when a track is chosen, so retail performs its own start sequence rather than the host reproducing vehicle, entrance, cutscene and game mode by hand."
+    },
+    {
+      "function": "asset_table_load",
       "beforeVram": "0x80076F0C",
       "text": "extern void dkr_v11_asset_mutex_acquire(uint8_t*, recomp_context*); dkr_v11_asset_mutex_acquire(rdram, ctx);",
       "reason": "Preserve Rev A's asset-DMA mutex while handling its common uncontended token receive without the general emulated scheduler path."
@@ -910,90 +1054,6 @@
     }
   ],
   "instructionPatches": [
-    {
-      "function": "asset_table_load",
-      "vram": "0x80076F04",
-      "value": "0x00000000",
-      "reason": "The adjacent Patch Pipeline hook performs Rev A's mutex acquire and invokes the original receive only when contention requires scheduler participation."
-    },
-    {
-      "function": "asset_table_load",
-      "vram": "0x80076F90",
-      "value": "0x00000000",
-      "reason": "The adjacent Patch Pipeline hook performs Rev A's mutex release and invokes the original send only when a waiter must be scheduled."
-    },
-    {
-      "function": "asset_table_load_zipped",
-      "vram": "0x80076FD8",
-      "value": "0x00000000",
-      "reason": "Replace the compressed-loader mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_table_load_zipped",
-      "vram": "0x800770CC",
-      "value": "0x00000000",
-      "reason": "Replace the compressed-loader mutex send call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_table_load_addr",
-      "vram": "0x8007710C",
-      "value": "0x00000000",
-      "reason": "Replace the fixed-address loader mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_table_load_addr",
-      "vram": "0x80077170",
-      "value": "0x00000000",
-      "reason": "Replace the fixed-address loader mutex send call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_load",
-      "vram": "0x800771B8",
-      "value": "0x00000000",
-      "reason": "Replace the partial-asset loader mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_load",
-      "vram": "0x80077220",
-      "value": "0x00000000",
-      "reason": "Replace the partial-asset loader mutex send call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_rom_offset",
-      "vram": "0x80077264",
-      "value": "0x00000000",
-      "reason": "Replace the asset-offset lookup mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_rom_offset",
-      "vram": "0x800772B4",
-      "value": "0x00000000",
-      "reason": "Replace the asset-offset lookup mutex send call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_table_size",
-      "vram": "0x800772FC",
-      "value": "0x00000000",
-      "reason": "Replace the asset-size lookup mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "asset_table_size",
-      "vram": "0x80077340",
-      "value": "0x00000000",
-      "reason": "Replace the asset-size lookup mutex send call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "dmacopy",
-      "vram": "0x80077394",
-      "value": "0x00000000",
-      "reason": "Replace the raw-ROM-copy mutex receive call with the contention-safe native hook at the same instruction."
-    },
-    {
-      "function": "dmacopy",
-      "vram": "0x800773BC",
-      "value": "0x00000000",
-      "reason": "Replace the raw-ROM-copy mutex send call with the contention-safe native hook at the same instruction."
-    },
     {
       "function": "load_texture",
       "vram": "0x8007B3E8",
@@ -1113,6 +1173,90 @@
       "vram": "0x8006F734",
       "value": "0x00000000",
       "reason": "Use a safe no-op return delay slot for the virtualized CIC probe."
+    },
+    {
+      "function": "asset_table_load",
+      "vram": "0x80076F04",
+      "value": "0x00000000",
+      "reason": "The adjacent Patch Pipeline hook performs Rev A's mutex acquire and invokes the original receive only when contention requires scheduler participation."
+    },
+    {
+      "function": "asset_table_load",
+      "vram": "0x80076F90",
+      "value": "0x00000000",
+      "reason": "The adjacent Patch Pipeline hook performs Rev A's mutex release and invokes the original send only when a waiter must be scheduled."
+    },
+    {
+      "function": "asset_table_load_zipped",
+      "vram": "0x80076FD8",
+      "value": "0x00000000",
+      "reason": "Replace the compressed-loader mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_table_load_zipped",
+      "vram": "0x800770CC",
+      "value": "0x00000000",
+      "reason": "Replace the compressed-loader mutex send call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_table_load_addr",
+      "vram": "0x8007710C",
+      "value": "0x00000000",
+      "reason": "Replace the fixed-address loader mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_table_load_addr",
+      "vram": "0x80077170",
+      "value": "0x00000000",
+      "reason": "Replace the fixed-address loader mutex send call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_load",
+      "vram": "0x800771B8",
+      "value": "0x00000000",
+      "reason": "Replace the partial-asset loader mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_load",
+      "vram": "0x80077220",
+      "value": "0x00000000",
+      "reason": "Replace the partial-asset loader mutex send call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_rom_offset",
+      "vram": "0x80077264",
+      "value": "0x00000000",
+      "reason": "Replace the asset-offset lookup mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_rom_offset",
+      "vram": "0x800772B4",
+      "value": "0x00000000",
+      "reason": "Replace the asset-offset lookup mutex send call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_table_size",
+      "vram": "0x800772FC",
+      "value": "0x00000000",
+      "reason": "Replace the asset-size lookup mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "asset_table_size",
+      "vram": "0x80077340",
+      "value": "0x00000000",
+      "reason": "Replace the asset-size lookup mutex send call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "dmacopy",
+      "vram": "0x80077394",
+      "value": "0x00000000",
+      "reason": "Replace the raw-ROM-copy mutex receive call with the contention-safe native hook at the same instruction."
+    },
+    {
+      "function": "dmacopy",
+      "vram": "0x800773BC",
+      "value": "0x00000000",
+      "reason": "Replace the raw-ROM-copy mutex send call with the contention-safe native hook at the same instruction."
     }
   ],
   "ignored": [

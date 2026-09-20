@@ -32,6 +32,7 @@ public:
         if (previous != reason) {
             generation_.fetch_add(1U, std::memory_order_acq_rel);
         }
+        if (previous == OnlineWaitReason::None) episode_.fetch_add(1U, std::memory_order_acq_rel);
     }
 
     void leave() {
@@ -53,10 +54,13 @@ public:
     [[nodiscard]] std::uint64_t generation() const {
         return generation_.load(std::memory_order_acquire);
     }
+    // Reason changes repaint, but do not restart a continuous wait's debounce.
+    [[nodiscard]] std::uint64_t episode() const { return episode_.load(std::memory_order_acquire); }
 
 private:
     std::atomic<OnlineWaitReason> reason_{OnlineWaitReason::None};
     std::atomic<std::uint64_t> generation_{0U};
+    std::atomic<std::uint64_t> episode_{0U};
 };
 
 } // namespace dkr::runtime::netplay

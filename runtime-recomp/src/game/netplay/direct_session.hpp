@@ -1,11 +1,13 @@
 #pragma once
 
+#include "../atomic_shared_ptr.hpp"
 #include "datagram_socket.hpp"
 #include "session_transport.hpp"
 #include "netplay_lobby.hpp"
 #include "netplay_protocol.hpp"
 #include "netplay_timeline.hpp"
 #include "replay_recorder.hpp"
+#include "social_executor.hpp"
 #include "sequence_window.hpp"
 #include "secure_channel.hpp"
 
@@ -17,6 +19,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -110,6 +113,12 @@ struct SessionView {
     std::uint64_t commit_repair_requests_received = 0U;
     std::uint64_t commit_repair_batches_sent = 0U;
     std::uint64_t late_inputs_discarded = 0U;
+    std::uint64_t refreshed_input_samples = 0U;
+    std::uint64_t stale_input_revisions = 0U;
+    std::uint64_t prediction_limit_waits = 0U;
+    std::uint32_t local_input_echo_ms = 0U;
+    std::uint32_t local_input_consume_ms = 0U;
+    std::uint64_t measured_input_echoes = 0U;
     std::uint64_t live_replica_requests_sent = 0U;
     std::uint64_t live_replica_request_misses = 0U;
     std::uint64_t live_replica_window_rejections = 0U;
@@ -147,6 +156,12 @@ struct SessionView {
     bool local_online_save_ready = false;
     std::array<bool, kMaximumPlayers> online_save_ready{};
     std::vector<PendingJoinView> pending_joins;
+    std::size_t checkpoint_transport_buffered_bytes = 0U;
+    std::size_t pending_outbound_bytes = 0U;
+    std::uint32_t oldest_outbound_age_ms = 0U;
+    std::uint64_t duplicate_retries_coalesced = 0U;
+    std::uint64_t checkpoint_encoding_cache_hits = 0U;
+    std::uint64_t maximum_network_pump_us = 0U;
 };
 
 struct RuntimeSessionView {
@@ -257,6 +272,13 @@ public:
     // session cursor moves.
     bool fast_forward_authoritative_commits(
         std::uint32_t next_frame, std::string& error);
+    // Pins epoch/ledger across a transactional game-thread installer. The
+    // installer must not call DirectSession; Pending never calls it.
+    SessionPollResult install_fast_forward(
+        std::uint32_t next_frame, const std::function<bool()>& installer,
+        std::string& error);
+    std::optional<std::uint32_t> native_completed_frame() const;
+    std::uint64_t synchronization_progress() const;
     // Records a frame only after the retail game loop has returned. Guests
     // send this authenticated latest-wins watermark to Player 1; the host can
     // then pause before a short local hitch becomes unbounded simulation debt.
@@ -362,6 +384,9 @@ public:
                                       std::string& error);
 
     SessionView view() const;
+    // UI-only, immutable worker publication: never waits on session/SDK locks.
+    SessionView presentation_view() const;
+    bool presentation_active() const;
     RuntimeSessionView runtime_view() const;
     std::optional<LaunchDescriptor> launch_descriptor() const;
     bool active() const;
@@ -369,6 +394,7 @@ public:
 
 private:
     friend struct DirectSessionTestAccess;
+    SessionView view_locked() const;
     enum class RecoveryStage : std::uint8_t {
         Idle,
         Scheduled,
@@ -393,12 +419,12 @@ private:
         std::uint64_t next_sequence = 1U;
         std::chrono::steady_clock::time_point last_ping{};
         std::uint64_t ping_token = 0U;
+        std::array<std::uint64_t, 4U> pending_ping_tokens{};
         std::uint32_t pings_sent = 0U;
         std::uint32_t pings_received = 0U;
         double rtt_ms = 0.0;
         double jitter_ms = 0.0;
         float loss_percent = 0.0F;
-        bool ping_outstanding = false;
         bool requires_save_sync = false;
         bool online_save_ready = false;
         std::array<double, 32U> rtt_samples{};
@@ -471,6 +497,8 @@ private:
         protocol::MessageType type = protocol::MessageType::Ping;
         std::uint32_t frame = 0U;
         std::vector<std::uint8_t> bytes;
+        std::vector<std::uint8_t> retry_identity;
+        std::chrono::steady_clock::time_point enqueued = std::chrono::steady_clock::now();
     };
 
     struct TransitionBarrierState {
@@ -505,6 +533,22 @@ private:
         std::chrono::steady_clock::time_point deadline{};
     };
 
+    // Completion belongs to the authenticated session, not to native objects
+    // which may already have been destroyed by level teardown.
+    struct CompletedRelease {
+        protocol::MessageType type{};
+        std::uint32_t epoch = 0U;
+        std::uint32_t boundary = 0U; // map for Go; frame for other releases
+        std::uint32_t detail = 0U;   // racer count / transition kind
+        std::array<std::uint64_t, kMaximumPlayers> recipients{};
+        std::chrono::steady_clock::time_point expires{};
+    };
+    void remember_release_locked(protocol::MessageType type,
+        std::uint32_t epoch, std::uint32_t boundary, std::uint32_t detail);
+    bool completed_release_locked(protocol::MessageType type,
+        std::uint32_t epoch, std::uint32_t boundary, std::uint32_t detail,
+        std::uint64_t recipient = 0U);
+
     bool parse_invite(std::string_view invite, PeerAddress& address,
                       std::uint64_t& match_id, std::uint64_t& host_sender_id,
                       ConnectionMethod& method,
@@ -527,11 +571,13 @@ private:
                    std::uint32_t frame = 0U);
     void pump_locked();
     void network_loop();
+    void queue_diagnostics_locked(std::string_view reason = {});
     void flush_outbound_locked();
     bool enqueue_outbound(PeerAddress destination,
                           protocol::MessageType type,
                           std::vector<std::uint8_t> bytes,
-                          std::uint32_t frame = 0U);
+                          std::uint32_t frame = 0U,
+                          std::vector<std::uint8_t> retry_identity = {});
     void handle_packet(const PeerAddress& source, std::uint64_t sender_id,
                        const protocol::Datagram& packet);
     void handle_host_packet(const PeerAddress& source, std::uint64_t sender_id,
@@ -540,6 +586,7 @@ private:
     void broadcast_lobby();
     protocol::LobbyStatePayload lobby_payload() const;
     void apply_lobby_payload(const protocol::LobbyStatePayload& payload);
+    void apply_online_save_status_locked(const protocol::OnlineSaveStatusPayload& payload);
     bool all_active_players_acknowledged_locked(
         const std::array<bool, kMaximumPlayers>& acknowledgements) const;
     std::chrono::milliseconds launch_control_timeout_locked(
@@ -565,6 +612,7 @@ private:
     bool approve_join_locked(std::uint64_t request_id, std::string& error);
     bool consume_friend_admission_locked(const secure::Key& admission);
     void clear_friend_admissions_locked();
+    void retire_transport_locked();
     void expire_pending_joins();
     std::uint8_t occupied_players() const;
     protocol::InputBatch make_local_history_batch(
@@ -575,6 +623,11 @@ private:
                             std::optional<std::uint32_t> requested_first =
                                 std::nullopt);
     bool ensure_local_input_for_repair_locked(std::uint32_t frame);
+    void clear_input_history_locked();
+    void store_local_input_locked(std::uint32_t frame, PackedInput input,
+                                  bool physical_sample = true);
+    void record_input_latency_locked(const protocol::FrameCommitPayload& commit,
+                                     bool consumed);
     void send_commit_history(std::uint32_t newest_frame,
                              std::size_t history_count);
     void send_commit_history_to_peer(PeerRecord& peer,
@@ -655,6 +708,19 @@ private:
     std::array<std::uint64_t, kMaximumPlayers> bootstrap_hashes_{};
     std::array<bool, kMaximumPlayers> bootstrap_hash_present_{};
     std::deque<std::pair<std::uint32_t, PackedInput>> local_history_;
+    struct LocalInputMetadata {
+        std::uint32_t revision = 1U;
+        std::chrono::steady_clock::time_point sampled_at{};
+    };
+    std::unordered_map<std::uint32_t, LocalInputMetadata> local_input_metadata_;
+    std::array<std::unordered_map<std::uint32_t, std::uint32_t>, kMaximumPlayers>
+        received_input_revisions_;
+    std::uint64_t refreshed_input_samples_ = 0U;
+    std::uint64_t stale_input_revisions_ = 0U;
+    std::uint64_t prediction_limit_waits_ = 0U;
+    std::uint32_t local_input_echo_ms_ = 0U;
+    std::uint32_t local_input_consume_ms_ = 0U;
+    std::uint64_t measured_input_echoes_ = 0U;
     std::unordered_map<std::uint32_t, protocol::FrameCommitPayload>
         frame_commits_;
     std::deque<protocol::FrameCommitPayload> commit_history_;
@@ -696,6 +762,11 @@ private:
     secure::KeyPair client_key_pair_{};
     secure::Key host_public_{};
     secure::Key invitation_capability_{};
+    struct PendingInvitation {
+        secure::Key capability{};
+        secure::KeyPair key_pair{};
+    };
+    std::optional<PendingInvitation> pending_invitation_;
     secure::Key client_friend_admission_{};
     std::array<FriendAdmissionRecord, 16U> friend_admissions_{};
     PeerAddress host_address_{};
@@ -732,16 +803,22 @@ private:
     bool connection_test_draining_ = false;
     std::uint32_t next_connection_test_id_ = 1U;
     std::uint32_t connection_test_id_ = 0U;
+    std::uint32_t terminal_connection_test_id_ = 0U;
+    std::array<std::uint8_t, kMaximumPlayers> connection_test_result_acks_{};
+    std::chrono::steady_clock::time_point connection_test_result_retry_until_{};
+    std::chrono::steady_clock::time_point connection_test_result_last_send_{};
+    std::chrono::steady_clock::time_point last_admission_response_{};
     std::uint32_t connection_test_result_generation_ = 0U;
     std::chrono::steady_clock::time_point connection_test_started_{};
     std::chrono::steady_clock::time_point connection_test_measurement_end_{};
     std::chrono::steady_clock::time_point connection_test_drain_end_{};
-    std::array<std::chrono::steady_clock::time_point, 4U>
+    std::array<std::chrono::steady_clock::time_point, 5U>
         connection_test_last_send_{};
-    std::array<std::uint32_t, 4U> connection_test_next_sequence_{};
-    std::array<std::uint32_t, 4U> connection_test_sent_{};
-    std::array<std::uint32_t, 4U> connection_test_received_{};
-    std::array<std::vector<double>, 4U> connection_test_rtt_samples_{};
+    std::array<std::uint32_t, 5U> connection_test_next_sequence_{};
+    std::array<std::array<std::uint32_t, 5U>, kMaximumPlayers> connection_test_sent_{};
+    std::array<std::array<std::uint32_t, 5U>, kMaximumPlayers> connection_test_received_{};
+    std::array<std::array<std::vector<double>, 5U>, kMaximumPlayers> connection_test_rtt_samples_{};
+    std::array<std::array<std::unordered_set<std::uint32_t>, 5U>, kMaximumPlayers> connection_test_echoes_{};
     std::uint64_t connection_test_queue_failures_at_start_ = 0U;
     std::array<ConnectionTestResultView, kMaximumPlayers>
         connection_test_results_{};
@@ -775,6 +852,7 @@ private:
     // client back after it has already adopted the current race identity.
     std::uint32_t last_host_scene_epoch_ = 0U;
     std::optional<std::uint32_t> recovery_frame_;
+    std::optional<std::uint32_t> native_completed_frame_;
     std::optional<std::uint32_t> completed_recovery_frame_;
     std::uint32_t completed_recovery_epoch_ = 0U;
     std::array<bool, kMaximumPlayers> recovery_acks_{};
@@ -782,6 +860,17 @@ private:
     std::chrono::steady_clock::time_point last_recovery_broadcast_{};
     std::chrono::steady_clock::time_point recovery_resume_until_{};
     std::optional<TransitionBarrierState> transition_barrier_;
+    std::deque<CompletedRelease> completed_releases_;
+    struct CheckpointEncoding {
+        std::uint32_t epoch = 0U;
+        std::uint32_t frame = 0U;
+        std::vector<std::uint8_t> source;
+        std::vector<std::uint8_t> wire;
+    };
+    std::optional<CheckpointEncoding> checkpoint_encoding_;
+    std::uint64_t duplicate_retries_coalesced_ = 0U;
+    std::uint64_t checkpoint_encoding_cache_hits_ = 0U;
+    std::uint64_t maximum_network_pump_us_ = 0U;
     std::chrono::steady_clock::time_point last_transition_broadcast_{};
     std::chrono::steady_clock::time_point transition_resume_until_{};
     std::optional<GameplayBarrierState> gameplay_barrier_;
@@ -807,12 +896,19 @@ private:
     std::chrono::steady_clock::time_point last_failure_broadcast_{};
     std::vector<std::uint8_t> failure_payload_;
     ReplayRecorder replay_;
+    SocialExecutor replay_writer_;
+    SocialExecutor transport_closer_;
+    bool transport_closer_started_ = false;
+    bool replay_writer_started_ = false;
+    std::vector<std::future<std::string>> replay_writes_;
+    std::string replay_write_error_;
     std::filesystem::path artifact_directory_;
     std::vector<std::uint8_t> session_save_;
     SaveInstaller save_installer_;
     std::uint32_t session_save_generation_ = 0U;
     bool local_online_save_ready_ = false;
     bool local_online_save_acknowledged_ = false;
+    std::optional<protocol::OnlineSaveStatusPayload> online_save_status_;
     std::uint64_t local_runtime_save_hash_ = 0U;
     std::uint32_t local_runtime_save_generation_ = 0U;
     std::array<std::uint64_t, kMaximumPlayers> runtime_save_hashes_{};
@@ -908,6 +1004,8 @@ private:
     // previous ordering as a startup race in DatagramSocket::is_open().
     std::atomic<bool> worker_stop_{false};
     bool worker_wake_ = false;
+    dkr::AtomicSharedPtr<const SessionView> presentation_view_;
+    std::chrono::steady_clock::time_point last_view_publication_{};
     std::thread network_worker_;
 };
 

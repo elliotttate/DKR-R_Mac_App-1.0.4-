@@ -7,7 +7,8 @@
 
 namespace dkr::runtime::hud {
 
-enum class LayoutMode { Original, SafeArea, FitToViewport };
+// Legacy numeric values are persistent: SafeArea must never become Custom.
+enum class LayoutMode { Original, SafeArea, FitToViewport, Custom };
 enum class Anchor { TopLeft, TopCentre, TopRight, Centre, BottomLeft, BottomCentre, BottomRight };
 enum class Group { Race, Inventory, Timing, Minimap, Message, Challenge, Speedometer };
 // DKR composes most visible HUD widgets from several independent HudElement
@@ -46,6 +47,32 @@ enum class ViewportClass { FullWidth, Quadrant };
 
 inline constexpr float kOriginalHudAspect = 4.0F / 3.0F;
 inline constexpr float kHudViewportCoverQuantisation = 1024.0F;
+// HudPass variants: zero is the ordinary clip-only pass. Counter variants
+// select an outer-edge rectangle origin without changing authored geometry.
+inline constexpr std::uint8_t kHudAnchorLeft = 1U;
+inline constexpr std::uint8_t kHudAnchorRight = 2U;
+
+constexpr bool quadrant_item_element(std::size_t element) {
+    return element == 2U || element == 49U; // weapon icon and quantity sprite
+}
+
+constexpr bool counter_requires_immediate_texture_draw(float draw_scale,
+                                                       std::uint32_t colour) {
+    // Only scale==1 uses hud_element_render's deferred texture batch. Scaled
+    // animation frames already draw immediately and NEED alpha 254 to select
+    // texrect_draw_scaled's XLU path. Alpha 255 selects OPA and exposes the
+    // transparent texture background. Preserve all other colours/scales.
+    return draw_scale == 1.0F && colour == 0xFFFFFFFEU;
+}
+
+constexpr std::uint8_t quadrant_counter_anchor(bool expanded_modern,
+                                              int layout, int player,
+                                              std::size_t element) {
+    if (!expanded_modern || (layout != 2 && layout != 3) ||
+        player < 0 || player >= 4 ||
+        (element > 1U && !quadrant_item_element(element))) return 0U;
+    return (player & 1) ? kHudAnchorRight : kHudAnchorLeft;
+}
 
 struct ElementDefinition {
     std::string_view id;

@@ -2,16 +2,23 @@
 #include "revision_addresses.hpp"
 #include "null_renderer.hpp"
 #include "rev_a_asset_mutex.hpp"
+#include "runtime_magic_codes.hpp"
 #include "runtime_platform.hpp"
 #include "runtime_netplay.hpp"
 #include "runtime_support.hpp"
 #include "save_manager.hpp"
 #include "startup_performance.hpp"
 #include "virtual_pak.hpp"
+#include "runtime_legacy_mods.hpp"
+#if DKR_LEGACY_QUALIFICATION
+#include "legacy_runtime_qualification.hpp"
+#endif
 #if DKR_RUNTIME_HAS_RT64
+#include "custom_tracks.hpp"
 #include "rt64_renderer.hpp"
 #include "runtime_texture_packs.hpp"
 #include "runtime_ui.hpp"
+#include "runtime_hud_layout.hpp"
 #include <SDL.h>
 #endif
 
@@ -476,6 +483,11 @@ int DkrMain(int argc, char** argv) {
     }
 
 #if DKR_RUNTIME_HAS_RT64
+    if (argc >= 3 && std::string_view(argv[1]) == "--self-test-hud-settings") {
+        const bool passed = dkr::runtime::hud::self_test_basic_settings(std::filesystem::u8path(argv[2]));
+        std::fprintf(stderr,"[test][hud-settings] %s: preset switching, restart, custom suppression and save failure\n",passed?"PASS":"FAILED");
+        return passed ? 0 : 1;
+    }
     if (argc >= 2 &&
         std::string_view(argv[1]) == "--self-test-input-switch") {
         const std::filesystem::path test_directory = argc >= 3
@@ -609,6 +621,7 @@ int DkrMain(int argc, char** argv) {
         return 2;
     }
     std::filesystem::path& rom_path = launch.rom_path;
+    std::shared_ptr<const dkr::mods::PreparedModLaunch> prepared_mods;
     const std::filesystem::path& config_directory = launch.config_directory;
     const unsigned timeout_seconds = launch.timeout_seconds;
     std::filesystem::create_directories(config_directory);
@@ -665,6 +678,18 @@ int DkrMain(int argc, char** argv) {
         dkr::runtime::pak::configure(config_directory);
         dkr::runtime::saves::configure(config_directory);
         dkr::runtime::platform::configure_input(config_directory);
+#if DKR_RUNTIME_HAS_RT64
+        // Custom tracks are user content beside the other imported assets, so
+        // they live in the configuration directory rather than next to the
+        // executable. Scanning here keeps the registry populated before the
+        // first asset table load reaches the Patch Pipeline hooks.
+        //
+        // Deliberately not "mods": librecomp owns that directory for its own
+        // .nrm mod format and reports "Mod is missing a mod.json" for anything
+        // else it finds there, which would surface as an error for every user
+        // who installs a track.
+        dkr::runtime::custom_tracks::scan(config_directory / "custom-tracks");
+#endif
     }
 
     {
@@ -724,6 +749,7 @@ int DkrMain(int argc, char** argv) {
             return 0;
         }
         rom_path = startup.rom_path;
+        prepared_mods = startup.mods;
         rom_identified = false;
     }
 #else
@@ -855,8 +881,47 @@ int DkrMain(int argc, char** argv) {
         }
         dkr::runtime::startup_performance::mark("runtime-rom-selected");
 
+        // The application can return to its launcher and start another fresh
+        // emulated DKR session without restarting the process. Reset only the
+        // per-session Magic Code state before the new RDRAM is created.
+        // A lobby's accepted manifest, not later overlay preferences, owns
+        // the simulation selection on every peer.
+        std::optional<std::uint32_t> online_magic_codes;
+        if (dkr::runtime::netplay::session().active()) {
+            online_magic_codes = static_cast<std::uint32_t>(
+                dkr::runtime::netplay::session().view().room.manifest.magic_codes_hash);
+        }
+        dkr::runtime::magic_codes::begin_game_session(online_magic_codes);
         dkr::runtime::netplay::reset_runtime_state();
         dkr::runtime::rev_a_asset_mutex::reset_statistics();
+        dkr::runtime::legacy::begin_session(nullptr);
+        try {
+            // Launcher preparation already ran on a worker with a progress
+            // modal. Explicit command-line launches validate here instead.
+            if(!prepared_mods)prepared_mods=dkr::mods::prepare_mod_launch(config_directory,rom_path,
+                dkr::runtime::netplay::session().active(),[](const char* stage){std::fprintf(stderr,"[legacy][launch] %s\n",stage);});
+            if(prepared_mods->session && dkr::runtime::netplay::session().active())
+                throw dkr::mods::Error("Offline custom assets cannot enter an online runtime.");
+            dkr::runtime::legacy::begin_prepared(prepared_mods);
+            dkr::runtime::pak::begin_session_directory(prepared_mods->pak_directory);
+        } catch(const std::exception& error) {
+            std::fprintf(stderr,"[legacy][launch] %s\n",error.what());
+            dkr::runtime::platform::shutdown();return 4;
+        }
+#if DKR_LEGACY_QUALIFICATION
+        if (const char* recipe = std::getenv("DKR_LEGACY_QUALIFICATION_RECIPE")) {
+            if (dkr::runtime::netplay::session().active()) {
+                std::fprintf(stderr, "[legacy][qualification] Refusing to modify an online session.\n");
+                return 4;
+            }
+            try {
+                dkr::runtime::legacy::configure_qualification(rom_path, std::filesystem::u8path(recipe));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[legacy][qualification] preparation failed: %s\n", error.what());
+                return 4;
+            }
+        }
+#endif
         std::fprintf(stderr,
                      "[boot] runtime initialized; waiting for first safe VI state\n");
         std::atomic<bool> runtime_finished{false};
@@ -901,6 +966,10 @@ int DkrMain(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         runtime_thread.join();
+        dkr::runtime::pak::begin_session_directory({});
+        prepared_mods.reset();
+        const auto mod_failure=dkr::runtime::legacy::failure();
+        dkr::runtime::legacy::begin_session(nullptr);
         if (registered_revision == dkr::runtime::rom::Revision::UsV80) {
             const auto mutex_stats =
                 dkr::runtime::rev_a_asset_mutex::statistics();
@@ -930,7 +999,8 @@ int DkrMain(int argc, char** argv) {
             return 5;
         }
 #if DKR_RUNTIME_HAS_RT64
-        if (lifecycle_request == dkr::runtime::ui::LifecycleRequest::StopGame) {
+        if (lifecycle_request == dkr::runtime::ui::LifecycleRequest::StopGame || !mod_failure.empty()) {
+            if(!mod_failure.empty())dkr::runtime::ui::report_mod_error("Custom content stopped safely: "+mod_failure);
             std::fprintf(stderr,
                          "[boot][stop] game stopped; returning to launcher\n");
             dkr::runtime::ui::reset_lifecycle_request();
@@ -967,6 +1037,7 @@ int DkrMain(int argc, char** argv) {
                 return RelaunchApplication(argc, argv) ? 0 : 6;
             }
             rom_path = std::move(next_rom_path);
+            prepared_mods = startup.mods;
             rom_identity = next_identity;
             std::fprintf(stderr,
                          "[boot][start] launching a new game session\n");

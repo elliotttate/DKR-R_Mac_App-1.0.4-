@@ -49,5 +49,7 @@ float texture_lod_bias();
 float effective_texture_lod_bias();
 int texture_lod_bias_hundredths();
 void set_texture_lod_bias_hundredths(int bias);
+bool generated_mipmaps_requested();
+void set_generated_mipmaps_requested(bool enabled);
 
 } // namespace dkr::runtime::enhancements

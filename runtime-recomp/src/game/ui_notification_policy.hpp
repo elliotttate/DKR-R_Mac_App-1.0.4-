@@ -28,12 +28,26 @@ public:
     explicit Queue(std::size_t capacity = 8U)
         : capacity_(std::max<std::size_t>(capacity, 1U)) {}
 
-    void push(Kind kind, std::string title, std::string message,
+    bool push(Kind kind, std::string title, std::string message,
               std::chrono::steady_clock::time_point now) {
-        if (message.empty()) return;
-        if (toasts_.size() >= capacity_) toasts_.pop_back();
+        if (message.empty()) return false;
+        discard_expired(now);
+        if (toasts_.size() >= capacity_) {
+            // Never evict an actionable invitation for background presence.
+            // Leave the displayed toast intact; coalesce queued presence bursts.
+            const auto presence = std::find_if(std::next(toasts_.begin()), toasts_.end(),
+                [](const Toast& toast) { return toast.kind == Kind::FriendOnline; });
+            if (presence == toasts_.end()) return false;
+            if (kind == Kind::FriendOnline) {
+                presence->title = "FRIENDS ONLINE";
+                presence->message = "Several friends are online. Open FRIENDS to see who is available.";
+                return true;
+            }
+            toasts_.erase(presence);
+        }
         toasts_.push_back(
             {kind, std::move(title), std::move(message), now});
+        return true;
     }
 
     const Toast* current(std::chrono::steady_clock::time_point now) {

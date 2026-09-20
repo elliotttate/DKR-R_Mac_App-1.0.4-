@@ -1,12 +1,18 @@
 #include "f3ddkr_rt64.hpp"
 #include "terrain_detail.hpp"
+#include "postrace_viewport_rt64.hpp"
 
 #include "interpolation_state_policy.hpp"
 #include "hud_layout_policy.hpp"
+#include "hud_group_rt64.hpp"
+#include "hud_rectangle_layout.hpp"
+#include "hud_projection_rt64.hpp"
+#include "hud_reference_layout.hpp"
 #include "presentation_identity.hpp"
 #include "revision_addresses.hpp"
 #include "runtime_enhancements.hpp"
 #include "widescreen_policy.hpp"
+#include "split_screen_rt64.hpp"
 
 #include "gbi/rt64_f3d.h"
 #include "gbi/rt64_gbi_f3d.h"
@@ -67,13 +73,9 @@ constexpr std::uint32_t kPresentationGroupSurfaceMode =
 constexpr std::uint32_t kPresentationGroupLevelSegmentMode =
     dkr::runtime::interpolation::kLevelSegmentScopeMode;
 constexpr std::uint8_t kSetScissorOpcode = 0xEDU;
+constexpr std::uint8_t kFullSyncOpcode = 0xE9U;
 constexpr std::uint8_t kViewportMoveMemType = 0x80U;
-constexpr std::uint8_t kSplitViewportMarkerVariant = 31U;
-constexpr std::uint8_t kFramedResultsMarkerVariant = 26U;
-constexpr std::uint8_t kFixedUiMarkerVariant = 27U;
-constexpr std::uint8_t kBackgroundAspectMarkerVariant = 28U;
-constexpr std::uint8_t kHudPassMarkerVariant = 29U;
-constexpr std::uint8_t kTrackSelectLensFlareMarkerVariant = 30U;
+using dkr::runtime::presentation::PresentationMarkerKind;
 constexpr std::uint32_t kHudPassMarkerBeginMode = 1U;
 constexpr float kSplitViewportCoverQuantisation = 1024.0F;
 constexpr std::uint32_t kRDRAMAddressMask = 0x00FFFFFFU;
@@ -137,6 +139,14 @@ bool ShadowTraceEnabled() {
         const char* value = std::getenv("DKR_SHADOW_TRACE");
         return value != nullptr && value[0] != '\0' &&
             !(value[0] == '0' && value[1] == '\0');
+    }();
+    return enabled;
+}
+
+bool SplitTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DKR_SPLIT_TRACE");
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
@@ -288,22 +298,25 @@ std::uint64_t dkr::runtime::completed_f3ddkr_task_count() {
 struct dkr::runtime::F3DDKRRT64Bridge::StateData {
     struct HudAlignmentScope {
         RT64::ExtendedAlignment previous_scissor{};
+        RT64::ExtendedAlignment previous_rect_alignment{};
+        bool changed_rect_alignment = false;
         std::array<std::int16_t, 4> previous_clip_ratios{};
         bool changed_scissor = false;
         bool changed_clip_ratios = false;
         bool pushed_scissor = false;
+        bool pushed_hud_projection = false;
         bool previous_matrix_aspect_override_active = false;
         std::uint8_t previous_matrix_aspect_override = G_EX_ASPECT_AUTO;
         std::uint8_t previous_rect_aspect = G_EX_ASPECT_AUTO;
-        bool previous_background_fill_stretch = false;
+        std::uint8_t previous_background_fill_stretch = 0U;
     };
 
     struct AspectScope {
-        std::uint8_t variant = 0U;
+        PresentationMarkerKind kind = PresentationMarkerKind::Geometry;
         bool previous_matrix_aspect_override_active = false;
         std::uint8_t previous_matrix_aspect_override = G_EX_ASPECT_AUTO;
         std::uint8_t previous_rect_aspect = G_EX_ASPECT_AUTO;
-        bool previous_background_fill_stretch = false;
+        std::uint8_t previous_background_fill_stretch = 0U;
     };
 
     struct PendingShadowBatch {
@@ -344,21 +357,36 @@ struct dkr::runtime::F3DDKRRT64Bridge::StateData {
     std::uint64_t task_count = 0;
     std::uint32_t presentation_group_begins = 0;
     std::uint32_t presentation_group_ends = 0;
-    bool background_fill_stretch_active = false;
+    std::uint8_t background_fill_stretch_active = 0U;
     bool matrix_aspect_override_active = false;
     std::uint8_t matrix_aspect_override = G_EX_ASPECT_AUTO;
     std::uint8_t rect_aspect_mode = G_EX_ASPECT_AUTO;
     bool task_rejected = false;
     bool split_viewport_fill_pending = false;
+    bool postrace_full_viewport_pending = false;
     bool split_viewport_scissor_adjusted = false;
     bool split_viewport_rsp_adjusted = false;
     std::uint8_t split_viewport_camera = 0U;
     std::uint8_t split_viewport_commands_remaining = 0U;
     float split_viewport_cover = 1.0F;
+    bool split_world_projection_active = false;
+    std::array<std::uint32_t, 8> split_color_images{};
+    std::size_t split_color_image_count = 0U;
+    std::array<std::uint32_t, 8> hud_color_images{};
+    std::size_t hud_color_image_count = 0U;
     std::array<HudAlignmentScope, 8> hud_alignment_scopes{};
     std::size_t hud_alignment_depth = 0U;
+    struct HudWidgetScope {
+        hud::groups::Transform transform;
+    };
+    std::array<HudWidgetScope,4> hud_widgets{};
+    std::size_t hud_widget_depth = 0;
+    unsigned hud_rect_bias = 0;
+    presentation::RejectedMarkerScopes rejected_hud_widgets{};
+    dkr::runtime::presentation::RejectedMarkerScopes rejected_hud_scopes{};
     std::array<AspectScope, 16> aspect_scopes{};
     std::size_t aspect_scope_depth = 0U;
+    dkr::runtime::presentation::RejectedMarkerScopes rejected_aspect_scopes{};
     PendingShadowBatch pending_shadow_batch{};
     std::uint64_t shadow_history_key = 0U;
     std::size_t shadow_expected_batch_count = 0U;
@@ -392,6 +420,8 @@ dkr::runtime::F3DDKRRT64Bridge::F3DDKRRT64Bridge()
     gbi_->map[kSetTextureImageOpcode] = &SetTextureImage;
     gbi_->map[kLoadBlockOpcode] = &LoadBlock;
     gbi_->map[kFillRectOpcode] = &FillRect;
+    gbi_->map[G_TEXRECT] = &HudTextureRect;
+    gbi_->map[G_TEXRECTFLIP] = &HudTextureRect;
     // Interpolation scopes are recorded out-of-band at the address of the
     // next authored command. Route every opcode through one bounded dispatcher
     // so the renderer can apply that metadata without appending bytes to DKR's
@@ -402,6 +432,16 @@ dkr::runtime::F3DDKRRT64Bridge::F3DDKRRT64Bridge()
 }
 
 dkr::runtime::F3DDKRRT64Bridge::~F3DDKRRT64Bridge() {
+    for (std::size_t index = 0U; index < diagnostic_budgets_.size(); ++index) {
+        const auto& budget = diagnostic_budgets_[index];
+        if (budget.total != 0U) {
+            std::fprintf(stderr,
+                "[boot][f3ddkr] presentation diagnostic summary category=%zu "
+                "total=%llu unreported=%llu\n", index,
+                static_cast<unsigned long long>(budget.total),
+                static_cast<unsigned long long>(budget.pending));
+        }
+    }
     if (active_ == this) {
         active_ = nullptr;
     }
@@ -1770,12 +1810,31 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
 
     const std::uint32_t start = PhysicalAddress(rsp, task.t.data_ptr);
     application.processDisplayLists(application.core.RDRAM, start, 0, true);
+    // Malformed/aborted tasks must not leave presentation state in RT64.
+    while (data_->hud_widget_depth > 0) {
+        state->flush();
+        --data_->hud_widget_depth;
+        state->rdp->popScissor();
+    }
+    dkr::runtime::presentation::select_split_world_projection(
+        rsp, false, data_->split_world_projection_active);
+    if (data_->hud_alignment_depth != 0U || data_->aspect_scope_depth != 0U ||
+        data_->rejected_hud_scopes.depth != 0U ||
+        data_->rejected_aspect_scopes.depth != 0U ||
+        data_->interpolation_groups.has_active_scope() ||
+        data_->interpolation_groups.rejected_scope_begins() != 0U) {
+        ReportPresentationError(0U, "unbalanced presentation group");
+    }
     while (data_->hud_alignment_depth > 0U) {
         const auto scope = data_->hud_alignment_scopes[
             --data_->hud_alignment_depth];
         if (scope.pushed_scissor) state->rdp->popScissor();
+        if (scope.pushed_hud_projection) hud::pop_hud_projection(rsp);
         if (scope.changed_scissor) {
             state->rdp->setScissorAlign(scope.previous_scissor);
+        }
+        if (scope.changed_rect_alignment) {
+            state->rdp->setRectAlign(scope.previous_rect_alignment);
         }
         if (scope.changed_clip_ratios) {
             for (std::size_t edge = 0U;
@@ -1814,17 +1873,6 @@ void dkr::runtime::F3DDKRRT64Bridge::process(RT64::Application& application,
     data_->matrix_aspect_override_active = false;
     data_->matrix_aspect_override = G_EX_ASPECT_AUTO;
     data_->background_fill_stretch_active = false;
-    if (data_->interpolation_groups.has_active_scope() ||
-        data_->interpolation_groups.rejected_scope_begins() != 0U) {
-        std::fprintf(stderr,
-                     "[boot][f3ddkr] unbalanced presentation group task=%llu "
-                     "begins=%u ends=%u depth=%zu rejected=%u\n",
-                     static_cast<unsigned long long>(data_->task_count),
-                     data_->presentation_group_begins,
-                     data_->presentation_group_ends,
-                     data_->interpolation_groups.scope_depth(),
-                     data_->interpolation_groups.rejected_scope_begins());
-    }
     terrain::publish_draw_statistics(data_->terrain_patches, data_->terrain_triangles,
                                     data_->terrain_submit_ms);
     if (std::getenv("DKR_TRACE_TERRAIN") && data_->task_count % 300 == 0)
@@ -1875,6 +1923,49 @@ void dkr::runtime::F3DDKRRT64Bridge::Dispatch(
         RejectTask(display_list);
         return;
     }
+    if (opcode == kFullSyncOpcode && (active_->data_->split_color_image_count != 0U ||
+                                     active_->data_->hud_color_image_count != 0U)) {
+        // Finish pending calls before normalising the producer-owned aggregate;
+        // never access or mutate a workload after fullSync hands it to RT64.
+        state->flush();
+        auto& workload = state->ext.workloadQueue->workloads[
+            state->ext.workloadQueue->writeCursor];
+        const auto& data = *active_->data_;
+        static std::uint64_t last_trace_task = 0U;
+        static unsigned trace_count = 0U;
+        const bool trace = SplitTraceEnabled() && trace_count < 24U &&
+            (trace_count == 0U || data.task_count >= last_trace_task + 120U);
+        for (std::uint32_t i = 0; i < workload.fbPairCount; ++i) {
+            auto& pair = workload.fbPairs[i];
+            const auto end = data.split_color_images.begin() + data.split_color_image_count;
+            const auto hud_end = data.hud_color_images.begin() + data.hud_color_image_count;
+            if (std::find(data.split_color_images.begin(), end,
+                          pair.colorImage.address) != end ||
+                std::find(data.hud_color_images.begin(), hud_end,
+                          pair.colorImage.address) != hud_end) {
+                const auto authored_union = pair.scissorRect;
+                dkr::runtime::presentation::normalise_split_framebuffer_extent(pair);
+                if (trace) {
+                    unsigned adjusted = 0U;
+                    unsigned rectangles = 0U;
+                    for (unsigned j = 0; j < pair.projectionCount; ++j) {
+                        const auto& projection = pair.projections[j];
+                        if (projection.type == RT64::Projection::Type::Rectangle) ++rectangles;
+                        if (projection.transformsIndex < workload.drawData.viewProjTransformGroups.size()) {
+                            const auto group = workload.drawData.viewProjTransformGroups[projection.transformsIndex];
+                            if (workload.drawData.transformGroups[group].aspectMode == G_EX_ASPECT_ADJUST) ++adjusted;
+                        }
+                    }
+                    std::fprintf(stderr, "[split-screen] task=%llu pair=%u cover=%.4f native-width=%u scissor=[%d,%d,%d,%d]->[%d,%d,%d,%d] projections=%u adjusted=%u rects=%u projection-restored=%u\n",
+                        static_cast<unsigned long long>(data.task_count), i, data.split_viewport_cover,
+                        pair.colorImage.width, authored_union.ulx, authored_union.uly, authored_union.lrx, authored_union.lry,
+                        pair.scissorRect.ulx, pair.scissorRect.uly, pair.scissorRect.lrx, pair.scissorRect.lry,
+                        pair.projectionCount, adjusted, rectangles, !data.split_world_projection_active);
+                }
+            }
+        }
+        if (trace) { last_trace_task = data.task_count; ++trace_count; }
+    }
     handler(state, display_list);
     AdjustSplitViewportCommand(state, command, opcode);
 }
@@ -1882,7 +1973,7 @@ void dkr::runtime::F3DDKRRT64Bridge::Dispatch(
 void dkr::runtime::F3DDKRRT64Bridge::AdjustSplitViewportCommand(
     RT64::State* state, RT64::DisplayList* command, std::uint8_t opcode) {
     StateData& data = *active_->data_;
-    if (!data.split_viewport_fill_pending || command == nullptr) {
+    if ((!data.split_viewport_fill_pending && !data.postrace_full_viewport_pending) || command == nullptr) {
         return;
     }
 
@@ -1896,8 +1987,12 @@ void dkr::runtime::F3DDKRRT64Bridge::AdjustSplitViewportCommand(
                 static_cast<float>(scissor.lrx),
                 data.split_viewport_cover,
                 static_cast<int>(data.split_viewport_camera));
-        scissor.ulx = static_cast<std::int32_t>(std::lround(expanded.left));
-        scissor.lrx = static_cast<std::int32_t>(std::lround(expanded.right));
+        if (data.postrace_full_viewport_pending) {
+            dkr::runtime::presentation::fill_postrace_scissor(scissor);
+        } else {
+            scissor.ulx = static_cast<std::int32_t>(std::lround(expanded.left));
+            scissor.lrx = static_cast<std::int32_t>(std::lround(expanded.right));
+        }
         state->updateDrawStatusAttribute(RT64::DrawAttribute::Scissor);
         data.split_viewport_scissor_adjusted = true;
     } else if (opcode == kMoveMemOpcode &&
@@ -1911,8 +2006,12 @@ void dkr::runtime::F3DDKRRT64Bridge::AdjustSplitViewportCommand(
             dkr::runtime::enhancements::expand_split_viewport_horizontal_range(
                 left, right, data.split_viewport_cover,
                 static_cast<int>(data.split_viewport_camera));
-        viewport.scale.x = (expanded.right - expanded.left) * 0.5F;
-        viewport.translate.x = (expanded.left + expanded.right) * 0.5F;
+        if (data.postrace_full_viewport_pending) {
+            dkr::runtime::presentation::fill_postrace_viewport(viewport);
+        } else {
+            viewport.scale.x = (expanded.right - expanded.left) * 0.5F;
+            viewport.translate.x = (expanded.left + expanded.right) * 0.5F;
+        }
         state->rsp->viewportChanged = true;
         data.split_viewport_rsp_adjusted = true;
     }
@@ -1920,6 +2019,7 @@ void dkr::runtime::F3DDKRRT64Bridge::AdjustSplitViewportCommand(
     if (data.split_viewport_scissor_adjusted &&
         data.split_viewport_rsp_adjusted) {
         data.split_viewport_fill_pending = false;
+        data.postrace_full_viewport_pending = false;
         return;
     }
 
@@ -1928,6 +2028,7 @@ void dkr::runtime::F3DDKRRT64Bridge::AdjustSplitViewportCommand(
     }
     if (data.split_viewport_commands_remaining == 0U) {
         data.split_viewport_fill_pending = false;
+        data.postrace_full_viewport_pending = false;
     }
 }
 
@@ -1950,9 +2051,36 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationMarkers(
             static_cast<std::uint32_t>(command - rdram_begin));
     for (std::size_t index = 0U; index < markers.count; ++index) {
         const auto& marker = markers.markers[index];
+        if (marker.kind == PresentationMarkerKind::HudRect) {
+            state->flush();
+            active_->data_->hud_rect_bias=marker.mode!=0 ? (marker.variant&3U) : 0U;
+            continue;
+        }
+        if (marker.kind == PresentationMarkerKind::HudWidget) {
+            auto& data = *active_->data_;
+            auto& rsp = *state->rsp;
+            state->flush();
+            if (marker.mode == 1) {
+                if (data.rejected_hud_widgets.reject_begin(data.hud_widget_depth,data.hud_widgets.size())) continue;
+                if (!marker.hud_transform.valid()) { ++data.rejected_hud_widgets.depth; continue; }
+                auto& scope = data.hud_widgets[data.hud_widget_depth++];
+                scope.transform = marker.hud_transform;
+                const auto& t = scope.transform;
+                state->rdp->pushScissor();
+                auto& clip = state->rdp->scissorRectStack[state->rdp->scissorStackSize-1];
+                clip.uly = std::max(clip.uly,static_cast<int>(t.clip_top*4));
+                clip.lry = std::min(clip.lry,static_cast<int>(t.clip_bottom*4));
+                state->updateDrawStatusAttribute(RT64::DrawAttribute::Scissor);
+            } else if (!data.rejected_hud_widgets.consume_end() && data.hud_widget_depth > 0) {
+                --data.hud_widget_depth;
+                state->rdp->popScissor();
+                state->updateDrawStatusAttribute(RT64::DrawAttribute::Scissor);
+            }
+            continue;
+        }
         ApplyPresentationGroup(state, marker.mode, marker.token,
-                               marker.variant);
-        if (marker.mode == kPresentationGroupBillboardMode) {
+                               marker.variant, marker.kind);
+        if (marker.kind == PresentationMarkerKind::Geometry && marker.mode == kPresentationGroupBillboardMode) {
             auto& data = *active_->data_;
             data.palm_sample = marker.palm;
             data.palm_world_matrix = state->rsp->modelMatrixStack[data.selected_matrix];
@@ -1971,14 +2099,41 @@ void dkr::runtime::F3DDKRRT64Bridge::PresentationGroup(
     const std::uint8_t presentation_variant = static_cast<std::uint8_t>(
         ((*display_list)->w1 >> 3U) & 0x1FU);
     ApplyPresentationGroup(state, mode, presentation_token,
-                           presentation_variant);
+                           presentation_variant,
+                           dkr::runtime::presentation::legacy_presentation_marker_kind(
+                               static_cast<std::uint8_t>(mode), presentation_variant));
+}
+
+void dkr::runtime::F3DDKRRT64Bridge::ReportPresentationError(
+    std::size_t index, const char* message, PresentationMarkerKind kind,
+    std::uint32_t mode, std::uint8_t variant) {
+    auto& budget = diagnostic_budgets_.at(index);
+    if (!budget.record(data_->task_count)) return;
+    std::fprintf(stderr,
+        "[boot][f3ddkr] %s task=%llu kind=%u mode=%u variant=%u "
+        "total=%llu since-report=%llu begins=%u ends=%u "
+        "depth=%zu aspect-depth=%zu hud-depth=%zu rejected=%u\n",
+        message, static_cast<unsigned long long>(data_->task_count),
+        static_cast<unsigned>(kind), mode, variant,
+        static_cast<unsigned long long>(budget.total),
+        static_cast<unsigned long long>(budget.take_pending()),
+        data_->presentation_group_begins, data_->presentation_group_ends,
+        data_->interpolation_groups.scope_depth(), data_->aspect_scope_depth,
+        data_->hud_alignment_depth,
+        data_->interpolation_groups.rejected_scope_begins());
 }
 
 void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
     RT64::State* state, std::uint32_t mode,
     std::uint16_t presentation_token,
-    std::uint8_t presentation_variant) {
+    std::uint8_t presentation_variant, PresentationMarkerKind kind) {
     StateData& data = *active_->data_;
+    if (mode > 9U || !dkr::runtime::presentation::valid_presentation_marker(
+            kind, static_cast<std::uint8_t>(mode), presentation_variant)) {
+        active_->ReportPresentationError(7U, "invalid presentation marker",
+                                         kind, mode, presentation_variant);
+        return;
+    }
     const auto apply_active_group = [&]() {
         const auto active_group = data.interpolation_groups.active_group();
         SelectInterpolationGroup(
@@ -1990,10 +2145,29 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                              data.matrix_aspect_override_active,
                              data.matrix_aspect_override));
         state->rsp->modelViewProjChanged = true;
+        dkr::runtime::presentation::select_split_world_projection(
+            *state->rsp,
+            data.split_color_image_count != 0U &&
+                data.interpolation_groups.contains_mode(kPresentationGroupAspectAdjustMode),
+            data.split_world_projection_active);
     };
 
-    const bool layout_marker = interpolation::is_layout_marker(mode, presentation_variant);
-    if (layout_marker && presentation_variant == kSplitViewportMarkerVariant) {
+    if (kind == PresentationMarkerKind::PostraceFullViewport) {
+        data.postrace_full_viewport_pending = true;
+        data.split_viewport_fill_pending = false;
+        data.split_viewport_scissor_adjusted = false;
+        data.split_viewport_rsp_adjusted = false;
+        data.split_viewport_commands_remaining = 32U;
+        return;
+    }
+    if (kind == PresentationMarkerKind::SplitViewport) {
+        data.postrace_full_viewport_pending = false;
+        const auto address = state->rdp->colorImage.address;
+        const auto end = data.split_color_images.begin() + data.split_color_image_count;
+        if (std::find(data.split_color_images.begin(), end, address) == end &&
+            data.split_color_image_count < data.split_color_images.size()) {
+            data.split_color_images[data.split_color_image_count++] = address;
+        }
         data.split_viewport_fill_pending = true;
         data.split_viewport_scissor_adjusted = false;
         data.split_viewport_rsp_adjusted = false;
@@ -2006,22 +2180,17 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
         return;
     }
 
-    if (layout_marker && (presentation_variant == kFramedResultsMarkerVariant ||
-        presentation_variant == kFixedUiMarkerVariant ||
-        presentation_variant == kBackgroundAspectMarkerVariant ||
-        presentation_variant == kTrackSelectLensFlareMarkerVariant)) {
+    if (dkr::runtime::presentation::is_aspect_marker(kind)) {
         state->flush();
         if (mode == kHudPassMarkerBeginMode) {
-            if (data.aspect_scope_depth >= data.aspect_scopes.size()) {
-                std::fprintf(stderr,
-                             "[boot][f3ddkr] aspect scope overflow "
-                             "task=%llu variant=%u\n",
-                             static_cast<unsigned long long>(data.task_count),
-                             presentation_variant);
+            if (data.rejected_aspect_scopes.reject_begin(
+                    data.aspect_scope_depth, data.aspect_scopes.size())) {
+                active_->ReportPresentationError(1U, "aspect scope overflow",
+                                                 kind, mode, presentation_variant);
                 return;
             }
             auto& scope = data.aspect_scopes[data.aspect_scope_depth++];
-            scope.variant = presentation_variant;
+            scope.kind = kind;
             scope.previous_matrix_aspect_override_active =
                 data.matrix_aspect_override_active;
             scope.previous_matrix_aspect_override =
@@ -2030,11 +2199,12 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
             scope.previous_background_fill_stretch =
                 data.background_fill_stretch_active;
 
-            if (presentation_variant == kBackgroundAspectMarkerVariant) {
+            if (kind == PresentationMarkerKind::BackgroundAspect) {
                 // Background-only rectangles may cover the host width. They do
                 // not alter the matrix aspect used by world or HUD geometry.
                 data.rect_aspect_mode = G_EX_ASPECT_STRETCH;
-                data.background_fill_stretch_active = presentation_token != 0U;
+                data.background_fill_stretch_active =
+                    presentation_token <= 2U ? presentation_token : 0U;
             } else {
                 // Framed views and fixed game UI preserve their own aspect.
                 data.matrix_aspect_override_active = true;
@@ -2043,9 +2213,10 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                 data.background_fill_stretch_active = false;
             }
             state->rdp->setRectAspect(data.rect_aspect_mode);
+        } else if (data.rejected_aspect_scopes.consume_end()) {
+            return;
         } else if (data.aspect_scope_depth > 0U &&
-                   data.aspect_scopes[data.aspect_scope_depth - 1U].variant ==
-                       presentation_variant) {
+                   data.aspect_scopes[data.aspect_scope_depth - 1U].kind == kind) {
             const auto scope = data.aspect_scopes[--data.aspect_scope_depth];
             data.matrix_aspect_override_active =
                 scope.previous_matrix_aspect_override_active;
@@ -2056,32 +2227,45 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                 scope.previous_background_fill_stretch;
             state->rdp->setRectAspect(data.rect_aspect_mode);
         } else {
-            std::fprintf(stderr,
-                         "[boot][f3ddkr] aspect scope mismatch "
-                         "task=%llu variant=%u depth=%zu\n",
-                         static_cast<unsigned long long>(data.task_count),
-                         presentation_variant, data.aspect_scope_depth);
+            active_->ReportPresentationError(2U, "aspect scope mismatch",
+                                             kind, mode, presentation_variant);
             return;
         }
         apply_active_group();
         return;
     }
 
-    if (layout_marker && presentation_variant == kHudPassMarkerVariant) {
+    if (kind == PresentationMarkerKind::HudPass) {
         state->flush();
         if (mode == kHudPassMarkerBeginMode) {
-            if (data.hud_alignment_depth >=
-                data.hud_alignment_scopes.size()) {
-                std::fprintf(stderr,
-                             "[boot][f3ddkr] HUD alignment scope overflow "
-                             "task=%llu\n",
-                             static_cast<unsigned long long>(data.task_count));
+            if (data.rejected_hud_scopes.reject_begin(
+                    data.hud_alignment_depth, data.hud_alignment_scopes.size())) {
+                active_->ReportPresentationError(3U, "HUD alignment scope overflow",
+                                                 kind, mode, presentation_variant);
+                return;
+            }
+            if (presentation_variant == hud::reference::kPassVariant &&
+                static_cast<std::size_t>(state->rsp->extended.viewProjMatrixIdStackSize) >=
+                    state->rsp->extended.viewProjMatrixIdStack.size()) {
+                ++data.rejected_hud_scopes.depth;
+                active_->ReportPresentationError(3U, "HUD projection scope overflow",
+                                                 kind, mode, presentation_variant);
                 return;
             }
 
             auto& scope = data.hud_alignment_scopes[
                 data.hud_alignment_depth++];
             scope.previous_scissor = state->rdp->extended.global.scissor;
+            scope.previous_rect_alignment = state->rdp->extended.global.rect;
+            scope.changed_rect_alignment =
+                presentation_variant == hud::kHudAnchorLeft ||
+                presentation_variant == hud::kHudAnchorRight;
+            if (scope.changed_rect_alignment) {
+                state->rdp->setRectAlign(presentation::split_counter_alignment(
+                    scope.previous_rect_alignment, presentation_variant,
+                    state->rdp->colorImage.width,
+                    hud::decode_hud_viewport_cover(presentation_token)));
+            }
             scope.previous_clip_ratios = state->rsp->clipRatios;
             scope.previous_matrix_aspect_override_active =
                 data.matrix_aspect_override_active;
@@ -2091,10 +2275,22 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
             scope.previous_background_fill_stretch =
                 data.background_fill_stretch_active;
 
-            // HUD layout patches already translate complete authored groups
-            // into the host viewport. This marker owns clipping only. Any
-            // matrix or rectangle aspect override here would apply a second
-            // aspect transform and pull text, dials and menu panels apart.
+            // The accepted quadrant variants remain clip/alignment-only.
+            // The 1/2-player reference pass explicitly preserves proportions
+            // on BOTH RDP rectangles and the independent RSP projection stack.
+            if (presentation_variant == hud::reference::kPassVariant) {
+                hud::push_hud_projection(*state->rsp);
+                scope.pushed_hud_projection = true;
+                state->rdp->setRectAspect(G_EX_ASPECT_ADJUST);
+                data.rect_aspect_mode = G_EX_ASPECT_ADJUST;
+                data.background_fill_stretch_active = false;
+                const auto address = state->rdp->colorImage.address;
+                const auto end = data.hud_color_images.begin() + data.hud_color_image_count;
+                if (std::find(data.hud_color_images.begin(), end, address) == end &&
+                    data.hud_color_image_count < data.hud_color_images.size()) {
+                    data.hud_color_images[data.hud_color_image_count++] = address;
+                }
+            }
 
             state->rdp->pushScissor();
             scope.pushed_scissor = true;
@@ -2125,17 +2321,38 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                 state->rdp->colorImage.width);
             left_origin = hud_alignment.leftOrigin;
             right_origin = hud_alignment.rightOrigin;
+            if (scope.pushed_hud_projection) {
+                // Signed overscan is a clip, not a larger native framebuffer.
+                // Use NONE origins because the global extended-origin policy
+                // intentionally stays at Original for the rest of the game.
+                const auto gutter = static_cast<std::int32_t>(std::lround(
+                    state->rdp->colorImage.width * 2.F *
+                    (hud::decode_hud_viewport_cover(presentation_token) - 1.F)));
+                rect.ulx = -gutter;
+                rect.lrx = state->rdp->colorImage.width * 4 + gutter;
+                left_origin = right_origin = G_EX_ORIGIN_NONE;
+                hud_alignment.leftOrigin = hud_alignment.rightOrigin = G_EX_ORIGIN_NONE;
+            }
             state->rdp->setScissorAlign(hud_alignment);
             scope.changed_scissor = true;
             state->updateDrawStatusAttribute(RT64::DrawAttribute::Scissor);
+        } else if (data.rejected_hud_scopes.consume_end()) {
+            return;
         } else if (data.hud_alignment_depth > 0U) {
             const auto scope = data.hud_alignment_scopes[
                 --data.hud_alignment_depth];
             if (scope.pushed_scissor) {
                 state->rdp->popScissor();
             }
+            if (scope.pushed_hud_projection) {
+                hud::pop_hud_projection(*state->rsp);
+                state->rdp->setRectAspect(scope.previous_rect_aspect);
+            }
             if (scope.changed_scissor) {
                 state->rdp->setScissorAlign(scope.previous_scissor);
+            }
+            if (scope.changed_rect_alignment) {
+                state->rdp->setRectAlign(scope.previous_rect_alignment);
             }
             if (scope.changed_clip_ratios) {
                 for (std::size_t edge = 0U;
@@ -2145,9 +2362,7 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                         scope.previous_clip_ratios[edge]);
                 }
             }
-            // The HUD marker never mutates aspect state. Preserve the saved
-            // values defensively in case an outer presentation scope changes
-            // while this scope is active.
+            // Restore all scoped state before dialogue, menus or world draws.
             data.matrix_aspect_override_active =
                 scope.previous_matrix_aspect_override_active;
             data.matrix_aspect_override =
@@ -2156,10 +2371,8 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
             data.background_fill_stretch_active =
                 scope.previous_background_fill_stretch;
         } else {
-            std::fprintf(stderr,
-                         "[boot][f3ddkr] HUD alignment scope underflow "
-                         "task=%llu\n",
-                         static_cast<unsigned long long>(data.task_count));
+            active_->ReportPresentationError(4U, "HUD alignment scope underflow",
+                                             kind, mode, presentation_variant);
         }
         apply_active_group();
         return;
@@ -2176,7 +2389,8 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
     // Pad while the shadow identity is still selected. Once the scope is
     // popped these samples would belong to the world matrix and could not keep
     // the shadow transform's vertex count continuous.
-    if (!presentation_scoped && data.shadow_scope_active &&
+    if (!presentation_scoped && !data.interpolation_groups.has_rejected_scope() &&
+        data.shadow_scope_active &&
         data.interpolation_groups.active_group().mode ==
             kPresentationGroupShadowMode) {
         FinishShadowScope(state);
@@ -2239,10 +2453,8 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
                 static_cast<std::uint8_t>(mode), scoped_identity,
                 scoped_vertices, scoped_texcoords, scoped_tiles);
         if (!began) {
-            std::fprintf(stderr,
-                         "[boot][f3ddkr] presentation scope overflow "
-                         "task=%llu mode=%u\n",
-                         static_cast<unsigned long long>(data.task_count), mode);
+            active_->ReportPresentationError(5U, "presentation scope overflow",
+                                             kind, mode, presentation_variant);
         } else if (mode == kPresentationGroupShadowMode) {
             data.pending_shadow_batch = {};
             data.pending_shadow_batches = {};
@@ -2275,11 +2487,9 @@ void dkr::runtime::F3DDKRRT64Bridge::ApplyPresentationGroup(
         }
     } else {
         const auto ended = data.interpolation_groups.end_scope();
-        if (!ended.had_scope) {
-            std::fprintf(stderr,
-                         "[boot][f3ddkr] presentation scope underflow "
-                         "task=%llu\n",
-                         static_cast<unsigned long long>(data.task_count));
+        if (!ended.had_scope && !ended.rejected_begin) {
+            active_->ReportPresentationError(6U, "presentation scope underflow",
+                                             kind, mode, presentation_variant);
         }
     }
     apply_active_group();
@@ -2350,10 +2560,47 @@ void dkr::runtime::F3DDKRRT64Bridge::FillRect(
 
     const std::int32_t uly = (*display_list)->p1(0, 12);
     const std::int32_t lry = (*display_list)->p0(0, 12);
+    if (data.background_fill_stretch_active == 2U) {
+        // The optional three-player panel ends at the expanded right edge.
+        // Explicit origins are disabled by the runtime's global HUD policy;
+        // extend this fill in signed coordinates without touching other fills.
+        state->rdp->fillRect((*display_list)->p1(12, 12), uly,
+            (*display_list)->p0(12, 12), lry,
+            presentation::split_panel_alignment(
+                state->rdp->colorImage.width, data.split_viewport_cover));
+        return;
+    }
     RT64::ExtendedAlignment alignment{};
+    // Preserve the existing full-width background policy.
     alignment.leftOrigin = G_EX_ORIGIN_LEFT;
     alignment.rightOrigin = G_EX_ORIGIN_RIGHT;
     state->rdp->fillRect(0, uly, 0, lry, alignment);
+}
+
+void dkr::runtime::F3DDKRRT64Bridge::HudTextureRect(
+    RT64::State* state, RT64::DisplayList** display_list) {
+    const bool flip = ((*display_list)->w0 >> 24U) == G_TEXRECTFLIP;
+    const auto& data = *active_->data_;
+    if (data.hud_widget_depth == 0) {
+        if (flip) RT64::GBI_RDP::texrectFlip(state,display_list);
+        else RT64::GBI_RDP::texrect(state,display_list);
+        return;
+    }
+    // Do not repack to unsigned 12-bit command coordinates. Widescreen HUD
+    // positions may be negative, and RT64 accepts signed rectangle bounds.
+    const auto& t = data.hud_widgets[data.hud_widget_depth-1].transform;
+    auto* command = *display_list;
+    const int ulx=command->p1(12,12), uly=command->p1(0,12);
+    const int lrx=command->p0(12,12), lry=command->p0(0,12);
+    const auto tile=static_cast<std::uint8_t>(command->p1(24,3));
+    ++command;
+    const auto s=static_cast<std::int16_t>(command->p1(16,16));
+    const auto uv=static_cast<std::int16_t>(command->p1(0,16));
+    ++command;
+    const auto rect=hud::groups::transform_rectangle(t,ulx,uly,lrx,lry,
+        static_cast<std::int16_t>(command->p1(16,16)),static_cast<std::int16_t>(command->p1(0,16)),data.hud_rect_bias);
+    state->rdp->drawTexRect(rect.ulx,rect.uly,rect.lrx,rect.lry,tile,s,uv,rect.dsdx,rect.dtdy,flip);
+    *display_list=command;
 }
 
 void dkr::runtime::F3DDKRRT64Bridge::TextureOffset(
@@ -2465,7 +2712,14 @@ void dkr::runtime::F3DDKRRT64Bridge::Vertex(
             .drawData.posTransformed.size()) {
         const auto& workload =
             state->ext.workloadQueue->workloads[state->ext.workloadQueue->writeCursor];
-        const hlslpp::float4 anchor = workload.drawData.posTransformed[rsp.indices[0]];
+        hlslpp::float4 anchor = workload.drawData.posTransformed[rsp.indices[0]];
+        if(data.hud_widget_depth!=0) {
+            // The ortho-sprite anchor was loaded earlier inside this same HUD
+            // scope. Undo its group affine before adding it to the billboard
+            // matrix, otherwise the quad receives the translation/scale twice.
+            anchor=hud::groups::untransform_anchor(anchor,rsp.viewportStack[rsp.viewportStackSize-1],
+                data.hud_widgets[data.hud_widget_depth-1].transform);
+        }
         auto adjusted_matrix = original_matrix;
         adjusted_matrix[3] += anchor;
         rsp.modelMatrixStack[data.selected_matrix] = adjusted_matrix;
@@ -2473,7 +2727,18 @@ void dkr::runtime::F3DDKRRT64Bridge::Vertex(
         adjusted_billboard = true;
     }
 
+    const auto authored_hud_matrix = rsp.modelMatrixStack[data.selected_matrix];
+    if (data.hud_widget_depth != 0) {
+        rsp.modelMatrixStack[data.selected_matrix] = hud::groups::transform_mvp(
+            authored_hud_matrix, rsp.viewportStack[rsp.viewportStackSize-1],
+            data.hud_widgets[data.hud_widget_depth-1].transform);
+        rsp.modelViewProjChanged = true;
+    }
     rsp.setVertex(kScratchVertexAddress, count, destination);
+    if (data.hud_widget_depth != 0) {
+        rsp.modelMatrixStack[data.selected_matrix] = authored_hud_matrix;
+        rsp.modelViewProjChanged = true;
+    }
     if (adjusted_billboard) {
         rsp.modelMatrixStack[data.selected_matrix] = original_matrix;
         rsp.modelViewProjChanged = true;
@@ -2504,9 +2769,9 @@ bool dkr::runtime::F3DDKRRT64Bridge::DrawPalmReplacement(RT64::State* state) {
     std::uint32_t texture_index = 0;
     interop::float2 texture_scale{};
     interop::float3 texture_dimensions{};
-    bool replaced = false, mipmaps = false, shifted = false;
+    bool replaced = false, mipmaps = false, shifted = false, generated_mipmaps = false;
     if (!cache->useTexture(hash, workload.submissionFrame, texture_index,
-                          texture_scale, texture_dimensions, replaced, mipmaps, shifted) || !replaced)
+                          texture_scale, texture_dimensions, replaced, mipmaps, shifted, generated_mipmaps) || !replaced)
         return fallback("atlas-not-yet-gpu-ready");
 
     const auto& sample = data.palm_sample;

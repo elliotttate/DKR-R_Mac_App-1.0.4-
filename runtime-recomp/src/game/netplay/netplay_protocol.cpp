@@ -52,7 +52,7 @@ bool Take64(std::span<const std::uint8_t> bytes, std::size_t& cursor,
 bool ValidType(std::uint8_t type) {
     return type >= static_cast<std::uint8_t>(MessageType::Hello) &&
            type <=
-               static_cast<std::uint8_t>(MessageType::OnlineSaveReadyAck);
+               static_cast<std::uint8_t>(MessageType::OnlineSaveStatus);
 }
 
 bool PutString(std::vector<std::uint8_t>& out, std::string_view value,
@@ -187,22 +187,27 @@ std::vector<std::uint8_t> encode_input_batch(const InputBatch& batch) {
     if (batch.epoch == 0U || batch.player_slot >= kMaximumPlayers ||
         batch.inputs.empty() ||
         batch.inputs.size() > 64U ||
+        (!batch.revisions.empty() && batch.revisions.size() != batch.inputs.size()) ||
         batch.first_frame >
             std::numeric_limits<std::uint32_t>::max() -
                 static_cast<std::uint32_t>(batch.inputs.size() - 1U)) {
         return {};
     }
     std::vector<std::uint8_t> out;
-    out.reserve(10U + batch.inputs.size() * 4U +
+    out.reserve(10U + batch.inputs.size() * 8U +
                 (batch.simulation_progress_present ? 8U : 0U));
     Put32(out, batch.epoch);
     out.push_back(batch.player_slot);
     out.push_back(static_cast<std::uint8_t>(batch.inputs.size()));
     Put32(out, batch.first_frame);
-    for (const PackedInput input : batch.inputs) {
+    for (std::size_t i = 0; i < batch.inputs.size(); ++i) {
+        const PackedInput input = batch.inputs[i];
+        const auto revision = batch.revisions.empty() ? 1U : batch.revisions[i];
+        if (revision == 0U) return {};
         Put16(out, input.buttons);
         out.push_back(static_cast<std::uint8_t>(input.stick_x));
         out.push_back(static_cast<std::uint8_t>(input.stick_y));
+        Put32(out, revision);
     }
     if (batch.simulation_progress_present) {
         Put32(out, batch.simulation_scene_epoch);
@@ -214,7 +219,7 @@ std::vector<std::uint8_t> encode_input_batch(const InputBatch& batch) {
 bool decode_input_batch(std::span<const std::uint8_t> bytes,
                         InputBatch& batch, std::string& error) {
     batch = {};
-    if (bytes.size() < 14U) {
+    if (bytes.size() < 18U) {
         error = "Input batch is truncated.";
         return false;
     }
@@ -226,7 +231,7 @@ bool decode_input_batch(std::span<const std::uint8_t> bytes,
     batch.player_slot = bytes[cursor++];
     const std::uint8_t count = bytes[cursor++];
     const std::size_t input_bytes =
-        10U + static_cast<std::size_t>(count) * 4U;
+        10U + static_cast<std::size_t>(count) * 8U;
     if (batch.epoch == 0U || batch.player_slot >= kMaximumPlayers ||
         count == 0U || count > 64U ||
         (bytes.size() != input_bytes && bytes.size() != input_bytes + 8U) ||
@@ -246,7 +251,13 @@ bool decode_input_batch(std::span<const std::uint8_t> bytes,
         }
         input.stick_x = static_cast<std::int8_t>(bytes[cursor++]);
         input.stick_y = static_cast<std::int8_t>(bytes[cursor++]);
+        std::uint32_t revision = 0U;
+        if (!Take32(bytes, cursor, revision) || revision == 0U) {
+            error = "Input sample revision is invalid.";
+            return false;
+        }
         batch.inputs.push_back(input);
+        batch.revisions.push_back(revision);
     }
     if (bytes.size() == input_bytes + 8U) {
         batch.simulation_progress_present = true;
@@ -437,7 +448,7 @@ bool decode_rollback_payload(std::span<const std::uint8_t> bytes,
 
 std::vector<std::uint8_t> encode_gameplay_barrier(
     const GameplayBarrierPayload& barrier) {
-    if (barrier.scene_epoch == 0U || barrier.racer_count == 0U ||
+    if (barrier.scene_epoch == 0U ||
         barrier.racer_count > 10U ||
         barrier.player_slot >= kMaximumPlayers ||
         barrier.stage > GameplayBarrierStage::Go) {
@@ -468,7 +479,7 @@ bool decode_gameplay_barrier(std::span<const std::uint8_t> bytes,
            (stage = bytes[cursor++]) <=
                static_cast<std::uint8_t>(GameplayBarrierStage::Go) &&
            (barrier.stage = static_cast<GameplayBarrierStage>(stage), true) &&
-           barrier.scene_epoch != 0U && barrier.racer_count != 0U &&
+           barrier.scene_epoch != 0U &&
            barrier.racer_count <= 10U && cursor == bytes.size();
 }
 
@@ -979,6 +990,35 @@ bool decode_online_save_ready(std::span<const std::uint8_t> bytes,
         !Take64(bytes, cursor, payload.hash) || payload.generation == 0U ||
         payload.hash == 0U || cursor != bytes.size()) {
         error = "Online save readiness identity is invalid.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+std::vector<std::uint8_t> encode_online_save_status(const OnlineSaveStatusPayload& payload) {
+    if (!payload.room_generation || !payload.save_generation || !payload.save_hash ||
+        !(payload.verified_mask & 1U) || (payload.verified_mask >> kMaximumPlayers)) return {};
+    std::vector<std::uint8_t> out;
+    Put64(out, payload.room_generation);
+    Put32(out, payload.save_generation);
+    Put64(out, payload.save_hash);
+    out.push_back(payload.verified_mask);
+    return out;
+}
+
+bool decode_online_save_status(std::span<const std::uint8_t> bytes,
+                               OnlineSaveStatusPayload& payload, std::string& error) {
+    payload = {};
+    std::size_t cursor = 0U;
+    if (bytes.size() != 21U || !Take64(bytes, cursor, payload.room_generation) ||
+        !Take32(bytes, cursor, payload.save_generation) || !Take64(bytes, cursor, payload.save_hash)) {
+        error = "Online save status payload is invalid.";
+        return false;
+    }
+    payload.verified_mask = bytes[cursor];
+    if (encode_online_save_status(payload).empty()) {
+        error = "Online save status identity is invalid.";
         return false;
     }
     error.clear();

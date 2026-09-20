@@ -9,6 +9,8 @@
 /.vs/
 /.vscode/
 /--portable/
+/unified-mod-test-902561023969800/
+/unified-mod-test-902924382217100/
 CMakeUserPresets.json
 
 # Build-system and compiler intermediates
@@ -34,7 +36,11 @@ _deps/
 /runtime-recomp/data_dump.toml
 /runtime-recomp/applied-patches.json
 /runtime-recomp/resolved-runtime-dependencies.json
-/runtime-recomp/dkr.us.v77.generated.toml
+# Recomp configs written by scripts/generate_recomp_config.py. They embed
+# absolute local paths (ELF, ROM, output dirs), so they are per-machine and
+# must be regenerated rather than shared.
+/runtime-recomp/dkr.us.*.generated.toml
+/runtime-recomp/dkr.us.*.regen.toml
 /imgui.ini
 /logs/
 /cache/
@@ -47,9 +53,6 @@ mods/*
 /extern/*/
 /extern/.resolved-dependencies.json
 /extern/.resolved-dkr-source.json
-
-# Local development utilities and extracted package worktrees
-/tools/
 
 # Copyrighted / ROM-derived data
 *.z64
@@ -106,3 +109,19 @@ runtime-recomp/RecompiledFuncs/
 runtime-recomp/RecompiledPatches/
 build/runtime-tools/
 runtime-recomp/build/
+
+# tools/blender holds the DKR track editor addon and is tracked. Everything else
+# under tools/ is not. Git does not descend into an excluded directory, so the
+# directory itself must stay un-excluded for any rule inside it to apply - do
+# not restore a bare /tools/ rule, it makes the addon invisible again.
+/tools/*
+!/tools/blender/
+
+# Blender addon build output, rebuilt by tools/blender/package_addon.py
+/tools/blender/dkr_track_editor.zip
+
+# Built .dkrmap packages. These carry retail object-map data verbatim - the
+# structure slot of a remix is the base track's map unless every object was
+# moved - and docs/ASSET_POLICY.md forbids committing extracted maps. They are
+# local test artifacts; rebuild them from Blender rather than sharing them.
+/custom-tracks/

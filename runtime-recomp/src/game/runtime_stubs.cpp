@@ -10,6 +10,7 @@
 #include "steering_wheel_policy.hpp"
 #include "vi_presentation_policy.hpp"
 #include "widescreen_policy.hpp"
+#include "finish_presentation_policy.hpp"
 
 #include "ultramodern/config.hpp"
 #include "ultramodern/ultramodern.hpp"
@@ -46,10 +47,7 @@ const std::uint32_t& kVoidCentreXAddress =
 const std::uint32_t& kVoidCentreZAddress =
     dkr::runtime::revision_addresses::VoidCentreZ;
 constexpr float kOriginalAspect = 4.0F / 3.0F;
-constexpr std::uint8_t kFramedResultsMarkerVariant = 26U;
-constexpr std::uint8_t kBackgroundAspectMarkerVariant = 28U;
-constexpr std::uint8_t kTrackSelectLensFlareMarkerVariant = 30U;
-constexpr std::uint8_t kSplitViewportMarkerVariant = 31U;
+using dkr::runtime::presentation::PresentationMarkerKind;
 constexpr float kSplitViewportCoverQuantisation = 1024.0F;
 enum class PresentationGroupMode : std::uint32_t {
     World = 0U,
@@ -67,6 +65,7 @@ float g_saved_transition_y = 1.0F;
 bool g_transition_cover_active = false;
 bool g_transition_interpolation_active = false;
 bool g_background_fill_stretch_active = false;
+bool g_three_player_panel_active = false;
 bool g_postrace_background_stretch_active = false;
 bool g_chequer_background_stretch_active = false;
 bool g_shadow_interpolation_active = false;
@@ -81,6 +80,8 @@ bool g_track_select_lens_flare_scope_active = false;
 dkr::runtime::intro::TailGate g_title_intro_tail_gate{};
 std::array<float, 8> g_saved_sky_projection_columns{};
 bool g_sky_cover_active = false;
+dkr::runtime::presentation::PostraceFrameGate g_postrace_frame_gate{};
+bool g_postrace_world_framed = false;
 
 float ExpandedCoverScale() {
     using ultramodern::renderer::AspectRatio;
@@ -115,11 +116,26 @@ gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
 }
 
+bool PostraceFullViewScope(std::uint8_t* rdram, float cover) {
+    namespace addresses = dkr::runtime::revision_addresses;
+    const auto word = [rdram](std::uint32_t address) {
+        return static_cast<std::int32_t>(MEM_W(0, RdramAddress(address)));
+    };
+    return dkr::runtime::presentation::postrace_full_view_scope(
+        dkr::runtime::enhancements::modern_presentation_enabled(),
+        cover > 1.0001F, word(addresses::GameMode) == 0,
+        static_cast<std::int8_t>(MEM_B(0, RdramAddress(addresses::PostRaceViewport))),
+        word(addresses::NumberOfActivePlayers), word(addresses::TrophyRaceWorldId),
+        word(addresses::ViewportLayout));
+}
+
 bool AppendPresentationGroupCommand(std::uint8_t* rdram,
                                     gpr display_list_pointer,
                                     PresentationGroupMode mode,
                                     std::uint16_t token = 0U,
-                                    std::uint8_t variant = 0U) {
+                                    std::uint8_t variant = 0U,
+                                    PresentationMarkerKind kind =
+                                        PresentationMarkerKind::Geometry) {
     if (display_list_pointer == 0) {
         return false;
     }
@@ -130,7 +146,7 @@ bool AppendPresentationGroupCommand(std::uint8_t* rdram,
     }
     (void)rdram;
     return dkr::runtime::presentation::record_presentation_marker(
-        current, static_cast<std::uint8_t>(mode), token, variant);
+        current, static_cast<std::uint8_t>(mode), token, variant, kind);
 }
 
 void EnsureLevelSegmentInterpolation(std::uint8_t* rdram) {
@@ -342,8 +358,11 @@ extern "C" std::uint32_t dkr_audio_event_queue_next(
     return recover(true, "non-progressing");
 }
 
+extern "C" void dkr_custom_tracks_prepare_memory(std::uint8_t*, recomp_context*);
+extern "C" void dkr_custom_tracks_prepare_vehicle(std::uint8_t*, recomp_context*);
+
 extern "C" void dkr_runtime_scene_reset(std::uint8_t* rdram,
-                                          recomp_context*) {
+                                          recomp_context* context) {
 #if DKR_RUNTIME_HAS_RT64
     // A transition can abandon one of these scoped patches before its normal
     // end hook runs. Restore any in-place matrix edit while the outgoing scene
@@ -368,6 +387,7 @@ extern "C" void dkr_runtime_scene_reset(std::uint8_t* rdram,
     g_transition_cover_active = false;
     g_transition_interpolation_active = false;
     g_background_fill_stretch_active = false;
+    g_three_player_panel_active = false;
     g_postrace_background_stretch_active = false;
     g_chequer_background_stretch_active = false;
     g_shadow_interpolation_active = false;
@@ -383,11 +403,58 @@ extern "C" void dkr_runtime_scene_reset(std::uint8_t* rdram,
     g_saved_transition_x = 1.0F;
     g_saved_transition_y = 1.0F;
     g_saved_sky_projection_columns = {};
+    g_postrace_frame_gate.reset();
+    g_postrace_world_framed = false;
 #else
     (void)rdram;
 #endif
     g_title_intro_tail_gate.reset();
     ResetAudioEventGuards();
+    // The existing level_load entry hook covers initial Track Lab loads,
+    // restarts and Track Select previews. Give a custom track its memory and
+    // model heap before the level allocates, and synchronize its vehicle
+    // before retail consumes r7.
+    if (rdram && context) {
+        dkr_custom_tracks_prepare_memory(rdram, context);
+        dkr_custom_tracks_prepare_vehicle(rdram, context);
+    }
+}
+
+void dkr::runtime::presentation::postrace_presentation_begin_frame() {
+#if DKR_RUNTIME_HAS_RT64
+    g_postrace_frame_gate.begin_frame();
+#endif
+}
+
+void dkr::runtime::presentation::postrace_presentation_submit_frame(bool presented) {
+#if DKR_RUNTIME_HAS_RT64
+    g_postrace_frame_gate.submit_frame(presented);
+#else
+    (void)presented;
+#endif
+}
+
+extern "C" void dkr_postrace_presentation_start(std::uint8_t*, recomp_context*) {
+#if DKR_RUNTIME_HAS_RT64
+    g_postrace_frame_gate.reset();
+    g_postrace_world_framed = false;
+#endif
+}
+
+extern "C" void dkr_postrace_wooden_frame_draw(std::uint8_t* rdram, recomp_context*) {
+#if DKR_RUNTIME_HAS_RT64
+    if (!rdram) return;
+    // This hook is the actual menu_element_render(4) call in postrace_viewport,
+    // after retail has updated the rectangle; asset-loading/stage gates have
+    // already passed. Merely entering postrace_start cannot trigger this.
+    const auto viewport = RdramAddress(dkr::runtime::revision_addresses::ScreenViewports);
+    g_postrace_frame_gate.observe_wood(
+        MEM_W(0, viewport), MEM_W(4, viewport), MEM_W(8, viewport), MEM_W(12, viewport),
+        dkr::runtime::presentation::kCanonicalViWidth,
+        dkr::runtime::presentation::kCanonicalViHeight);
+#else
+    (void)rdram;
+#endif
 }
 
 extern "C" void dkr_fix_fullscreen_clear_scissor(
@@ -422,6 +489,16 @@ extern "C" void dkr_split_screen_viewport_fill(
         return;
     }
     const float cover = ExpandedCoverScale();
+    const bool postrace = PostraceFullViewScope(rdram, cover);
+    g_postrace_world_framed = postrace &&
+        g_postrace_frame_gate.contracted_frame_submitted;
+    if (postrace && !g_postrace_world_framed) {
+        // Presentation-only viewport/scissor correction: leave the authored
+        // viewport, camera, menu animation and shared simulation RAM intact.
+        AppendPresentationGroupCommand(
+            rdram, context->r17, PresentationGroupMode::World, 0U,
+            0U, PresentationMarkerKind::PostraceFullViewport);
+    }
     const int viewport_layout = static_cast<std::int32_t>(
         MEM_W(0, RdramAddress(
             dkr::runtime::revision_addresses::ViewportLayout)));
@@ -443,7 +520,7 @@ extern "C" void dkr_split_screen_viewport_fill(
         (quantised_cover << 2U) | camera);
     AppendPresentationGroupCommand(
         rdram, context->r17, PresentationGroupMode::World, token,
-        kSplitViewportMarkerVariant);
+        0U, PresentationMarkerKind::SplitViewport);
 #else
     (void)rdram;
     (void)context;
@@ -470,34 +547,12 @@ extern "C" void dkr_split_screen_world_aspect_begin(
             rdram, context->r17, PresentationGroupMode::AspectAdjust);
     }
 
-    const auto postrace_viewport = static_cast<std::int8_t>(MEM_B(
-        0, RdramAddress(
-            dkr::runtime::revision_addresses::PostRaceViewport)));
-    const auto finish_state = static_cast<std::int8_t>(MEM_B(
-        0, RdramAddress(
-            dkr::runtime::revision_addresses::PostraceFinishState)));
-    const auto read_word = [rdram](const std::uint32_t address) {
-        return static_cast<std::int32_t>(MEM_W(0, RdramAddress(address)));
-    };
-    const bool framed_results_visible =
-        dkr::runtime::enhancements::postrace_wooden_frame_visible(
-            dkr::runtime::enhancements::modern_presentation_enabled(),
-            ExpandedCoverScale() > 1.0001F,
-            read_word(dkr::runtime::revision_addresses::GameMode) == 0,
-            postrace_viewport,
-            read_word(dkr::runtime::revision_addresses::NumberOfActivePlayers),
-            read_word(dkr::runtime::revision_addresses::TrophyRaceWorldId),
-            finish_state,
-            read_word(dkr::runtime::revision_addresses::MenuStage),
-            read_word(dkr::runtime::revision_addresses::MenuDelay));
-
-    // The fixed-aspect replay is derived from the exact state which causes
-    // retail to submit the wooden frame later in this same authored frame.
-    // No state survives into a retry, alternate finish path or later race.
-    if (framed_results_visible) {
+    // Use the SAME decision as the pre-viewport hook. No competing menu-stage
+    // predicate can enable 4:3 before the first contracted frame was submitted.
+    if (g_postrace_world_framed) {
         g_postrace_framed_scope_active = AppendPresentationGroupCommand(
             rdram, context->r17, PresentationGroupMode::StaticAuto, 0U,
-            kFramedResultsMarkerVariant);
+            0U, PresentationMarkerKind::FramedResults);
     }
 #else
     (void)rdram;
@@ -516,7 +571,7 @@ extern "C" void dkr_split_screen_world_aspect_end(
     if (g_postrace_framed_scope_active) {
         AppendPresentationGroupCommand(
             rdram, context->r17, PresentationGroupMode::World, 0U,
-            kFramedResultsMarkerVariant);
+            0U, PresentationMarkerKind::FramedResults);
         g_postrace_framed_scope_active = false;
     }
     if (g_split_world_aspect_active) {
@@ -602,7 +657,7 @@ extern "C" void dkr_track_select_lens_flare_tint_begin(
     g_track_select_lens_flare_scope_active =
         AppendPresentationGroupCommand(
             rdram, context->r17, PresentationGroupMode::StaticAuto, 0U,
-            kTrackSelectLensFlareMarkerVariant);
+            0U, PresentationMarkerKind::TrackSelectLensFlare);
 #else
     (void)rdram;
     (void)context;
@@ -618,7 +673,7 @@ extern "C" void dkr_track_select_lens_flare_tint_end(
     }
     AppendPresentationGroupCommand(
         rdram, context->r17, PresentationGroupMode::World, 0U,
-        kTrackSelectLensFlareMarkerVariant);
+        0U, PresentationMarkerKind::TrackSelectLensFlare);
     g_track_select_lens_flare_scope_active = false;
 #else
     (void)rdram;
@@ -1202,10 +1257,44 @@ extern "C" void dkr_background_fill_stretch_begin(std::uint8_t* rdram,
     }
     g_background_fill_stretch_active = AppendPresentationGroupCommand(
         rdram, context->r16, PresentationGroupMode::StaticAuto, 1U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
 #else
     (void)rdram;
     (void)context;
+#endif
+}
+
+// These two hooks bracket only divider_draw's optional lower-right fill,
+// after retail has decided whether to show the map/AI panel or T.T. camera.
+extern "C" void dkr_three_player_panel_begin(std::uint8_t* rdram,
+                                             recomp_context* context) {
+#if DKR_RUNTIME_HAS_RT64
+    g_three_player_panel_active = false;
+    if (rdram == nullptr || context == nullptr ||
+        !dkr::runtime::enhancements::modern_presentation_enabled() ||
+        ExpandedCoverScale() <= 1.0001F ||
+        MEM_W(0, RdramAddress(dkr::runtime::revision_addresses::ViewportLayout)) != 2) return;
+    // Token two extends the fill from centre to right. Token one is the
+    // unrelated full-width clear; a rect-aspect override alone cannot affect
+    // RT64's fill-cycle clear path.
+    g_three_player_panel_active = AppendPresentationGroupCommand(
+        rdram, context->r16, PresentationGroupMode::StaticAuto, 2U,
+        0U, PresentationMarkerKind::BackgroundAspect);
+#else
+    (void)rdram; (void)context;
+#endif
+}
+
+extern "C" void dkr_three_player_panel_end(std::uint8_t* rdram,
+                                           recomp_context* context) {
+#if DKR_RUNTIME_HAS_RT64
+    if (!g_three_player_panel_active) return;
+    AppendPresentationGroupCommand(
+        rdram, context->r16, PresentationGroupMode::World, 0U,
+        0U, PresentationMarkerKind::BackgroundAspect);
+    g_three_player_panel_active = false;
+#else
+    (void)rdram; (void)context;
 #endif
 }
 
@@ -1217,7 +1306,7 @@ extern "C" void dkr_background_fill_stretch_end(std::uint8_t* rdram,
     }
     AppendPresentationGroupCommand(
         rdram, context->r16, PresentationGroupMode::World, 0U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
     g_background_fill_stretch_active = false;
 #else
     (void)rdram;
@@ -1240,7 +1329,7 @@ extern "C" void dkr_postrace_background_stretch_begin(
     // their authored 4:3 placement.
     g_postrace_background_stretch_active = AppendPresentationGroupCommand(
         rdram, context->r4, PresentationGroupMode::StaticAuto, 0U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
 #else
     (void)rdram;
     (void)context;
@@ -1255,7 +1344,7 @@ extern "C" void dkr_postrace_background_stretch_end(
     }
     AppendPresentationGroupCommand(
         rdram, context->r4, PresentationGroupMode::World, 0U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
     g_postrace_background_stretch_active = false;
 #else
     (void)rdram;
@@ -1276,7 +1365,7 @@ extern "C" void dkr_chequer_background_stretch_begin(
     // same host-width policy without widening the authored replay viewport.
     g_chequer_background_stretch_active = AppendPresentationGroupCommand(
         rdram, context->r4, PresentationGroupMode::StaticAuto, 0U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
 #else
     (void)rdram;
     (void)context;
@@ -1291,7 +1380,7 @@ extern "C" void dkr_chequer_background_stretch_end(
     }
     AppendPresentationGroupCommand(
         rdram, context->r4, PresentationGroupMode::World, 0U,
-        kBackgroundAspectMarkerVariant);
+        0U, PresentationMarkerKind::BackgroundAspect);
     g_chequer_background_stretch_active = false;
 #else
     (void)rdram;

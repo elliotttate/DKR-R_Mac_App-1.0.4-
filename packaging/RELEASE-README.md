@@ -1,4 +1,4 @@
-# DKR-R 1.0.4-macos.1 — Apple Silicon
+# DKR-R 1.0.5-beta.10-macos.1 — Apple Silicon
 
 This is the experimental macOS build from
 https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-, based on jt87's macOS port
@@ -25,12 +25,21 @@ F8 toggles the optional 3D plants/items; F7 toggles terrain detail. Original
 gameplay timing and collision are retained. Saves, ROMs and texture packs stay
 outside the app. No ROM, saves or external HD texture pack is included.
 
-The package passed all 63 DKR tests, controller-pak recovery and signature/
-dependency checks. Balloon models were reviewed through 360 degrees; native
-USA 1.1 attract-mode draws were checked. This is not exhaustive course,
-multiplayer or gold/silver collection testing.
+## Upstream beta changes
 
-## Shared runtime information
+This playtest build repairs failed model-load cache accounting in US v1.0,
+safely rejects null model instances, and gives offline custom-mod sessions
+the native expansion-memory heap extent within the existing 8 MiB renderer
+boundary. Stock and online sessions keep their original heap extent.
+HUD asset-load failures now produce a bounded diagnostic instead of being silent.
+Custom-character selection facing, portraits, voices, HUD placement and Blender
+Track Lab additions are retained. Visual HUD acceptance remains a playtest check.
+Track Lab is available in **Mods/Hacks**, directly below **Magic Codes**, with
+its Blender working-folder, import and testing controls intact.
+Custom legacy mods remain offline-only, with at most two active custom characters.
+Characters can only use replacement portraits and sounds actually supplied by
+their mod; unchanged donor assets remain unchanged. Saved ghost identities still
+use the original game's character IDs.
 
 DKR-R is a native static recompilation of Diddy Kong Racing. This package does
 not include the game ROM or extracted game assets. Supply your own legally
@@ -49,8 +58,7 @@ Open settings with Escape, F1 or controller Back/View. Alt+Enter and F11 toggle
 fullscreen. Local settings, saves, Controller Paks, imported filters and texture
 packs are stored outside this package.
 
-Modern mode includes compact HUD controls for original placement, a protected
-safe area or fit-to-viewport positioning, plus a global HUD-size adjustment.
+Modern mode includes HUD controls for original 4:3 or fit-to-window placement.
 HUD artwork retains its original proportions; these presentation settings do
 not alter gameplay or online determinism.
 

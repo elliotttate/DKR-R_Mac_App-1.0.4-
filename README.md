@@ -18,9 +18,14 @@ original game simulation and collision.
 - **Native packaging:** bundled SDL runtimes and Finder-safe asset discovery.
   See [local build instructions](LOCAL-MAC-BUILD.md).
 
+The current source integrates upstream `main` at
+[`8a8e927`](https://github.com/ThatGuyMcd/DKR-R/commit/8a8e927e9ea14c5c07ca7ad74b44fdbe077f5ff6)
+(September 19, 2026), version **1.0.5-beta.10**, with our 3D models and terrain.
+The unfinished PBR experiment remains separate. See [build instructions](LOCAL-MAC-BUILD.md).
+
 ### [Download this fork's Mac release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
 
-Version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
+The previously published version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
 These experimental builds are ad-hoc signed, **not notarized**; see the included
 [Mac installation instructions](packaging/RELEASE-README.md). ROMs, saves,
 external HD packs, and ROM-derived audit fixtures are not included. The original
@@ -75,8 +80,9 @@ are not in any upstream release:
 
 Four of these are upstream bugs and have been reported to the relevant projects.
 
-The full set is in [`macos-patches/`](macos-patches/) as a standalone series,
-and applied to the source in this fork. `scripts/Bundle-macOS-Redistributable.sh`
+The original port fixes are in [`macos-patches/`](macos-patches/) as a standalone
+series and applied to this fork. Current source also includes the beta-specific
+Apple compatibility changes described in [the update notes](UPSTREAM-UPDATE.md). `scripts/Bundle-macOS-Redistributable.sh`
 vendors SDL into the app bundle so it runs without Homebrew.
 
 ## Support
@@ -87,19 +93,10 @@ Linux release. Bugs specific to macOS belong here.
 
 ## Building it yourself
 
-```bash
-./Setup-macOS.sh
-./scripts/Prepare-DKR-Runtime-macOS.sh          # prompts for your ROM
-# re-apply the RT64 Retina patch, which dependency prep resets:
-(cd extern/rt64 && git apply ../../macos-patches/extern/rt64-enable-retina.patch)
-DKR_MAC_V80_GENERATED_SOURCE=<v80-generated-dir> ./Build-macOS.sh
-./scripts/Bundle-macOS-Redistributable.sh dist/*/DKR-R.app "Developer ID Application: ..."
-```
-
-`Build-macOS.sh` requires generated sources for **both** ROM revisions. The prep
-script produces the v1.0 (v77) payload; the Rev A (v80) payload is generated
-separately from a v1.1 ROM with `scripts/generate_recomp_config.py` and
-N64Recomp.
+Follow [LOCAL-MAC-BUILD.md](LOCAL-MAC-BUILD.md) to prepare both matching ROM
+revisions, generate the current beta payloads, and build the signed Mac ZIP.
+The 1.0.5 beta requires regenerated payloads with the checked legacy track and
+character hooks; the previous 1.0.4 generated sources cannot be reused.
 
 ## Licence
 

@@ -1,10 +1,13 @@
 #include "rt64_renderer.hpp"
+#include "render/rt64_generated_mip_config.h"
 
 #include "game_registration.hpp"
 #include "presentation_identity.hpp"
 #include "renderer_snapshot.hpp"
+#include "revision_addresses.hpp"
 #include "runtime_enhancements.hpp"
 #include "runtime_netplay.hpp"
+#include "netplay/failure_recorder.hpp"
 #include "runtime_telemetry.hpp"
 #include "runtime_texture_packs.hpp"
 #include "startup_performance.hpp"
@@ -20,6 +23,7 @@
 #include "common/rt64_enhancement_configuration.h"
 #include "common/rt64_user_configuration.h"
 #include "hle/rt64_application.h"
+#include "runtime_mipmap_loading.hpp"
 #include "hle/rt64_state.h"
 #include "render/rt64_shader_library.h"
 #include "librecomp/game.hpp"
@@ -32,6 +36,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <tuple>
 #include <utility>
@@ -346,6 +351,11 @@ dkr::runtime::RT64Renderer::RT64Renderer(
     const float texture_lod_bias =
         dkr::runtime::enhancements::effective_texture_lod_bias();
     RT64::setDefaultSamplerMipLODBias(texture_lod_bias);
+    RT64::beginGeneratedMipSession(dkr::runtime::enhancements::generated_mipmaps_requested());
+    RT64::setGeneratedMipSampling(dkr::runtime::enhancements::modern_presentation_enabled());
+    std::fprintf(stderr, "[boot][graphics] generated_texture_mipmaps=%s (sampling=%s)\n",
+        RT64::generatedMipSessionEnabled() ? "on" : "off",
+        RT64::generatedMipSamplingEnabled() ? "on" : "off");
     std::fprintf(stderr,
                  "[boot][graphics] texture_lod_bias=%+.2f anisotropy=%d\n",
                  static_cast<double>(texture_lod_bias),
@@ -513,6 +523,7 @@ void dkr::runtime::RT64Renderer::send_dl(const OSTask* task,
         return;
     }
     dkr::runtime::telemetry::record_graphics_task();
+    RT64::MipWaitFeedbackScope mipFeedback([this] { present_mipmap_loading(*application_); });
 
     // A real RSP DMAs task inputs before notifying the CPU that it may recycle
     // them. DKR relies on that during scene transitions and can free texture
@@ -533,7 +544,84 @@ void dkr::runtime::RT64Renderer::send_dl(const OSTask* task,
     if (ExperimentalInterpolationEnabled()) {
         application_->state->setRefreshRate(30);
     }
-    f3ddkr_.process(*application_, *task);
+    if (track_performance::enabled()) {
+        const auto start = track_performance::Clock::now();
+        f3ddkr_.process(*application_, *task);
+        record_track_performance(rdram_snapshot, start);
+    } else {
+        f3ddkr_.process(*application_, *task);
+    }
+}
+
+void dkr::runtime::RT64Renderer::record_track_performance(
+    std::uint8_t* snapshot, track_performance::Clock::time_point start) {
+    using namespace track_performance;
+    const auto now = Clock::now();
+    const auto read_word = [&](std::uint32_t address) {
+        std::uint32_t value = 0U;
+        // Submission snapshot uses host-endian aligned N64 words. Read only
+        // revision-mapped globals, never live simulation memory.
+        std::memcpy(&value, snapshot + (address & 0x007FFFFCU), sizeof(value));
+        return value;
+    };
+    const auto scene = presentation::task_scene_generation();
+    const auto map = read_word(revision_addresses::CurrentMapId);
+    const auto menu = read_word(revision_addresses::CurrentMenuId);
+    auto& capture = track_capture_;
+    if (capture.count == 0U || capture.scene != scene ||
+        capture.map != map || capture.menu != menu) {
+        capture.count = 0U;
+        capture.started = start;
+        capture.scene = scene;
+        capture.map = map;
+        capture.menu = menu;
+    }
+    capture.decode_ms[capture.count++] =
+        std::chrono::duration<double, std::milli>(now - start).count();
+    if (capture.count < kSamples) return;
+
+    std::array<Samples, 4> history{};
+    bool available = false;
+    if (application_->workloadQueue != nullptr) {
+        auto& queue = *application_->workloadQueue;
+        // Writers own this mutex during matching and rendering. Diagnostics
+        // must never wait for it, alter its timers or retain references after
+        // release. Copy only bounded history, then format/log outside it.
+        std::unique_lock lock(queue.threadMutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            const RT64::ProfilingTimer* timers[] = {
+                &queue.matchingProfiler, &queue.rendererCPUProfiler,
+                &queue.rendererGPUProfiler, &queue.workloadProfiler};
+            for (std::size_t i = 0U; i < history.size(); ++i) {
+                std::copy_n(timers[i]->data(),
+                    std::min(timers[i]->size(), kSamples), history[i].begin());
+            }
+            available = true;
+        }
+    }
+    if (!available) ++capture.unavailable_windows;
+    const auto decode = summarize(capture.decode_ms);
+    const double seconds = std::chrono::duration<double>(now - capture.started).count();
+    std::fprintf(stderr,
+        "[perf][track] scene=%u map=%u menu=%u tasks=%zu seconds=%.3f "
+        "task-hz=%.2f decode-ms(p50/p95/p99)=%.3f/%.3f/%.3f "
+        "renderer-history-available=%u unavailable-windows=%llu\n",
+        scene, map, menu, capture.count, seconds,
+        seconds > 0.0 ? static_cast<double>(capture.count - 1U) / seconds : 0.0,
+        decode.median, decode.p95, decode.p99, available ? 1U : 0U,
+        static_cast<unsigned long long>(capture.unavailable_windows));
+    const char* labels[] = {"matching", "render-cpu", "render-gpu", "workload"};
+    if (available) {
+        for (std::size_t i = 0U; i < history.size(); ++i) {
+            const auto result = summarize(history[i]);
+            std::fprintf(stderr,
+                "[perf][track-history] %s n=%zu ms(p50/p95/p99)=%.3f/%.3f/%.3f\n",
+                labels[i], result.count, result.median, result.p95, result.p99);
+        }
+    }
+    // These are rolling renderer timings, not presented-frame intervals.
+    // They can include the preceding scene until its history ages out.
+    capture.count = 0U;
 }
 
 void dkr::runtime::RT64Renderer::update_screen() {
@@ -542,6 +630,7 @@ void dkr::runtime::RT64Renderer::update_screen() {
         return;
     }
     dkr::runtime::telemetry::record_vi_present();
+    RT64::MipWaitFeedbackScope mipFeedback([this] { present_mipmap_loading(*application_); });
     if (application_->sharedQueueResources != nullptr) {
         const std::uint64_t completed = application_->sharedQueueResources->
             totalPresentations.load(std::memory_order_relaxed);
@@ -596,7 +685,8 @@ void dkr::runtime::RT64Renderer::service_online_wait_presentation() {
         return;
     }
 
-    std::scoped_lock presentation_lock(presentation_mutex_);
+    std::unique_lock presentation_lock(presentation_mutex_, std::try_to_lock);
+    if (!presentation_lock.owns_lock()) return;
     const bool queue_ready = application_ != nullptr &&
         application_->state != nullptr &&
         application_->workloadQueue != nullptr &&
@@ -657,16 +747,29 @@ void dkr::runtime::RT64Renderer::service_online_wait_presentation() {
     dkr::runtime::ui::draw(*application_);
     bool has_inspector = false;
     {
-        const std::scoped_lock inspector_lock(
-            application_->presentQueue->inspectorMutex);
+        const std::unique_lock inspector_lock(
+            application_->presentQueue->inspectorMutex, std::try_to_lock);
+        if (!inspector_lock.owns_lock()) return;
         has_inspector = application_->presentQueue->inspector != nullptr;
     }
     if (has_inspector) {
         const bool previous_pause =
             application_->state->debuggerInspector.paused;
         application_->state->debuggerInspector.paused = true;
+        const auto replay_started = std::chrono::steady_clock::now();
         application_->updateScreen();
         application_->state->debuggerInspector.paused = previous_pause;
+        const auto replay_elapsed = std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                      replay_started);
+        if (replay_elapsed >= std::chrono::milliseconds(50) &&
+            replay_elapsed > slowest_wait_replay_) {
+            slowest_wait_replay_ = replay_elapsed;
+            netplay::failure_recorder().record(
+                netplay::FailureEventKind::ProgressWatchdog, 0U,
+                static_cast<std::uint32_t>(replay_elapsed.count()), 0U,
+                "slow synchronized wait presentation (milliseconds)");
+        }
     }
     last_wait_presentation_ = now;
     observed_wait_generation_ = wait_generation;
@@ -722,7 +825,8 @@ dkr::runtime::CreateRT64Renderer(
 }
 
 void dkr::runtime::service_online_wait_presentation() {
-    std::scoped_lock active_lock(g_active_renderer_mutex);
+    std::unique_lock active_lock(g_active_renderer_mutex, std::try_to_lock);
+    if (!active_lock.owns_lock()) return;
     if (g_active_renderer != nullptr) {
         g_active_renderer->service_online_wait_presentation();
     }

@@ -19,7 +19,10 @@ enum class TransportTrafficClass : std::uint8_t {
     Authoritative,
     Realtime,
     Replica,
+    Checkpoint,
 };
+
+enum class QuickJoinRekeyStatus { Idle, Pending, Committed, Failed };
 
 // Keep each traffic class on its own Quick Join data channel. In particular,
 // immutable frame commits use a reliable/unordered channel: losing one SCTP
@@ -51,6 +54,10 @@ public:
                          std::vector<std::uint8_t>& bytes,
                          std::string& error) = 0;
     virtual void service() {}
+    // Only authenticated session admission may pin a logical route across ICE
+    // replacement. An unapproved connection must retain its bounded lifetime.
+    virtual void retain_peer_route(const PeerAddress&) {}
+    virtual void release_peer_route(const PeerAddress&) {}
     virtual std::size_t buffered_bytes(TransportTrafficClass) const {
         return 0U;
     }
@@ -80,6 +87,7 @@ public:
         error = "This transport does not support Quick Join code rotation.";
         return false;
     }
+    virtual QuickJoinRekeyStatus rekey_status() const { return QuickJoinRekeyStatus::Idle; }
     virtual bool take_quick_join_bootstrap(std::string&, PeerAddress&) {
         return false;
     }

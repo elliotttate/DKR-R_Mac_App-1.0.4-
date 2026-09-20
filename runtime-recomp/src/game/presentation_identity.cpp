@@ -2,8 +2,10 @@
 #include "revision_addresses.hpp"
 
 #include "recomp.h"
+#include "finish_presentation_policy.hpp"
 
 #include "runtime_enhancements.hpp"
+#include "runtime_hud_layout.hpp"
 #include "runtime_netplay.hpp"
 #include "vehicle_context_policy.hpp"
 
@@ -40,8 +42,6 @@ const std::uint32_t& kCurrentCameraFovAddress =
     dkr::runtime::revision_addresses::CurrentCameraFov;
 const std::uint32_t& kCutsceneCameraActiveAddress =
     dkr::runtime::revision_addresses::CutsceneCameraActive;
-const std::uint32_t& kSceneActiveCameraAddress =
-    dkr::runtime::revision_addresses::SceneActiveCamera;
 constexpr std::uint32_t kCameraModeOffset = 0x36U;
 const std::uint32_t& kWaveControllerAddress =
     dkr::runtime::revision_addresses::WaveController;
@@ -154,6 +154,9 @@ std::array<std::unordered_map<std::uint32_t, MatrixBinding>, 2> g_matrix_maps;
 std::array<std::unordered_map<std::uint32_t,
     std::vector<dkr::runtime::presentation::PresentationMarker>>, 2>
     g_marker_maps;
+std::array<dkr::runtime::presentation::MarkerRecordingIntegrity, 2>
+    g_marker_integrity{};
+dkr::runtime::presentation::PresentationDiagnosticBudget g_marker_rejections{};
 std::array<std::unordered_map<std::uint64_t,
     dkr::runtime::presentation::ShadowOwnerMotionSample>, 2>
     g_shadow_owner_motion_maps;
@@ -167,7 +170,7 @@ std::uint32_t g_next_presentation_token = 1U;
 std::atomic<std::uint64_t> g_identity_collisions{0U};
 std::atomic<std::uint64_t> g_matrix_ranges{0U};
 std::array<CameraContinuityState, 8> g_camera_continuity{};
-std::array<bool, 8> g_camera_discontinuity_pending{};
+std::array<dkr::runtime::presentation::FinishCameraShot, 8> g_finish_camera_shots{};
 thread_local std::array<ObjectCapture, kMaximumObjectNesting> g_capture_stack{};
 thread_local std::size_t g_capture_depth = 0U;
 thread_local std::size_t g_capture_overflow_depth = 0U;
@@ -381,14 +384,6 @@ bool CapturePalmAttachment(std::uint8_t* rdram, dkr::runtime::palm::Sample& samp
             sample.sprite_id, sample.position[0], sample.position[1], sample.position[2],
             sample.attachment[0], sample.attachment[1], sample.attachment[2], sample.attachment_valid, vertices.size());
     return true;
-}
-
-int ActiveSceneCameraMode(std::uint8_t* rdram) {
-    const std::uint32_t camera = ReadU32(rdram, kSceneActiveCameraAddress);
-    if (!ValidRange(camera, kCameraSize)) {
-        return -1;
-    }
-    return static_cast<int>(ReadS16(rdram, camera + kCameraModeOffset));
 }
 
 bool ActiveLogicalCamera(std::uint8_t* rdram, std::uint32_t& camera_id) {
@@ -659,8 +654,8 @@ void RegisterCameraMatrix(std::uint8_t* rdram,
     const std::uint32_t task = ReadU32(rdram, kSpTaskNumberAddress);
     CameraContinuityState& continuity = g_camera_continuity[camera_id];
     const bool forced_discontinuity =
-        g_camera_discontinuity_pending[camera_id];
-    g_camera_discontinuity_pending[camera_id] = false;
+        g_finish_camera_shots[camera_id].sample(
+            ReadS16(rdram, camera + kCameraModeOffset));
     if (!continuity.valid || continuity.scene != scene) {
         continuity = CameraContinuityState{sample, scene, task, 1U, true};
         if (forced_discontinuity) {
@@ -1149,19 +1144,33 @@ void dkr::runtime::presentation::interpolation_trace_billboard(
 
 bool dkr::runtime::presentation::record_presentation_marker(
     std::uint32_t command_address, std::uint8_t mode,
-    std::uint16_t token, std::uint8_t variant) {
-    if (!dkr::runtime::enhancements::modern_presentation_enabled() ||
-        !ValidRange(command_address, 8U) || mode > 9U) {
+    std::uint16_t token, std::uint8_t variant, PresentationMarkerKind kind,
+    hud::groups::Transform hud_transform) {
+    if (!dkr::runtime::enhancements::modern_presentation_enabled()) {
         return false;
     }
     const std::uint32_t physical = Physical(command_address);
     std::scoped_lock lock(g_identity_mutex);
+    auto& integrity = g_marker_integrity[g_recording_buffer & 1U];
+    if (!integrity.valid) return false;
     auto& markers = g_marker_maps[g_recording_buffer & 1U][physical];
-    if (markers.size() >= kMaximumMarkersPerCommand) {
+    if (!integrity.accept(ValidRange(command_address, 8U) &&
+                          valid_presentation_marker(kind, mode, variant) &&
+                          (kind != PresentationMarkerKind::HudWidget || hud_transform.valid()),
+                          markers.size(), kMaximumMarkersPerCommand)) {
+        if (g_marker_rejections.record(g_next_submission_sequence.load(
+                std::memory_order_relaxed))) {
+            std::fprintf(stderr,
+                "[boot][presentation] rejected marker transaction "
+                "address=0x%08X kind=%u mode=%u variant=%u count=%zu "
+                "total=%llu since-report=%llu; partial task metadata discarded\n",
+                command_address, static_cast<unsigned>(kind), mode, variant,
+                markers.size(), static_cast<unsigned long long>(g_marker_rejections.total),
+                static_cast<unsigned long long>(g_marker_rejections.take_pending()));
+        }
         return false;
     }
-    markers.push_back(PresentationMarker{mode, token,
-                                         static_cast<std::uint8_t>(variant & 0x1FU)});
+    markers.push_back(PresentationMarker{mode, token, variant, kind, hud_transform});
     return true;
 }
 
@@ -1265,7 +1274,7 @@ extern "C" void dkr_presentation_scene_begin(std::uint8_t*, recomp_context*) {
     g_rigid_shadow_owner_policies.clear();
     g_next_presentation_token = 1U;
     g_camera_continuity = {};
-    g_camera_discontinuity_pending = {};
+    g_finish_camera_shots = {};
     g_current_camera_identity =
         dkr::runtime::presentation::kIgnoredIdentity;
     g_recording_interpolation_allowed = false;
@@ -1285,6 +1294,7 @@ extern "C" void dkr_presentation_scene_begin(std::uint8_t*, recomp_context*) {
         map.clear();
         map.reserve(1024U);
     }
+    g_marker_integrity = {};
     for (auto& map : g_marker_maps) {
         map.clear();
         map.reserve(256U);
@@ -1305,6 +1315,8 @@ extern "C" void dkr_presentation_scene_begin(std::uint8_t*, recomp_context*) {
 
 extern "C" void dkr_presentation_frame_begin(std::uint8_t* rdram,
                                               recomp_context*) {
+    dkr::runtime::hud::begin_authored_frame(rdram);
+    dkr::runtime::presentation::postrace_presentation_begin_frame();
     const std::uint64_t frame =
         g_authored_frame_sequence.fetch_add(
             1U, std::memory_order_relaxed) + 1U;
@@ -1316,26 +1328,14 @@ extern "C" void dkr_presentation_frame_begin(std::uint8_t* rdram,
     g_capture_overflow_depth = 0U;
     g_current_camera_identity =
         dkr::runtime::presentation::kIgnoredIdentity;
-    const int camera_mode = ActiveSceneCameraMode(rdram);
     g_recording_interpolation_allowed =
-        dkr::runtime::enhancements::interpolation_allowed_for_camera(
-            dkr::runtime::enhancements::presentation_profile(), camera_mode);
+        dkr::runtime::enhancements::interpolation_allowed(
+            dkr::runtime::enhancements::presentation_profile());
     std::scoped_lock lock(g_identity_mutex);
     g_matrix_maps[g_recording_buffer].clear();
     g_marker_maps[g_recording_buffer].clear();
+    g_marker_integrity[g_recording_buffer] = {};
     g_shadow_owner_motion_maps[g_recording_buffer].clear();
-}
-
-extern "C" void dkr_presentation_viewport_camera_mode(
-    std::uint8_t* rdram, recomp_context*) {
-    const int camera_mode = ActiveSceneCameraMode(rdram);
-    g_recording_interpolation_allowed =
-        dkr::runtime::enhancements::interpolation_allowed_for_camera(
-            dkr::runtime::enhancements::presentation_profile(), camera_mode);
-    if (!g_recording_interpolation_allowed) {
-        g_current_camera_identity =
-            dkr::runtime::presentation::kIgnoredIdentity;
-    }
 }
 
 extern "C" void dkr_presentation_perspective_matrix(
@@ -1482,6 +1482,8 @@ extern "C" void dkr_presentation_object_freed(std::uint8_t*,
 
 extern "C" void dkr_presentation_task_submitted(std::uint8_t* rdram,
                                                   recomp_context* context) {
+    dkr::runtime::presentation::postrace_presentation_submit_frame(
+        dkr::runtime::netplay::external_side_effects_allowed());
     if (!dkr::runtime::netplay::external_side_effects_allowed()) {
         std::scoped_lock lock(g_identity_mutex);
         g_matrix_maps[g_recording_buffer & 1U].clear();
@@ -1531,6 +1533,15 @@ extern "C" void dkr_presentation_task_submitted(std::uint8_t* rdram,
     frame.shadow_owner_motion =
         std::move(g_shadow_owner_motion_maps[g_recording_buffer & 1U]);
     g_shadow_owner_motion_maps[g_recording_buffer & 1U].reserve(64U);
+    if (!g_marker_integrity[g_recording_buffer & 1U].valid) {
+        // Use the existing no-sidecar fallback for this malformed task only.
+        // Never publish a truncated begin/end stream, or retain the failure
+        // into the next frame/scene. Valid tasks take the unchanged path.
+        frame.markers.clear();
+        frame.matrices.clear();
+        frame.shadow_owner_motion.clear();
+        frame.interpolation_allowed = false;
+    }
     g_submitted_frames.emplace_back(std::move(frame));
 }
 
@@ -1618,14 +1629,21 @@ extern "C" void dkr_presentation_object_end(std::uint8_t* rdram,
     }
 }
 
-extern "C" void dkr_presentation_finish_camera_enter(
-    std::uint8_t*, recomp_context*) {
-    // This hook lands on the exact transition into CAMERA_FINISH_RACE. The
-    // post-race flag can be committed later in the same authored frame, so
-    // gate the recording immediately. Do not churn camera epochs for every
-    // fixed spectator node: that created expensive pairing invalidations and
-    // still allowed incompatible end-race display lists to meet.
-    g_recording_interpolation_allowed = false;
-    g_current_camera_identity =
-        dkr::runtime::presentation::kIgnoredIdentity;
+extern "C" void dkr_presentation_finish_camera_node(
+    std::uint8_t* rdram, recomp_context* context) {
+    // update_camera_finish_race, after spectate_nearest returns a node:
+    // s0=&gCameraObject, a0=node, a3=racer object (verified in BOTH revisions).
+    // Observe the final shot here; advance its epoch only when it is rendered.
+    if (!rdram || !context) return;
+    const auto reference = static_cast<std::uint32_t>(context->r16);
+    if (!ValidRange(reference, 4U)) return;
+    const auto camera = ReadU32(rdram, reference);
+    if (camera < kCamerasAddress || (camera - kCamerasAddress) % kCameraSize != 0U) return;
+    const auto slot = (camera - kCamerasAddress) / kCameraSize;
+    const auto node = static_cast<std::uint32_t>(context->r4);
+    const auto owner = static_cast<std::uint32_t>(context->r7);
+    if (slot >= g_finish_camera_shots.size() ||
+        !ValidObjectAddress(node) || !ValidObjectAddress(owner)) return;
+    std::scoped_lock lock(g_identity_mutex);
+    g_finish_camera_shots[slot].observe_node(owner, node);
 }

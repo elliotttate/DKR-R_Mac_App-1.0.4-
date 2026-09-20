@@ -43,6 +43,7 @@ constexpr std::size_t kMaximumBundleSize =
     dkr::runtime::saves::kControllerPakCount * (32U + kControllerPakSize);
 std::filesystem::path g_config_directory;
 std::mutex g_save_manager_mutex;
+std::vector<std::uint8_t> g_staged_host_online_save;
 
 std::filesystem::path AdventurePath() {
     return g_config_directory / "saves" / "dkr.us.v77.bin";
@@ -419,6 +420,7 @@ void dkr::runtime::saves::configure(
     const std::filesystem::path& config_directory) {
     std::scoped_lock lock(g_save_manager_mutex);
     g_config_directory = config_directory;
+    g_staged_host_online_save.clear();
 }
 
 dkr::runtime::saves::SaveInfo dkr::runtime::saves::adventure_info() {
@@ -676,18 +678,9 @@ bool dkr::runtime::saves::prepare_host_online_adventure(
         bytes = std::move(stored);
     }
 
-    if (mode != OnlineSaveSeedMode::ContinuePreviousSession &&
-        !WriteAtomic(destination, bytes, ReadAdventure, error)) {
-        error = "The host online save could not be created: " + error;
-        bytes.clear();
-        return false;
-    }
-    std::vector<std::uint8_t> verified;
-    if (!ReadAdventure(destination, verified) || verified != bytes) {
-        error = "The host online save did not pass its read-back verification.";
-        bytes.clear();
-        return false;
-    }
+    // Creating a lobby is not a commit point: registration/approval may fail.
+    // Keep the validated seed in memory until actual host game-save activation.
+    g_staged_host_online_save = bytes;
     error.clear();
     return true;
 }
@@ -729,6 +722,23 @@ bool dkr::runtime::saves::read_online_adventure(
     std::scoped_lock lock(g_save_manager_mutex);
     bytes.clear();
     path = OnlineAdventurePath(host, match_id);
+    if (host && !g_staged_host_online_save.empty()) {
+        std::vector<std::uint8_t> previous;
+        const bool had_previous = ReadAdventure(path, previous);
+        if (had_previous && previous != g_staged_host_online_save &&
+            !WriteAtomic(path.string() + ".previous-session", previous, ReadAdventure, error)) {
+            error = "The previous online session could not be preserved: " + error;
+            return false;
+        }
+        if ((!had_previous || previous != g_staged_host_online_save) &&
+            !WriteAtomic(path, g_staged_host_online_save, ReadAdventure, error)) return false;
+        std::vector<std::uint8_t> verified;
+        if (!ReadAdventure(path, verified) || verified != g_staged_host_online_save) {
+            error = "The staged host save did not pass activation read-back verification.";
+            return false;
+        }
+        g_staged_host_online_save.clear();
+    }
     if ((!host && match_id == 0U) || !ReadAdventure(path, bytes)) {
         error = "The expected checksum-valid online Adventure save is unavailable.";
         bytes.clear();

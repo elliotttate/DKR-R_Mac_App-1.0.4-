@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <sstream>
+#include <vector>
 
 namespace dkr::runtime::netplay {
 namespace {
@@ -58,30 +60,38 @@ void FailureRecorder::record(FailureEventKind kind, std::uint32_t frame,
 void FailureRecorder::dump(std::FILE* stream,
                            std::size_t maximum_events) const {
     if (stream == nullptr || maximum_events == 0U) return;
+    const auto text = snapshot_text(maximum_events);
+    std::fwrite(text.data(), 1U, text.size(), stream);
+    std::fflush(stream);
+}
+
+std::string FailureRecorder::snapshot_text(std::size_t maximum_events) const {
+    std::vector<FailureEvent> copy;
+    copy.reserve((std::min)(maximum_events, kCapacity));
+    {
     std::scoped_lock lock(mutex_);
     const std::uint64_t first_available =
         next_sequence_ > kCapacity ? next_sequence_ - kCapacity : 1U;
     const std::uint64_t requested_first =
         next_sequence_ > maximum_events ? next_sequence_ - maximum_events : 1U;
     const std::uint64_t first = (std::max)(first_available, requested_first);
-    std::fprintf(stream,
-                 "[netplay][flight-recorder] begin first=%llu next=%llu\n",
-                 static_cast<unsigned long long>(first),
-                 static_cast<unsigned long long>(next_sequence_));
     for (std::uint64_t sequence = first; sequence < next_sequence_; ++sequence) {
         const FailureEvent& event =
             events_[static_cast<std::size_t>((sequence - 1U) % kCapacity)];
         if (event.sequence != sequence) continue;
-        std::fprintf(stream,
-                     "[netplay][flight-recorder] seq=%llu us=%llu kind=%s "
-                     "frame=%u a=%u b=%u detail=%s\n",
-                     static_cast<unsigned long long>(event.sequence),
-                     static_cast<unsigned long long>(event.monotonic_micros),
-                     kind_name(event.kind), event.frame, event.value_a,
-                     event.value_b, event.detail.data());
+        copy.push_back(event);
     }
-    std::fprintf(stream, "[netplay][flight-recorder] end\n");
-    std::fflush(stream);
+    }
+    std::ostringstream out;
+    out << "[netplay][flight-recorder] begin\n";
+    for (const auto& event : copy) {
+        out << "[netplay][flight-recorder] seq=" << event.sequence
+            << " us=" << event.monotonic_micros << " kind=" << kind_name(event.kind)
+            << " frame=" << event.frame << " a=" << event.value_a
+            << " b=" << event.value_b << " detail=" << event.detail.data() << '\n';
+    }
+    out << "[netplay][flight-recorder] end\n";
+    return out.str();
 }
 
 void FailureRecorder::clear() {

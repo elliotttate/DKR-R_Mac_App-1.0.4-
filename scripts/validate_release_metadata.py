@@ -17,8 +17,8 @@ def fail(message: str) -> None:
 
 def main() -> int:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        fail(f"VERSION is not a final semantic version: {version!r}")
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-beta\.[1-9]\d*)?", version):
+        fail(f"VERSION is not a supported release/beta semantic version: {version!r}")
 
     appdata = (ROOT / "packaging/linux/dkr-port.appdata.xml").read_text(
         encoding="utf-8"

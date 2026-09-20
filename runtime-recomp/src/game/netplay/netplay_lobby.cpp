@@ -170,6 +170,11 @@ bool Lobby::can_start(std::string* reason) const {
     if (player_count() < 2U) {
         return reject("At least two racers are required.");
     }
+    // JOINTVENTURE is the retail two-player Adventure mode, not a four-player
+    // race modifier. Reject that unsupported combination before any launch.
+    if (player_count() > 2U && (room_.manifest.magic_codes_hash & (1ULL << 24U))) {
+        return reject("Two-player Adventure (JOINTVENTURE) requires exactly two racers. Disable it for three- or four-player races and minigames.");
+    }
     for (const Player& player : room_.players) {
         if (player.occupied && (!player.compatible || !player.ready)) {
             return reject("Every connected racer must be compatible and Ready.");

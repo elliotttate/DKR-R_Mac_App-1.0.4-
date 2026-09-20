@@ -91,7 +91,7 @@ std::optional<LanLobby> decode(std::string_view packet) {
         !number(fields[2], lobby.players) || !number(fields[3], lobby.maximum_players) ||
         !number(fields[4], in_progress) || in_progress > 1U ||
         lobby.players > lobby.maximum_players ||
-        lobby.maximum_players != kSupportedOnlinePlayers ||
+        lobby.maximum_players < 2U || lobby.maximum_players > kSupportedOnlinePlayers ||
         !safe_text(fields[5], kMaximumLobbyNameBytes) ||
         !safe_text(fields[6], kMaximumPlayerNameBytes) || fields[7].size() > 768U ||
         !fields[7].starts_with("dkr-r://v7/")) return std::nullopt;

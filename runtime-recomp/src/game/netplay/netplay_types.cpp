@@ -88,7 +88,7 @@ bool valid_room_name(std::string_view value) {
 }
 
 bool valid_rules(const Rules& rules) {
-    return rules.maximum_players == kSupportedOnlinePlayers &&
+    return rules.maximum_players >= 2U && rules.maximum_players <= kSupportedOnlinePlayers &&
            rules.manual_input_delay <= kMaximumInputDelayFrames &&
            rules.synchronization <= SynchronizationMode::Lockstep &&
            ((rules.synchronization == SynchronizationMode::Rollback &&

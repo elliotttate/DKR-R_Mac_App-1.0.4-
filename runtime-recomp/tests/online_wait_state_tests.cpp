@@ -13,6 +13,7 @@ int main() {
 
     state.enter(OnlineWaitReason::Transition);
     const std::uint64_t transition_generation = state.generation();
+    const auto transition_episode = state.episode();
     assert(state.active());
     assert(state.reason() == OnlineWaitReason::Transition);
     assert(transition_generation != 0U);
@@ -25,6 +26,7 @@ int main() {
     state.enter(OnlineWaitReason::ClientCatchUp);
     assert(state.reason() == OnlineWaitReason::ClientCatchUp);
     assert(state.generation() > transition_generation);
+    assert(state.episode() == transition_episode);
 
     state.leave();
     const std::uint64_t cleared_generation = state.generation();
@@ -37,6 +39,7 @@ int main() {
     assert(state.generation() == cleared_generation);
     state.enter(OnlineWaitReason::ClientCatchUp);
     assert(state.generation() > cleared_generation);
+    assert(state.episode() > transition_episode);
     assert(state.active());
 
     state.enter(OnlineWaitReason::None);

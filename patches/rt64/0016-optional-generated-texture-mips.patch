@@ -1,0 +1,854 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a16ff1f..c6a1068 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -545,6 +545,7 @@ build_pixel_shader(  rt64 "src/shaders/RtCopyDepthToColorPS.hlsl" "src/shaders/R
+ build_pixel_shader(  rt64 "src/shaders/RtCopyDepthToColorPS.hlsl" "src/shaders/RtCopyDepthToColor8XPS.hlsl" "-D SAMPLES_8X")
+ build_pixel_shader(  rt64 "src/shaders/TextureCopyPS.hlsl")
+ build_compute_shader(rt64 "src/shaders/TextureDecodeCS.hlsl")
++build_compute_shader(rt64 "src/shaders/GenerateMipsCS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples2XPS.hlsl" "-D SAMPLES_2X")
+ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples4XPS.hlsl" "-D SAMPLES_4X")
+ build_pixel_shader(  rt64 "src/shaders/TextureResolvePS.hlsl" "src/shaders/TextureResolveSamples8XPS.hlsl" "-D SAMPLES_8X")
+@@ -558,4 +559,3 @@ build_pixel_shader(  rt64 "src/shaders/Im3DPS.hlsl")
+ build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
+ 
+ target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/src)
+-
+diff --git a/src/render/rt64_framebuffer_renderer.cpp b/src/render/rt64_framebuffer_renderer.cpp
+index ff3ef0d..c008640 100644
+--- a/src/render/rt64_framebuffer_renderer.cpp
++++ b/src/render/rt64_framebuffer_renderer.cpp
+@@ -3,6 +3,8 @@
+ //
+ 
+ #include "rt64_framebuffer_renderer.h"
++#include "rt64_generated_mip_config.h"
++#include "rt64_generated_mip_scope.h"
+ 
+ #include "../include/rt64_extended_gbi.h"
+ 
+@@ -250,6 +252,7 @@ namespace RT64 {
+                     gpuTile.flags.fromCopy = true;
+                     gpuTile.flags.rawTMEM = false;
+                     gpuTile.flags.hasMipmaps = false;
++                    gpuTile.flags.generatedMipmaps = false;
+                 }
+             }
+             else {
+@@ -258,7 +261,8 @@ namespace RT64 {
+                 bool textureReplaced = false;
+                 bool hasMipmaps = false;
+                 bool shiftedByHalf = false;
+-                textureCache->useTexture(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
++                bool generatedMipmaps = false;
++                textureCache->useTexture(callTile.tmemHashOrID, submissionFrame, textureIndex, gpuTile.tcScale, gpuTile.textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf, generatedMipmaps);
+ 
+                 // Describe the GPU tile for a regular texture.
+                 gpuTile.ulScale.x = gpuTile.tcScale.x;
+@@ -271,6 +275,7 @@ namespace RT64 {
+                 gpuTile.flags.fromCopy = false;
+                 gpuTile.flags.rawTMEM = !textureReplaced && callTile.rawTMEM;
+                 gpuTile.flags.hasMipmaps = hasMipmaps;
++                gpuTile.flags.generatedMipmaps = generatedMipmaps;
+                 gpuTile.flags.shiftedByHalf = shiftedByHalf;
+             }
+         }
+@@ -472,6 +477,7 @@ namespace RT64 {
+         RenderRect previousScissor;
+         interop::RasterParams rasterParams{};
+         rasterParams.mipLODBias = getDefaultSamplerMipLODBias();
++        const bool sampleGeneratedMips = generatedMipSamplingEnabled();
+         RenderDescriptorSet *descRealFbSet = framebuffer.descRealFbSet->get();
+         RenderDescriptorSet *descDummyFbSet = framebuffer.descDummyFbSet->get();
+ 
+@@ -573,6 +579,7 @@ namespace RT64 {
+                 }
+                 
+                 rasterParams.renderIndex = i;
++                rasterParams.generatedMipmaps = sampleGeneratedMips && triangles.generatedMipmaps;
+                 rasterParams.screenScale = triangles.screenScale;
+                 rasterParams.screenOffset = triangles.screenOffset;
+                 worker->commandList->setGraphicsPushConstants(0, &rasterParams);
+@@ -1607,6 +1614,11 @@ namespace RT64 {
+ #               endif
+                     {
+                         triangles.shaderDesc = call.shaderDesc;
++                        // Recognize combined-MVP microcodes without changing any transform.
++                        // The shader additionally excludes HUD rectangles, alpha/decal passes and subtiles.
++                        triangles.generatedMipmaps = generatedMipSessionEnabled() &&
++                            generatedMipPerspectiveScope(proj.type == Projection::Type::Perspective,
++                                drawData.worldTransforms, call.callDesc.minWorldMatrix, call.callDesc.maxWorldMatrix);
+ 
+                         RasterShader *gpuShader = p.ubershadersOnly ? nullptr : p.rasterShaderCache->getGPUShader(call.shaderDesc);
+                         if (gpuShader != nullptr) {
+@@ -1918,4 +1930,4 @@ namespace RT64 {
+         unsigned int im3dVertexCount;
+     };
+ };
+-*/
+\ No newline at end of file
++*/
+diff --git a/src/render/rt64_framebuffer_renderer_call.h b/src/render/rt64_framebuffer_renderer_call.h
+index f2eee70..9398d0a 100644
+--- a/src/render/rt64_framebuffer_renderer_call.h
++++ b/src/render/rt64_framebuffer_renderer_call.h
+@@ -39,6 +39,7 @@ namespace RT64 {
+                 uint32_t indexStart;
+                 uint32_t faceCount;
+                 bool vertexTestZ : 1;
++                bool generatedMipmaps : 1;
+                 bool postBlendDitherNoise : 1;
+                 bool postBlendDitherNoiseNegative : 1;
+             } triangles;
+@@ -61,4 +62,4 @@ namespace RT64 {
+ 
+         ~InstanceDrawCall() { }
+     };
+-};
+\ No newline at end of file
++};
+diff --git a/src/render/rt64_generated_mip_config.h b/src/render/rt64_generated_mip_config.h
+new file mode 100644
+index 0000000..27659ec
+--- /dev/null
++++ b/src/render/rt64_generated_mip_config.h
+@@ -0,0 +1,55 @@
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <chrono>
++#include <functional>
++namespace RT64 {
++    struct GeneratedMipStatistics { uint64_t originals, replacements, authored, singleLevel; };
++    namespace MipConfiguration {
++        inline std::atomic<bool> generate{false}, sample{false};
++        inline std::atomic<uint64_t> originals{0}, replacements{0}, authored{0}, singleLevel{0};
++        inline std::atomic<uint64_t> pending{0}, queued{0}, completed{0}, startedMs{0};
++        inline std::atomic<bool> blockingWait{false};
++        inline thread_local std::function<void()> waitFeedback;
++    }
++    inline uint64_t mipClockMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++    struct MipActivity {
++        uint64_t units;
++        explicit MipActivity(uint64_t count) : units(count) {
++            if(units) { if(MipConfiguration::pending.fetch_add(units)==0) MipConfiguration::startedMs=mipClockMs(); MipConfiguration::queued.fetch_add(units); }
++        }
++        ~MipActivity() { if(units) { MipConfiguration::completed.fetch_add(units);MipConfiguration::pending.fetch_sub(units); } }
++        MipActivity(const MipActivity&)=delete;
++        MipActivity& operator=(const MipActivity&)=delete;
++    };
++    struct MipWaitFeedbackScope {
++        std::function<void()> previous;
++        explicit MipWaitFeedbackScope(std::function<void()> callback) : previous(std::move(MipConfiguration::waitFeedback)) { MipConfiguration::waitFeedback=std::move(callback); }
++        ~MipWaitFeedbackScope() { MipConfiguration::waitFeedback=std::move(previous); }
++        MipWaitFeedbackScope(const MipWaitFeedbackScope&)=delete;
++        MipWaitFeedbackScope& operator=(const MipWaitFeedbackScope&)=delete;
++    };
++    inline bool mipLoadingVisible() {
++        return MipConfiguration::generate.load() && (MipConfiguration::blockingWait.load() ||
++            (MipConfiguration::pending.load()>0 && mipClockMs()-MipConfiguration::startedMs.load()>=250));
++    }
++    // Called before constructing a new application/cache, never from a live checkbox.
++    inline void beginGeneratedMipSession(bool enabled) {
++        MipConfiguration::generate.store(enabled);
++        MipConfiguration::originals=0; MipConfiguration::replacements=0;
++        MipConfiguration::authored=0; MipConfiguration::singleLevel=0;
++        MipConfiguration::pending=0;MipConfiguration::queued=0;MipConfiguration::completed=0;
++        MipConfiguration::blockingWait=false;
++    }
++    inline bool generatedMipSessionEnabled() { return MipConfiguration::generate.load(); }
++    inline void setGeneratedMipSampling(bool modern) { MipConfiguration::sample.store(modern); }
++    inline bool generatedMipSamplingEnabled() { return generatedMipSessionEnabled() && MipConfiguration::sample.load(); }
++    inline GeneratedMipStatistics generatedMipStatistics() {
++        return {MipConfiguration::originals.load(),MipConfiguration::replacements.load(),MipConfiguration::authored.load(),MipConfiguration::singleLevel.load()};
++    }
++    inline void recordMipUpload(bool generated, uint32_t levels, bool replacement) {
++        if(generated) { if(replacement) ++MipConfiguration::replacements; else ++MipConfiguration::originals; }
++        else if(levels>1) ++MipConfiguration::authored;
++        else ++MipConfiguration::singleLevel;
++    }
++}
+diff --git a/src/render/rt64_generated_mip_scope.h b/src/render/rt64_generated_mip_scope.h
+new file mode 100644
+index 0000000..2502a6c
+--- /dev/null
++++ b/src/render/rt64_generated_mip_scope.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <cmath>
++#include <cstddef>
++#include <vector>
++#include "shared/rt64_hlsl.h"
++
++namespace RT64 {
++    // F3DDKR puts its combined MVP in the model stack and leaves the separate
++    // projection identity. Affine HUD transforms must still remain excluded.
++    inline bool generatedMipPerspectiveScope(bool separatePerspective,
++        const std::vector<interop::float4x4>& models, size_t first, size_t last) {
++        if (separatePerspective) return true;
++        if (first > last || last >= models.size()) return false;
++        for (size_t i = first; i <= last; ++i) {
++            const auto& matrix = models[i];
++            const float x=matrix[0][3], y=matrix[1][3], z=matrix[2][3];
++            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
++                !std::isfinite(matrix[3][3]) ||
++                (x == 0.0f && y == 0.0f && z == 0.0f)) return false;
++        }
++        return true;
++    }
++}
+diff --git a/src/render/rt64_generated_mips.h b/src/render/rt64_generated_mips.h
+new file mode 100644
+index 0000000..854893b
+--- /dev/null
++++ b/src/render/rt64_generated_mips.h
+@@ -0,0 +1,145 @@
++// DKR-R optional mip generation. No subresource-state assumptions or per-frame waits.
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <stdexcept>
++#include "rt64_texture.h"
++#include "rt64_shader_library.h"
++#include "rt64_descriptor_sets.h"
++#include "rt64_generated_mip_config.h"
++
++namespace RT64::GeneratedMips {
++    // Bound work per PNG and scratch retained by an entire native upload batch.
++    constexpr uint64_t MaxTexels = 4ULL * 1024 * 1024;
++    constexpr uint64_t MaxScratchBytes = 32ULL * 1024 * 1024;
++    // Also bound allocation/descriptor overhead for batches of very small N64 textures.
++    constexpr size_t MaxScratchTextures = 512;
++    inline uint32_t levelCount(uint32_t w, uint32_t h) {
++        if (!w || !h || uint64_t(w) * h > MaxTexels) return 1;
++        uint32_t count = 1;
++        while (w > 1 || h > 1) { w = std::max(w / 2, 1U); h = std::max(h / 2, 1U); ++count; }
++        return count;
++    }
++    inline uint64_t levelBytes(uint32_t w, uint32_t h) { return ((uint64_t(w) * 4 + 255) & ~255ULL) * h; }
++    struct Level { uint32_t width, height; std::vector<uint8_t> pixels; };
++    // Integer alpha-weighted RGB; average alpha. Deliberately NOT a binary coverage filter.
++    // Partition odd dimensions into disjoint boxes, including their final row/column.
++    inline Level downsample(const Level &src) {
++        Level dst{std::max(src.width / 2, 1U), std::max(src.height / 2, 1U), {}};
++        dst.pixels.resize(size_t(dst.width) * dst.height * 4);
++        for (uint32_t y = 0; y < dst.height; ++y) for (uint32_t x = 0; x < dst.width; ++x) {
++            uint32_t sums[4]{}, raw[3]{}, count = 0;
++            for (uint32_t sy = y * src.height / dst.height; sy < (y + 1) * src.height / dst.height; ++sy)
++                for (uint32_t sx = x * src.width / dst.width; sx < (x + 1) * src.width / dst.width; ++sx) {
++                    const auto *p = &src.pixels[(size_t(sy) * src.width + sx) * 4];
++                    for (unsigned c = 0; c < 3; ++c) { sums[c] += p[c] * p[3]; raw[c] += p[c]; }
++                    sums[3] += p[3]; ++count;
++                }
++            auto *p = &dst.pixels[(size_t(y) * dst.width + x) * 4];
++            for (unsigned c = 0; c < 3; ++c)
++                p[c] = uint8_t(sums[3] ? (sums[c] + sums[3] / 2) / sums[3] : (raw[c] + count / 2) / count);
++            p[3] = uint8_t((sums[3] + count / 2) / count);
++        }
++        return dst;
++    }
++    struct Scratch {
++        std::vector<std::unique_ptr<RenderTexture>> textures;
++        std::vector<std::unique_ptr<TextureDecodeDescriptorSet>> descriptors;
++        uint64_t bytes = 0;
++    };
++    inline bool uploadRGBA32(Texture &dst, RenderDevice *device, RenderCommandList *cmd,
++                             const uint8_t *bytes, size_t byteCount, uint32_t w, uint32_t h, uint32_t rowPitch,
++                             std::unique_ptr<RenderBuffer> &upload) {
++        const uint32_t count = levelCount(w,h);
++        if(count<=1 || uint64_t(rowPitch)<uint64_t(w)*4 || uint64_t(rowPitch)*h>byteCount) return false;
++        std::vector<Level> levels;
++        std::vector<uint64_t> offsets;
++        std::unique_ptr<RenderTexture> chain;
++        std::unique_ptr<RenderBuffer> staging;
++        uint64_t total=0;
++        try {
++            levels.push_back({w,h,{}}); levels[0].pixels.resize(size_t(w)*h*4);
++            for(uint32_t y=0;y<h;++y) std::memcpy(levels[0].pixels.data()+size_t(y)*w*4,bytes+size_t(y)*rowPitch,size_t(w)*4);
++            for(uint32_t m=1;m<count;++m) levels.emplace_back(downsample(levels.back()));
++            for(const auto &l:levels) { offsets.push_back(total);total+=(levelBytes(l.width,l.height)+511)&~511ULL; }
++            if(total>MaxScratchBytes) return false;
++            chain=device->createTexture(RenderTextureDesc::Texture2D(w,h,count,RenderFormat::R8G8B8A8_UNORM));
++            staging=device->createBuffer(RenderBufferDesc::UploadBuffer(total));
++            if(!chain || !staging) return false;
++        } catch(const std::bad_alloc &) { return false; }
++        auto *data=static_cast<uint8_t*>(staging->map());
++        if(!data) return false;
++        for(uint32_t m=0;m<count;++m) { const auto &l=levels[m]; const uint64_t pitch=(uint64_t(l.width)*4+255)&~255ULL;
++            for(uint32_t y=0;y<l.height;++y)std::memcpy(data+offsets[m]+y*pitch,l.pixels.data()+size_t(y)*l.width*4,size_t(l.width)*4); }
++        staging->unmap();
++        cmd->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(chain.get(),RenderTextureLayout::COPY_DEST));
++        for(uint32_t m=0;m<count;++m) { const auto &l=levels[m];
++            cmd->copyTextureRegion(RenderTextureCopyLocation::Subresource(chain.get(),m),RenderTextureCopyLocation::PlacedFootprint(staging.get(),RenderFormat::R8G8B8A8_UNORM,l.width,l.height,1,((l.width*4+255)&~255U)/4,offsets[m])); }
++        dst.texture=std::move(chain);upload=std::move(staging);dst.width=w;dst.height=h;
++        dst.format=RenderFormat::R8G8B8A8_UNORM;dst.mipmaps=count;dst.memorySize=total;dst.generatedMipmaps=true;
++        return true;
++    }
++    // Record only after native RGBA decode. Keep Scratch alive until the upload fence.
++    // Every read/write pair is two different textures; final chain stays COPY_DEST.
++    inline bool record(Texture &dst, RenderDevice *device, RenderCommandList *cmd,
++                       const ShaderRecord &shader, Scratch &retained) {
++        const uint32_t count = levelCount(dst.width, dst.height);
++        if (count <= 1 || !shader.pipeline || !dst.texture) return false;
++        uint64_t scratchBytes = levelBytes(dst.width, dst.height), finalBytes = scratchBytes;
++        uint32_t w = dst.width, h = dst.height;
++        for (uint32_t m = 1; m < count; ++m) {
++            w = std::max(w / 2, 1U); h = std::max(h / 2, 1U);
++            scratchBytes += levelBytes(w, h); finalBytes += levelBytes(w, h);
++        }
++        if (retained.bytes + scratchBytes > MaxScratchBytes ||
++            retained.textures.size() + count > MaxScratchTextures) return false;
++        std::vector<std::unique_ptr<RenderTexture>> scratch;
++        std::vector<std::unique_ptr<TextureDecodeDescriptorSet>> sets;
++        std::unique_ptr<RenderTexture> chain;
++        // Allocate everything before recording or changing the original Texture.
++        try {
++            chain = device->createTexture(RenderTextureDesc::Texture2D(dst.width, dst.height, count, dst.format));
++            if (!chain) return false;
++            w = dst.width; h = dst.height;
++            for (uint32_t m = 1; m < count; ++m) {
++                w = std::max(w / 2, 1U); h = std::max(h / 2, 1U);
++                auto tex = device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, dst.format,
++                    RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
++                if (!tex) return false;
++                auto set = std::make_unique<TextureDecodeDescriptorSet>(device);
++                set->setTexture(set->TMEM, m == 1 ? dst.texture.get() : scratch.back().get(), RenderTextureLayout::SHADER_READ);
++                set->setTexture(set->RGBA32, tex.get(), RenderTextureLayout::GENERAL);
++                scratch.emplace_back(std::move(tex)); sets.emplace_back(std::move(set));
++            }
++            retained.textures.reserve(retained.textures.size() + count);
++            retained.descriptors.reserve(retained.descriptors.size() + count - 1);
++        } catch (const std::bad_alloc &) { return false; }
++        cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(chain.get(), RenderTextureLayout::COPY_DEST));
++        cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(dst.texture.get(), RenderTextureLayout::COPY_SOURCE));
++        cmd->copyTextureRegion(RenderTextureCopyLocation::Subresource(chain.get(), 0), RenderTextureCopyLocation::Subresource(dst.texture.get()));
++        cmd->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(dst.texture.get(), RenderTextureLayout::SHADER_READ));
++        cmd->setComputePipelineLayout(shader.pipelineLayout.get()); cmd->setPipeline(shader.pipeline.get());
++        w = dst.width; h = dst.height;
++        for (uint32_t m = 1; m < count; ++m) {
++            const uint32_t nw = std::max(w / 2, 1U), nh = std::max(h / 2, 1U);
++            const uint32_t dims[4]{w, h, nw, nh};
++            auto *target = scratch[m - 1].get();
++            cmd->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(target, RenderTextureLayout::GENERAL));
++            cmd->setComputePushConstants(0, dims); cmd->setComputeDescriptorSet(sets[m - 1]->get(), 0);
++            cmd->dispatch((nw + 7) / 8, (nh + 7) / 8, 1);
++            cmd->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(target, RenderTextureLayout::COPY_SOURCE));
++            cmd->copyTextureRegion(RenderTextureCopyLocation::Subresource(chain.get(), m), RenderTextureCopyLocation::Subresource(target));
++            if (m + 1 < count) cmd->barriers(RenderBarrierStage::COMPUTE, RenderTextureBarrier(target, RenderTextureLayout::SHADER_READ));
++            w = nw; h = nh;
++        }
++        cmd->barriers(RenderBarrierStage::GRAPHICS_AND_COMPUTE, RenderTextureBarrier(chain.get(), RenderTextureLayout::SHADER_READ));
++        retained.textures.emplace_back(std::move(dst.texture));
++        for (auto &t : scratch) retained.textures.emplace_back(std::move(t));
++        for (auto &s : sets) retained.descriptors.emplace_back(std::move(s));
++        retained.bytes += scratchBytes;
++        dst.texture = std::move(chain); dst.mipmaps = count; dst.memorySize = finalBytes;
++        dst.generatedMipmaps = true;
++        return true;
++    }
++}
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index 53437d8..a370263 100644
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -44,6 +44,7 @@
+ #include "shaders/RtCopyDepthToColor8XPS.hlsl.spirv.h"
+ #include "shaders/TextureCopyPS.hlsl.spirv.h"
+ #include "shaders/TextureDecodeCS.hlsl.spirv.h"
++#include "shaders/GenerateMipsCS.hlsl.spirv.h"
+ #include "shaders/TextureResolveSamples2XPS.hlsl.spirv.h"
+ #include "shaders/TextureResolveSamples4XPS.hlsl.spirv.h"
+ #include "shaders/TextureResolveSamples8XPS.hlsl.spirv.h"
+@@ -90,6 +91,7 @@
+ #   include "shaders/RtCopyDepthToColor8XPS.hlsl.dxil.h"
+ #   include "shaders/TextureCopyPS.hlsl.dxil.h"
+ #   include "shaders/TextureDecodeCS.hlsl.dxil.h"
++#   include "shaders/GenerateMipsCS.hlsl.dxil.h"
+ #   include "shaders/TextureResolveSamples2XPS.hlsl.dxil.h"
+ #   include "shaders/TextureResolveSamples4XPS.hlsl.dxil.h"
+ #   include "shaders/TextureResolveSamples8XPS.hlsl.dxil.h"
+@@ -135,6 +137,7 @@
+ #   include "shaders/RtCopyDepthToColor8XPS.hlsl.metal.h"
+ #   include "shaders/TextureCopyPS.hlsl.metal.h"
+ #   include "shaders/TextureDecodeCS.hlsl.metal.h"
++#   include "shaders/GenerateMipsCS.hlsl.metal.h"
+ #   include "shaders/TextureResolveSamples2XPS.hlsl.metal.h"
+ #   include "shaders/TextureResolveSamples4XPS.hlsl.metal.h"
+ #   include "shaders/TextureResolveSamples8XPS.hlsl.metal.h"
+@@ -611,6 +614,18 @@ namespace RT64 {
+             textureDecode.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+ 
++        // Optional generated mips: same t1/u2 descriptor shape, separate resources.
++        {
++            TextureDecodeDescriptorSet descriptorSet;
++            layoutBuilder.begin();
++            layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 4, RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addDescriptorSet(descriptorSet);
++            layoutBuilder.end();
++            generateMips.pipelineLayout = layoutBuilder.create(device);
++            auto computeShader = device->createShader(CREATE_SHADER_INPUTS(GenerateMipsCSBlobDXIL, GenerateMipsCSBlobSPIRV, GenerateMipsCSBlobMSL, "CSMain", shaderFormat));
++            generateMips.pipeline = device->createComputePipeline(RenderComputePipelineDesc(generateMips.pipelineLayout.get(), computeShader.get(), 8, 8, 1));
++        }
++
+         // Video Interface.
+         {
+             std::unique_ptr<RenderShader> regularShader = device->createShader(CREATE_SHADER_INPUTS(VideoInterfacePSRegularBlobDXIL, VideoInterfacePSRegularBlobSPIRV, VideoInterfacePSRegularBlobMSL, "PSMain", shaderFormat));
+diff --git a/src/render/rt64_shader_library.h b/src/render/rt64_shader_library.h
+index 1ef80b2..3f9c9ee 100644
+--- a/src/render/rt64_shader_library.h
++++ b/src/render/rt64_shader_library.h
+@@ -57,6 +57,7 @@ namespace RT64 {
+         ShaderRecord rtCopyColorToDepthMS;
+         ShaderRecord rtCopyDepthToColorMS;
+         ShaderRecord textureDecode;
++        ShaderRecord generateMips;
+         ShaderRecord textureCopy;
+         ShaderRecord textureResolve;
+         ShaderRecord videoInterfaceLinear;
+diff --git a/src/render/rt64_texture.h b/src/render/rt64_texture.h
+index 95618bc..158b2ed 100644
+--- a/src/render/rt64_texture.h
++++ b/src/render/rt64_texture.h
+@@ -21,5 +21,6 @@ namespace RT64 {
+         uint64_t memorySize = 0;
+         std::vector<uint8_t> bytesTMEM;
+         bool decodeTMEM = false;
++        bool generatedMipmaps = false;
+     };
+ };
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index 67bc66b..2a7c73c 100644
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -19,6 +19,7 @@
+ #include "hle/rt64_workload_queue.h"
+ 
+ #include "rt64_texture_cache.h"
++#include "rt64_generated_mips.h"
+ 
+ #define ONLY_USE_LOW_MIP_CACHE 0
+ 
+@@ -240,7 +241,7 @@ namespace RT64 {
+ 
+         hashMap[hash] = textureIndex;
+         textures[textureIndex] = texture;
+-        cachedTextureDimensions[textureIndex] = interop::float3(float(texture->width), float(texture->height), 1.0f);
++        cachedTextureDimensions[textureIndex] = interop::float3(float(texture->width), float(texture->height), float(std::max(texture->mipmaps, 1U)));
+         textureReplacements[textureIndex] = nullptr;
+         textureReplacementShiftedByHalf[textureIndex] = false;
+         textureReplacementReferenceCounted[textureIndex] = false;
+@@ -288,10 +289,11 @@ namespace RT64 {
+         }
+     }
+ 
+-    bool TextureMap::use(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf) {
++    bool TextureMap::use(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf, bool &generatedMipmaps) {
+         textureScale = IdentityScale;
+         hasMipmaps = false;
+         shiftedByHalf = false;
++        generatedMipmaps = false;
+ 
+         // Find the matching texture index in the hash map.
+         const auto it = hashMap.find(hash);
+@@ -307,10 +309,13 @@ namespace RT64 {
+             textureScale = textureScales[textureIndex];
+             textureDimensions = cachedTextureReplacementDimensions[textureIndex];
+             hasMipmaps = (textureReplacements[textureIndex]->mipmaps > 1);
++            generatedMipmaps = textureReplacements[textureIndex]->generatedMipmaps;
+             shiftedByHalf = textureReplacementShiftedByHalf[textureIndex];
+         }
+         else {
+             textureDimensions = cachedTextureDimensions[textureIndex];
++            hasMipmaps = textures[textureIndex]->mipmaps > 1;
++            generatedMipmaps = textures[textureIndex]->generatedMipmaps;
+         }
+ 
+         // Remove the existing entry from the list if it exists.
+@@ -436,7 +441,7 @@ namespace RT64 {
+ 
+                 if (fileLoaded) {
+                     worker->commandList->begin();
+-                    Texture *texture = TextureCache::loadTextureFromBytes(worker->device, worker->commandList.get(), replacementBytes, uploadResource);
++                    Texture *texture = TextureCache::loadTextureFromBytes(worker->device, worker->commandList.get(), replacementBytes, uploadResource, nullptr, nullptr, textureCache->generateMipmaps);
+                     worker->commandList->end();
+ 
+                     // Only execute the command list and wait if the texture was loaded successfully.
+@@ -456,6 +461,7 @@ namespace RT64 {
+     // TextureCache
+ 
+     TextureCache::TextureCache(RenderWorker *directWorker, RenderWorker *copyWorker, uint32_t threadCount, const ShaderLibrary *shaderLibrary) {
++        generateMipmaps = generatedMipSessionEnabled();
+         assert(directWorker != nullptr);
+ 
+         this->directWorker = directWorker;
+@@ -929,8 +935,9 @@ namespace RT64 {
+         return true;
+     }
+ 
+-    Texture *TextureCache::loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool, std::mutex *uploadResourcePoolMutex) {
++    Texture *TextureCache::loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool, std::mutex *uploadResourcePoolMutex, bool generateMipmaps) {
+         const uint32_t PNG_MAGIC = 0x474E5089;
++        if (fileBytes.size() < sizeof(uint32_t)) return nullptr;
+         Texture *replacementTexture = new Texture();
+         uint32_t magicNumber = *reinterpret_cast<const uint32_t *>(fileBytes.data());
+         bool loadedTexture = false;
+@@ -939,12 +946,15 @@ namespace RT64 {
+             loadedTexture = TextureCache::setDDS(replacementTexture, device, commandList, fileBytes.data(), fileBytes.size(), dstUploadResource, resourcePool, uploadResourcePoolMutex);
+             break;
+         case PNG_MAGIC: {
++            MipActivity mipActivity(generateMipmaps ? 1U : 0U);
+             int width, height;
+             stbi_uc *data = stbi_load_from_memory(fileBytes.data(), fileBytes.size(), &width, &height, nullptr, 4);
+             if (data != nullptr) {
+                 uint32_t rowPitch = uint32_t(width) * 4;
+                 size_t byteCount = uint32_t(height) * rowPitch;
+-                TextureCache::setRGBA32(replacementTexture, device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool);
++                if (!generateMipmaps || !GeneratedMips::uploadRGBA32(*replacementTexture, device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource)) {
++                    TextureCache::setRGBA32(replacementTexture, device, commandList, data, byteCount, uint32_t(width), uint32_t(height), rowPitch, dstUploadResource, resourcePool, uploadResourcePoolMutex);
++                }
+                 stbi_image_free(data);
+                 loadedTexture = true;
+             }
+@@ -957,6 +967,7 @@ namespace RT64 {
+         }
+ 
+         if (loadedTexture) {
++            recordMipUpload(replacementTexture->generatedMipmaps, replacementTexture->mipmaps, true);
+             return replacementTexture;
+         }
+         else {
+@@ -1042,6 +1053,7 @@ namespace RT64 {
+             if (!queueCopy.empty() || !resolvedPathQueueCopy.empty() || !afterDecodeBarriers.empty()) {
+                 // Create new upload buffers and descriptor heaps to fill out the required size.
+                 const size_t queueSize = queueCopy.size();
++                MipActivity mipActivity(generateMipmaps ? queueSize : 0U);
+                 const uint64_t TMEMSize = 0x1000;
+                 {
+                     std::unique_lock queueLock(uploadResourcePoolMutex);
+@@ -1105,6 +1117,8 @@ namespace RT64 {
+                         static uint32_t TextureGlobalCounter = 0;
+                         TextureDecodeDescriptorSet *descSet = descriptorSets[i].get();
+                         dstTexture->format = RenderFormat::R8G8B8A8_UNORM;
++                        dstTexture->mipmaps = 1;
++                        dstTexture->memorySize = GeneratedMips::levelBytes(upload.width, upload.height);
+                         dstTexture->texture = directWorker->device->createTexture(RenderTextureDesc::Texture2D(upload.width, upload.height, 1, dstTexture->format, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
+                         dstTexture->texture->setName("Texture Cache RGBA32 #" + std::to_string(TextureGlobalCounter++));
+                         descSet->setTexture(descSet->TMEM, dstTexture->tmem.get(), RenderTextureLayout::SHADER_READ);
+@@ -1161,7 +1175,8 @@ namespace RT64 {
+                         // Load the texture directly on this thread (operation was defined as Stall).
+                         else if (textureMap.replacementMap.fileSystems[resolvedPath.fileSystemIndex]->load(resolvedPath.relativePath, replacementBytes)) {
+                             replacementUploadResources.emplace_back();
+-                            replacementTexture = TextureCache::loadTextureFromBytes(copyWorker->device, copyWorker->commandList.get(), replacementBytes, replacementUploadResources.back());
++                            replacementTexture = TextureCache::loadTextureFromBytes(copyWorker->device, copyWorker->commandList.get(), replacementBytes, replacementUploadResources.back(), nullptr, nullptr, generateMipmaps);
++                            if (replacementTexture == nullptr) continue;
+                             textureMapMutex.lock();
+                             textureMap.replacementMap.addLoadedTexture(replacementTexture, resolvedPath.fileSystemIndex, resolvedPath.relativePath, true);
+                             textureMapMutex.unlock();
+@@ -1187,6 +1202,7 @@ namespace RT64 {
+                 directWorker->commandList->barriers(RenderBarrierStage::GRAPHICS_AND_COMPUTE, beforeDecodeBarriers);
+ 
+                 const ShaderRecord &textureDecode = shaderLibrary->textureDecode;
++                GeneratedMips::Scratch mipScratch; // Kept through the existing direct-worker fence below.
+                 bool pipelineSet = false;
+                 for (size_t i = 0; i < queueSize; i++) {
+                     const TextureUpload &upload = queueCopy[i];
+@@ -1214,6 +1230,12 @@ namespace RT64 {
+                         directWorker->commandList->setComputeDescriptorSet(descriptorSets[i]->get(), 0);
+                         directWorker->commandList->dispatch(dispatchX, dispatchY, 1);
+ 
++                        if (generateMipmaps) {
++                            GeneratedMips::record(*textureMapAdditions[i].texture, directWorker->device,
++                                directWorker->commandList.get(), shaderLibrary->generateMips, mipScratch);
++                            pipelineSet = false; // Generator changes the compute bindings.
++                        }
++
+                         afterDecodeBarriers.emplace_back(RenderTextureBarrier(textureMapAdditions[i].texture->texture.get(), RenderTextureLayout::SHADER_READ));
+                     }
+                 }
+@@ -1235,6 +1257,7 @@ namespace RT64 {
+                 {
+                     std::unique_lock lock(textureMapMutex);
+                     for (const TextureMapAddition &addition : textureMapAdditions) {
++                        recordMipUpload(addition.texture->generatedMipmaps, addition.texture->mipmaps, false);
+                         textureMap.add(addition.hash, addition.texture->creationFrame, addition.texture);
+                     }
+ 
+@@ -1281,9 +1304,21 @@ namespace RT64 {
+ 
+     void TextureCache::waitForGPUUploads() {
+         std::unique_lock queueLock(uploadQueueMutex);
+-        uploadQueueFinished.wait(queueLock, [this]() {
+-            return uploadQueue.empty();
+-        });
++        if (!generateMipmaps || !MipConfiguration::waitFeedback) {
++            uploadQueueFinished.wait(queueLock, [this]() { return uploadQueue.empty(); });
++            return;
++        }
++        const auto started = std::chrono::steady_clock::now();
++        struct ResetWait { ~ResetWait() { MipConfiguration::blockingWait=false; } } resetWait;
++        while (!uploadQueue.empty()) {
++            if (uploadQueueFinished.wait_for(queueLock, std::chrono::milliseconds(33), [this]() { return uploadQueue.empty(); })) break;
++            if (std::chrono::steady_clock::now()-started >= std::chrono::milliseconds(250)) {
++                MipConfiguration::blockingWait=true;
++                queueLock.unlock(); // Never hold the upload/cache lock while presenting UI.
++                MipConfiguration::waitFeedback();
++                queueLock.lock();
++            }
++        }
+     }
+ 
+     void TextureCache::addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash) {
+@@ -1312,9 +1347,9 @@ namespace RT64 {
+         }
+     }
+ 
+-    bool TextureCache::useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf) {
++    bool TextureCache::useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf, bool &generatedMipmaps) {
+         std::unique_lock lock(textureMapMutex);
+-        return textureMap.use(hash, submissionFrame, textureIndex, textureScale, textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
++        return textureMap.use(hash, submissionFrame, textureIndex, textureScale, textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf, generatedMipmaps);
+     }
+ 
+     bool TextureCache::useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex) {
+@@ -1323,7 +1358,8 @@ namespace RT64 {
+         bool textureReplaced;
+         bool hasMipmaps;
+         bool shiftedByHalf;
+-        return useTexture(hash, submissionFrame, textureIndex, textureScale, textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf);
++        bool generatedMipmaps;
++        return useTexture(hash, submissionFrame, textureIndex, textureScale, textureDimensions, textureReplaced, hasMipmaps, shiftedByHalf, generatedMipmaps);
+     }
+     
+     bool TextureCache::addReplacement(uint64_t hash, const std::string &relativePath, ReplacementShift shift) {
+@@ -1347,7 +1383,7 @@ namespace RT64 {
+         if (newTexture == nullptr) {
+             std::unique_ptr<RenderBuffer> dstUploadBuffer;
+             loaderCommandList->begin();
+-            newTexture = TextureCache::loadTextureFromBytes(copyWorker->device, loaderCommandList.get(), replacementBytes, dstUploadBuffer);
++            newTexture = TextureCache::loadTextureFromBytes(copyWorker->device, loaderCommandList.get(), replacementBytes, dstUploadBuffer, nullptr, nullptr, generateMipmaps);
+             loaderCommandList->end();
+ 
+             if (newTexture != nullptr) {
+diff --git a/src/render/rt64_texture_cache.h b/src/render/rt64_texture_cache.h
+index 32f4b21..c15a0f0 100644
+--- a/src/render/rt64_texture_cache.h
++++ b/src/render/rt64_texture_cache.h
+@@ -143,7 +143,7 @@ namespace RT64 {
+         void clearReplacements();
+         void add(uint64_t hash, uint64_t creationFrame, Texture *texture);
+         void replace(uint64_t hash, Texture *texture, bool shiftedByHalf, bool referenceCounted);
+-        bool use(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf);
++        bool use(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf, bool &generatedMipmaps);
+         bool evict(uint64_t submissionFrame, std::vector<uint64_t> &evictedHashes);
+         void incrementLock();
+         void decrementLock();
+@@ -230,6 +230,7 @@ namespace RT64 {
+         std::mutex uploadResourcePoolMutex;
+         uint32_t lockCounter;
+         bool developerMode;
++        bool generateMipmaps = false; // Immutable for this cache/session.
+ 
+         TextureCache(RenderWorker *directWorker, RenderWorker *copyWorker, uint32_t threadCount, const ShaderLibrary *shaderLibrary);
+         ~TextureCache();
+@@ -237,7 +238,7 @@ namespace RT64 {
+         void queueGPUUploadTMEM(uint64_t hash, uint64_t creationFrame, const uint8_t *bytes, int bytesCount, int width, int height, uint32_t tlut, const LoadTile &loadTile, bool decodeTMEM);
+         void waitForGPUUploads();
+         void addResolvedPaths(uint64_t hash, uint32_t width, uint32_t height, uint32_t tlut, const LoadTile &loadTile, const std::vector<uint8_t> &bytesTMEM, bool decodeTMEM, std::vector<ReplacementResolvedPath> &resolvedPaths, uint64_t exclusiveDbHash = 0);
+-        bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf);
++        bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex, interop::float2 &textureScale, interop::float3 &textureDimensions, bool &textureReplaced, bool &hasMipmaps, bool &shiftedByHalf, bool &generatedMipmaps);
+         bool useTexture(uint64_t hash, uint64_t submissionFrame, uint32_t &textureIndex);
+         bool addReplacement(uint64_t hash, const std::string &relativePath, ReplacementShift shift);
+         bool hasReplacement(uint64_t hash);
+@@ -265,6 +266,6 @@ namespace RT64 {
+         static void setRGBA32(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, uint32_t width, uint32_t height, uint32_t rowPitch, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setDDS(Texture *dstTexture, RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *uploadResourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
+         static bool setLowMipCache(RenderDevice *device, RenderCommandList *commandList, const uint8_t *bytes, size_t byteCount, std::unique_ptr<RenderBuffer> &dstUploadResource, std::unordered_map<std::string, LowMipCacheTexture> &dstTextureMap, uint64_t &totalMemory);
+-        static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr);
++        static Texture *loadTextureFromBytes(RenderDevice *device, RenderCommandList *commandList, const std::vector<uint8_t> &fileBytes, std::unique_ptr<RenderBuffer> &dstUploadResource, RenderPool *resourcePool = nullptr, std::mutex *uploadResourcePoolMutex = nullptr, bool generateMipmaps = false);
+     };
+ };
+diff --git a/src/shaders/GenerateMipsCS.hlsl b/src/shaders/GenerateMipsCS.hlsl
+new file mode 100644
+index 0000000..a18ba8e
+--- /dev/null
++++ b/src/shaders/GenerateMipsCS.hlsl
+@@ -0,0 +1,18 @@
++// Integer reference-matched filter. Source/destination are separate resources.
++struct MipDimensions { uint2 source; uint2 target; };
++[[vk::push_constant]] ConstantBuffer<MipDimensions> dims : register(b0);
++Texture2D<float4> inputTexture : register(t1);
++RWTexture2D<float4> outputTexture : register(u2);
++[numthreads(8, 8, 1)]
++void CSMain(uint2 pos : SV_DispatchThreadID) {
++    if (any(pos >= dims.target)) return;
++    uint2 begin = pos * dims.source / dims.target;
++    uint2 end = (pos + 1) * dims.source / dims.target;
++    uint4 sums = 0; uint3 raw = 0; uint count = 0;
++    for (uint y = begin.y; y < end.y; ++y) for (uint x = begin.x; x < end.x; ++x) {
++        uint4 c = uint4(round(saturate(inputTexture.Load(int3(x, y, 0))) * 255.0));
++        sums.rgb += c.rgb * c.a; sums.a += c.a; raw += c.rgb; ++count;
++    }
++    uint3 rgb = sums.a ? (sums.rgb + sums.a / 2) / sums.a : (raw + count / 2) / count;
++    outputTexture[pos] = float4(rgb, (sums.a + count / 2) / count) / 255.0;
++}
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index 14ecbc2..9b495ed 100644
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -143,7 +143,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         
+         const GPUTile gpuTile = GPUTiles[globalTileIndex];
+         const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
+-        texVal0 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, false, gConstants.mipLODBias);
++        texVal0 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, false, gConstants.mipLODBias, gConstants.generatedMipmaps != 0);
+     }
+     
+     if (renderFlagUsesTexture1(rp.flags)) {
+@@ -159,7 +159,7 @@ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float
+         const GPUTile gpuTile = GPUTiles[globalTileIndex];
+         const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
+         const uint nativeSampler = renderFlagNativeSampler1(rp.flags);
+-        texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug, gConstants.mipLODBias);
++        texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug, gConstants.mipLODBias, gConstants.generatedMipmaps != 0);
+     }
+     
+     // Color combiner.
+@@ -310,4 +310,4 @@ void PSMain(
+     pixelColor = resultColor;
+     pixelAlpha = resultAlpha;
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+index bbae084..45ea243 100644
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -71,7 +71,26 @@ void computeLOD(OtherMode otherMode, uint rdpTileCount, float2 primLOD, float re
+     }
+ }
+ 
++int generatedMipTexel(int texel, int dimension, uint mode) {
++    // Explicit scalar calls avoid loop-carried dependencies in the shipping
++    // re-spirv specialized shader graph (the dynamic shader also uses this).
++    if (mode & G_TX_CLAMP) return clamp(texel, 0, dimension - 1);
++    if (mode & G_TX_MIRROR) {
++        int p = modulo(texel, 2 * dimension);
++        return p < dimension ? p : 2 * dimension - 1 - p;
++    }
++    return modulo(texel, dimension);
++}
++
+ float4 clampWrapMirrorSample(const RDPTile rdpTile, const GPUTile gpuTile, float2 tcScale, int2 texelInt, uint tlut, bool gpuTileUsesTMEM, uint mipLevel) {
++    if (gpuTileFlagGeneratedMipmaps(gpuTile.flags) && mipLevel > 0) {
++        // Eligible generated chains cover the whole image. Actual dimensions also
++        // handle the short axis reaching 1 before the long axis, and NPOT levels.
++        int2 dims = max(int2(gpuTile.textureDimensions.xy) >> mipLevel, int2(1, 1));
++        texelInt.x = generatedMipTexel(texelInt.x, dims.x, rdpTile.cms);
++        texelInt.y = generatedMipTexel(texelInt.y, dims.y, rdpTile.cmt);
++        return gTextures[NonUniformResourceIndex(gpuTile.textureIndex)].Load(int3(texelInt, mipLevel));
++    }
+     if (rdpTile.cms & G_TX_CLAMP) {
+         texelInt.x = clamp(texelInt.x, 0, (round(tcScale.x * rdpTile.lrs) / 4) - (round(tcScale.x * rdpTile.uls) / 4) + round(tcScale.x - 1.0f));
+     }
+@@ -142,7 +161,9 @@ float4 sampleTextureNative(Texture2D texture, uint nativeSampler, int2 texelBase
+ float4 sampleTextureLevel(const RDPTile rdpTile, const GPUTile gpuTile, bool filterBilerp, bool filterAverage, bool linearFiltering, float2 uvCoord, uint tlut, bool canDecodeTMEM, uint mipLevel, bool usesHDR) {
+     float2 tcScale = gpuTile.tcScale;
+     float mipScale = float(1U << mipLevel);
+-    uvCoord /= mipScale;
++    if (gpuTileFlagGeneratedMipmaps(gpuTile.flags))
++        uvCoord *= max(floor(gpuTile.textureDimensions.xy / mipScale), float2(1,1)) / gpuTile.textureDimensions.xy;
++    else uvCoord /= mipScale;
+     tcScale /= mipScale;
+     
+     int2 texelBaseInt = floor(uvCoord);
+@@ -214,7 +235,7 @@ float4 sampleTextureLevel(const RDPTile rdpTile, const GPUTile gpuTile, bool fil
+     }
+ }
+ 
+-float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug, float mipLODBias) {
++float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputUV, float2 ddxUV, float2 ddyUV, const RDPTile rdpTile, const GPUTile gpuTile, bool nextPixelBug, float mipLODBias, bool allowGeneratedMips = false) {
+     const bool texturePerspective = (otherMode.textPersp() == G_TP_PERSP);
+     const bool applyCorrection = (!texturePerspective && !renderFlagRect(renderFlags));
+ 
+@@ -263,7 +284,23 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+     const bool canDecodeTMEM = renderFlagCanDecodeTMEM(renderFlags);
+     const bool usesHDR = renderFlagUsesHDR(renderFlags);
+     const uint nativeSampler = rdpTile.nativeSampler;
+-    const bool flagHasMipmaps = gpuTileFlagHasMipmaps(gpuTile.flags);
++    const bool generated = gpuTileFlagGeneratedMipmaps(gpuTile.flags);
++    float2 originalDimensions = gpuTile.textureDimensions.xy / gpuTile.tcScale;
++    float2 tileDimensions = (float2(rdpTile.lrs-rdpTile.uls, rdpTile.lrt-rdpTile.ult) / 4.0f) + 1.0f;
++    bool wholeS = (rdpTile.cms & G_TX_CLAMP) ? abs(tileDimensions.x-originalDimensions.x)<0.01f : abs(rdpTile.masks-originalDimensions.x)<0.01f;
++    bool wholeT = (rdpTile.cmt & G_TX_CLAMP) ? abs(tileDimensions.y-originalDimensions.y)<0.01f : abs(rdpTile.maskt-originalDimensions.y)<0.01f;
++    // Coverage-sensitive cutouts and translucent/decal passes intentionally stay
++    // on level zero. Authored DDS chains retain their previous independent policy.
++    const bool eligible = allowGeneratedMips && !renderFlagRect(renderFlags) && texturePerspective
++        && otherMode.zCmp() && otherMode.zUpd() && otherMode.zMode() == ZMODE_OPA
++        && !otherMode.forceBlend() && !otherMode.cvgXAlpha() && otherMode.alphaCompare() == G_AC_NONE
++        && !gpuTileFlagRawTMEM(gpuTile.flags) && !gpuTileFlagFromCopy(gpuTile.flags)
++        && wholeS && wholeT;
++    const bool flagHasMipmaps = gpuTileFlagHasMipmaps(gpuTile.flags) && (!generated || eligible);
++    if (generated && flagHasMipmaps) {
++        ddxUV *= float2(rdpTile.shifts, rdpTile.shiftt) * perspCorrectionMod;
++        ddyUV *= float2(rdpTile.shifts, rdpTile.shiftt) * perspCorrectionMod;
++    }
+     uint numRDPSamples = 0;
+     uint RDPMipLevels[2];
+     RDPMipLevels[0] = 0;
+@@ -358,4 +395,4 @@ float4 sampleTexture(OtherMode otherMode, RenderFlags renderFlags, float2 inputU
+     }
+     
+     return textureColor;
+-}
+\ No newline at end of file
++}
+diff --git a/src/shared/rt64_gpu_tile.h b/src/shared/rt64_gpu_tile.h
+index 4548f15..c7c325f 100644
+--- a/src/shared/rt64_gpu_tile.h
++++ b/src/shared/rt64_gpu_tile.h
+@@ -18,6 +18,7 @@ namespace interop {
+             uint rawTMEM : 1;
+             uint hasMipmaps : 1;
+             uint shiftedByHalf : 1;
++            uint generatedMipmaps : 1;
+         };
+ 
+         uint value;
+@@ -49,6 +50,7 @@ namespace interop {
+     bool gpuTileFlagShiftedByHalf(GPUTileFlags flags) {
+         return flags & 0x20;
+     }
++    bool gpuTileFlagGeneratedMipmaps(GPUTileFlags flags) { return flags & 0x40; }
+ #endif
+     struct GPUTile {
+         float2 ulScale;
+@@ -61,4 +63,4 @@ namespace interop {
+     };
+ #ifdef HLSL_CPU
+ };
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/shared/rt64_raster_params.h b/src/shared/rt64_raster_params.h
+index cdac4e1..ac6431c 100644
+--- a/src/shared/rt64_raster_params.h
++++ b/src/shared/rt64_raster_params.h
+@@ -12,10 +12,11 @@ namespace interop {
+     struct RasterParams {
+         uint renderIndex;
+         float mipLODBias;
+-        uint2 padding;
++        uint generatedMipmaps;
++        uint padding;
+         float2 screenScale;
+         float2 screenOffset;
+     };
+ #ifdef HLSL_CPU
+ };
+-#endif
+\ No newline at end of file
++#endif

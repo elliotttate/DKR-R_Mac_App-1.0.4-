@@ -79,12 +79,26 @@ bool ReplayRecorder::finalize(std::string& error) {
     stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
     stream.write(reinterpret_cast<const char*>(frames_.data()),
                  static_cast<std::streamsize>(frames_.size() * sizeof(ReplayFrame)));
+    stream.flush();
+    stream.close();
     if (!stream) {
         error = "The netplay replay could not be written completely.";
         return false;
     }
     error.clear();
     return true;
+}
+
+ReplayRecorder ReplayRecorder::detach() {
+    ReplayRecorder pending;
+    pending.directory_ = directory_;
+    pending.room_id_ = room_id_;
+    pending.manifest_hash_ = manifest_hash_;
+    pending.player_count_ = player_count_;
+    pending.active_ = active_;
+    pending.frames_.swap(frames_);
+    active_ = false;
+    return pending;
 }
 
 void ReplayRecorder::reset() {

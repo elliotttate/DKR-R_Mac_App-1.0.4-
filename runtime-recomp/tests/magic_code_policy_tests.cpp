@@ -1,4 +1,5 @@
 #include "magic_code_policy.hpp"
+#include "magic_code_runtime_policy.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -45,6 +46,38 @@ int main() {
              (normalised & (magic_code_bit(15) | magic_code_bit(16) |
                             magic_code_bit(17) | magic_code_bit(18) |
                             magic_code_bit(19) | magic_code_bit(20))) != 0U));
+
+    const auto queued = magic_code_bit(10) | magic_code_bit(26);
+    const auto progression = magic_code_bit(0) | magic_code_bit(1);
+    const auto start = begin_magic_code_session(magic_code_bit(7), queued);
+    const auto applied = apply_magic_code_session(start, progression, progression);
+    assert(applied.active == (progression | magic_code_bit(7) | queued));
+    assert(applied.unlocked == applied.active);
+    // Neither a native toggle nor clear-all is an executed one-shot action.
+    const auto cleared = apply_magic_code_session(applied.state, 0U, progression);
+    assert(cleared.active == 0U);
+    assert(cleared.state.completed_action_mask == 0U);
+    assert(cleared.state.armed_action_mask == queued);
+    // Replay and unsolicited native codes cannot acknowledge launcher queues.
+    auto completed = complete_magic_code_action(applied.state, queued, false);
+    assert(completed.completed_action_mask == 0U);
+    completed = complete_magic_code_action(completed, magic_code_bit(7), true);
+    assert(completed.completed_action_mask == 0U);
+    completed = complete_magic_code_action(completed, magic_code_bit(26), true);
+    assert(completed.completed_action_mask == magic_code_bit(26));
+    completed = acknowledge_magic_code_actions(completed, magic_code_bit(26));
+    assert(completed.armed_action_mask == magic_code_bit(10));
+    assert(completed.deferred_action_mask == queued); // immutable launch identity
+    completed = complete_magic_code_action(completed, magic_code_bit(26), true);
+    assert(completed.completed_action_mask == 0U); // duplicate completion
+    const auto online = begin_magic_code_session(magic_code_bit(24), queued, true);
+    assert(online.deferred_action_mask == magic_code_bit(26));
+    assert(online.persistent_mask == magic_code_bit(24));
+    assert(!begin_magic_code_session(0U, 0U).applied);
+    assert(!magic_code_manifest_needs_refresh(false, queued, queued));
+    assert(magic_code_manifest_needs_refresh(false, 0U, queued));
+    assert(magic_code_manifest_needs_refresh(false, queued, 0U));
+    assert(!magic_code_manifest_needs_refresh(true, queued, 0U));
 
     std::puts("[test][magic-code-policy] PASS");
     return 0;

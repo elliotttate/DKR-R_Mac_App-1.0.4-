@@ -41,6 +41,8 @@ bool repair_adventure_checksums(bool& changed,
 bool canonical_adventure_bytes(std::vector<std::uint8_t>& bytes,
                                std::string& error);
 SaveInfo previous_online_adventure_info();
+// Stages validated bytes without touching previous online progress. The host's
+// first read_online_adventure during game activation commits this seed.
 bool prepare_host_online_adventure(
     OnlineSaveSeedMode mode, std::vector<std::uint8_t>& bytes,
     std::string& error);

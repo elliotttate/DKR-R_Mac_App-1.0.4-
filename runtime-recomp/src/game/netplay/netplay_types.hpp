@@ -31,13 +31,18 @@ namespace dkr::runtime::netplay {
 // v43 isolates online EEPROM data from single-player saves and requires both a
 // disk read-back acknowledgement and an active-runtime save hash before frame
 // zero can be released.
-inline constexpr std::uint32_t kProtocolVersion = 43U;
+// v44 isolates reliable checkpoint traffic from the control/commit channels.
+// v45 admits zero-racer cinematics at the existing load barrier and keeps all
+// admitted frontend ticks on the same fixed logic step as racing. Older peers
+// can reject the cinematic barrier or reach its boundary on a different tick.
+// v46 adds the checkpoint pre-flight lane and boundary-safe recovery admission.
+// v47 versions refreshed future input samples and bounds host prediction.
+// Mixing with older peers would silently restore stale-input behaviour.
+inline constexpr std::uint32_t kProtocolVersion = 47U;
 inline constexpr std::uint8_t kMaximumInputDelayFrames = 9U;
 inline constexpr std::size_t kMaximumPlayers = 4U;
-// Keep the four-slot wire/storage layout intact so three- and four-racer
-// sessions can be restored after their synchronization paths are qualified.
-// The current online contract deliberately admits and launches only two racers.
-inline constexpr std::size_t kSupportedOnlinePlayers = 2U;
+// Regular races/minigames support 2-4 peers. Adventure remains two-player.
+inline constexpr std::size_t kSupportedOnlinePlayers = 4U;
 inline constexpr std::size_t kMaximumLobbyNameBytes = 48U;
 inline constexpr std::size_t kMaximumPlayerNameBytes = 24U;
 inline constexpr std::size_t kMaximumChatBytes = 256U;
@@ -102,8 +107,7 @@ struct CompatibilityManifest {
 struct Rules {
     HostControlPolicy host_control =
         HostControlPolicy::GuidedUntilCharacterSelect;
-    std::uint8_t maximum_players =
-        static_cast<std::uint8_t>(kSupportedOnlinePlayers);
+    std::uint8_t maximum_players = 2U;
     bool automatic_input_delay = true;
     std::uint8_t manual_input_delay = 2U;
     std::uint8_t rollback_window = 10U;

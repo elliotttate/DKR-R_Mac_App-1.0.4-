@@ -2,6 +2,10 @@
 
 #include <filesystem>
 #include <cstdint>
+#include <memory>
+#include <string>
+
+namespace dkr::mods { struct PreparedModLaunch; }
 
 struct SDL_Window;
 typedef union SDL_Event SDL_Event;
@@ -23,6 +27,7 @@ struct StartupResult {
     bool start_game = false;
     LifecycleRequest lifecycle_request = LifecycleRequest::None;
     std::filesystem::path rom_path;
+    std::shared_ptr<const dkr::mods::PreparedModLaunch> mods;
 };
 
 void configure(const std::filesystem::path& config_directory);
@@ -44,5 +49,6 @@ void toggle_overlay();
 bool overlay_visible();
 LifecycleRequest lifecycle_request();
 void reset_lifecycle_request();
+void report_mod_error(std::string error);
 
 } // namespace dkr::runtime::ui

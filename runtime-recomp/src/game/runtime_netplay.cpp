@@ -8,6 +8,7 @@
 #include "netplay/gekko_direct_adapter.hpp"
 #include "netplay/netplay_pacing_policy.hpp"
 #include "netplay/two_player_adventure_policy.hpp"
+#include "netplay/progress_budget.hpp"
 #include "netplay/online_input_broker.hpp"
 #include "netplay/rollback_simulation_state.hpp"
 #include "netplay/rollback_state_store.hpp"
@@ -227,9 +228,10 @@ struct GameplayStartCoordinator {
     std::optional<int> requested_race_type;
     std::uint32_t resolved_map = 0U;
     std::uint32_t racer_count = 0U;
+    bool empty_cutscene = false;
     std::vector<std::uint8_t> local_baseline;
     std::vector<std::uint8_t> host_baseline;
-    std::chrono::steady_clock::time_point deadline{};
+    ProgressBudget deadline{};
 
     bool active() const { return stage != GameplayStartStage::Idle; }
     void reset() {
@@ -238,6 +240,7 @@ struct GameplayStartCoordinator {
         requested_race_type.reset();
         resolved_map = 0U;
         racer_count = 0U;
+        empty_cutscene = false;
         local_baseline.clear();
         host_baseline.clear();
         deadline = {};
@@ -256,7 +259,7 @@ struct FinishCoordinator {
     FinishStage stage = FinishStage::Idle;
     std::uint32_t frame = 0U;
     std::uint8_t transition_kind = 0U;
-    std::chrono::steady_clock::time_point deadline{};
+    ProgressBudget deadline{};
 
     bool active() const { return stage != FinishStage::Idle; }
     void reset() {
@@ -280,7 +283,7 @@ struct RecoveryCoordinator {
     std::uint32_t frame = 0U;
     std::vector<std::uint8_t> local_state;
     std::vector<std::uint8_t> host_state;
-    std::chrono::steady_clock::time_point deadline{};
+    ProgressBudget deadline{};
 
     bool active() const { return stage != RecoveryCoordinatorStage::Idle; }
     void reset() {
@@ -752,7 +755,7 @@ SessionPollResult synchronize_live_replica(
         // Live replicas are disposable actor-state samples. A topology change
         // can race a final packet from the previous scene; strict track-start
         // and transition checkpoints remain responsible for validation.
-        if (g_live_replica.discarded_frame != replica_frame) {
+        if (!detail.empty() && g_live_replica.discarded_frame != replica_frame) {
             std::fprintf(stderr,
                          "[netplay][replica] discarded frame=%u: %s\n",
                          replica_frame, detail.c_str());
@@ -925,9 +928,14 @@ SessionPollResult fast_forward_to_live_replica(
 
     std::string detail;
     std::uint32_t unmatched_actors = 0U;
-    if (!apply_live_authoritative_state(
-            rdram, 0x00800000U, g_live_replica.received, replica_frame,
-            unmatched_actors, detail)) {
+    const auto installed = g_session.install_fast_forward(replica_frame, [&] {
+        // Validate the immutable commit chain before changing RDRAM, then
+        // commit both state and cursor under the same session admission lock.
+        return apply_catch_up_authoritative_state(
+            rdram, 0x00800000U, g_live_replica.received, replica_frame, detail);
+    }, error);
+    if (installed == SessionPollResult::Failed) return installed;
+    if (installed == SessionPollResult::Pending) {
         // A disposable state can race an actor spawn/retirement. Keep
         // simulating the immutable ledger and wait for the next complete
         // correction instead of damaging the session cursor.
@@ -941,9 +949,6 @@ SessionPollResult fast_forward_to_live_replica(
         return SessionPollResult::Ready;
     }
 
-    if (!g_session.fast_forward_authoritative_commits(replica_frame, error)) {
-        return SessionPollResult::Failed;
-    }
     g_authored_frame.store(replica_frame, std::memory_order_release);
     if (replica_frame != 0U) {
         g_session.report_simulation_progress(replica_frame - 1U);
@@ -1274,7 +1279,8 @@ void resolve_authored_input_frame(std::uint8_t* rdram,
         g_session.mark_game_loaded(
             bootstrap_checkpoint_hash(rdram, *descriptor),
             boundary_view.online_save_generation, active_save.hash);
-        if (!g_session.wait_until_running(std::chrono::seconds(20))) {
+        g_online_wait_state.enter(OnlineWaitReason::Loading);
+        if (!g_session.wait_until_running(std::chrono::seconds(90))) {
             boundary_view = g_session.runtime_view();
             std::fprintf(stderr, "[netplay][start] %s\n",
                          boundary_view.status.c_str());
@@ -1285,6 +1291,7 @@ void resolve_authored_input_frame(std::uint8_t* rdram,
         }
     }
     boundary_view = g_session.runtime_view();
+    if (boundary_view.running) g_online_wait_state.leave();
     if (!boundary_view.running) return;
 
     const std::uint32_t frame = g_authored_frame.load(
@@ -1331,11 +1338,16 @@ void resolve_authored_input_frame(std::uint8_t* rdram,
             frame, InputFrameSource::FrontendLockstep, FrameInputs{});
         return;
     }
+    if (!prepared) {
+        // Cold boot may precede outer-loop admission. Keep this required wait
+        // visible without allowing SI to consume an uncommitted input frame.
+        g_online_wait_state.enter(OnlineWaitReason::Transition);
+    }
     const InputSynchronizationResult input_result =
         g_session.synchronize_inputs_result(
             frame, local, synchronized,
             prepared ? std::chrono::milliseconds(0)
-                     : std::chrono::seconds(15));
+                     : std::chrono::seconds(90));
     if (input_result == InputSynchronizationResult::AlreadyCommitted) {
         // This is a redundant retail input read after the authored outer tick
         // already simulated `frame`. Re-publish the immutable consumed pads so
@@ -1571,15 +1583,39 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
             g_gameplay_start.requested_race_type.value_or(-1), race_type,
             active_players, racer_count,
             descriptor->player_count);
+    bool verified_boss_introduction = false;
+    if (two_player_adventure && context != nullptr &&
+        g_gameplay_start.requested_race_type == kBossRaceType &&
+        race_type == kHubWorldRaceType && g_gameplay_start.requested_map) {
+        const GamePayload* payload = active_payload();
+        if (payload != nullptr && payload->get_misc_asset != nullptr) {
+            // get_misc_asset is a read-only lookup of the already loaded
+            // table. Use a copied MIPS context, exactly as other queries do.
+            const auto address = static_cast<std::uint32_t>(
+                call_payload_query_with_argument(payload->get_misc_asset,
+                    rdram, *context, 67));
+            if (address >= 0x80000000U && address <= 0x807FFFECU) {
+                std::array<std::uint8_t, 20U> pairs{};
+                for (std::size_t i = 0; i < pairs.size(); ++i) {
+                    pairs[i] = static_cast<std::uint8_t>(
+                        MEM_BU(i, rdram_address(address)));
+                }
+                verified_boss_introduction = boss_introduction_redirect_matches(
+                    pairs, *g_gameplay_start.requested_map,
+                    static_cast<std::uint32_t>(MEM_W(0,
+                        rdram_address(revision_addresses::CurrentMapId))));
+            }
+        }
+    }
     const bool boss_ready = two_player_adventure_boss_topology_ready(
         g_session.running(),
         g_assigned_ports_released.load(std::memory_order_acquire),
         two_player_adventure,
         g_gameplay_start.requested_race_type.value_or(-1), race_type,
         active_players, racer_count,
-        descriptor->player_count);
+        descriptor->player_count, verified_boss_introduction);
     const bool jointventure_selected =
-        magic_codes::magic_code_enabled(magic_codes::selected_mask(), 24U);
+        magic_codes::magic_code_enabled(magic_codes::launch_mask(), 24U);
     const bool bootstrap_shared_hub_ready =
         !two_player_adventure &&
         two_player_adventure_bootstrap_hub_topology_ready(
@@ -1591,12 +1627,39 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
             descriptor->player_count);
     const bool shared_hub_ready = established_shared_hub_ready ||
                                   bootstrap_shared_hub_ready;
+    const bool empty_cutscene_ready =
+        two_player_adventure_empty_cutscene_ready(
+            g_session.running(),
+            g_assigned_ports_released.load(std::memory_order_acquire),
+            two_player_adventure || jointventure_selected,
+            g_gameplay_start.requested_race_type.value_or(-1), race_type,
+            active_players, racer_count, descriptor->player_count);
+    std::fprintf(stderr,
+                 "[netplay][level-ready] frame=%u requested=%u resolved=%u requested_type=%d resolved_type=%d racers=%u empty_cutscene=%d boss_redirect=%d\n",
+                 authored_frame(), g_gameplay_start.requested_map.value_or(~0U),
+                 static_cast<std::uint32_t>(MEM_W(0, rdram_address(revision_addresses::CurrentMapId))),
+                 g_gameplay_start.requested_race_type.value_or(-1), race_type,
+                 racer_count, empty_cutscene_ready ? 1 : 0,
+                 verified_boss_introduction ? 1 : 0);
     if (!ordinary_gameplay_ready && !shared_hub_ready &&
-        !dual_adventure_gameplay_ready && !boss_ready) {
+        !dual_adventure_gameplay_ready && !boss_ready && !empty_cutscene_ready) {
         std::fprintf(stderr,
                      "[netplay][determinism] gameplay validation remains disarmed: race_type=%d players=%u expected=%u racers=%u\n",
                      race_type, active_players, descriptor->player_count,
                      racer_count);
+        if (g_session.running()) {
+            g_session.fail_authoritative_state(
+                "The loaded scene has an unsupported online topology (type=" +
+                std::to_string(race_type) + ", racers=" +
+                std::to_string(racer_count) + ", requested map=" +
+                std::to_string(g_gameplay_start.requested_map.value_or(~0U)) +
+                ", requested type=" + std::to_string(
+                    g_gameplay_start.requested_race_type.value_or(-1)) +
+                ", resolved map=" + std::to_string(static_cast<std::uint32_t>(
+                    MEM_W(0, rdram_address(revision_addresses::CurrentMapId)))) +
+                ", active players=" + std::to_string(active_players) + ").");
+            halt_failed_simulation();
+        }
         return;
     }
     if (shared_hub_ready) {
@@ -1645,8 +1708,8 @@ void complete_gameplay_level(std::uint8_t* rdram, recomp_context* context) {
     g_gameplay_start.requested_race_type = requested_race_type;
     g_gameplay_start.resolved_map = resolved_map;
     g_gameplay_start.racer_count = racer_count;
-    g_gameplay_start.deadline = std::chrono::steady_clock::now() +
-                                std::chrono::seconds(45);
+    g_gameplay_start.empty_cutscene = empty_cutscene_ready;
+    g_gameplay_start.deadline.start(g_session.synchronization_progress());
     if (!capture_authoritative_state(rdram, 0x00800000U,
                                      kGameplayBaselineFrame,
                                      g_gameplay_start.local_baseline,
@@ -1673,7 +1736,7 @@ bool service_gameplay_start(std::uint8_t* rdram) {
         fail("The synchronized track-start gate lost the game state.");
         return true;
     }
-    if (std::chrono::steady_clock::now() >= g_gameplay_start.deadline) {
+    if (g_gameplay_start.deadline.expired(g_session.synchronization_progress())) {
         fail("The synchronized track-start barrier timed out. The game was "
              "released from its parked online state safely.");
         return true;
@@ -1794,6 +1857,22 @@ bool service_gameplay_start(std::uint8_t* rdram) {
         g_authored_input_epoch.store(resumed_view.input_epoch,
                                      std::memory_order_release);
         online_input_broker().begin_epoch();
+        if (g_gameplay_start.empty_cutscene) {
+            // Reuse the verified baseline + Arm/Go exchange, then release the
+            // non-racer scene on the fixed-step frontend ledger. Never leave
+            // LoadingBarrier active while its cutscene runs with neutral SI
+            // reads and a frozen authored cursor. Each subsequent load gets
+            // its own scene/input epoch, even if it requests the same hub.
+            g_session.end_authoritative_phase();
+            g_frame_debt_phase.store(FrameDebtPhase::Frontend,
+                                     std::memory_order_release);
+            std::fprintf(stderr,
+                         "[netplay][cutscene] resumed frame=%u input_epoch=%u map=%u\n",
+                         resume_frame, resumed_view.input_epoch,
+                         g_gameplay_start.resolved_map);
+            g_gameplay_start.reset();
+            return true;
+        }
         const std::uint32_t frame =
             g_authored_frame.load(std::memory_order_acquire);
         g_session.submit_state_hash(
@@ -1854,8 +1933,7 @@ void seal_race_finish(std::uint8_t* rdram, std::uint8_t transition_kind) {
     g_finish.reset();
     g_finish.frame = next == 0U ? 0U : next - 1U;
     g_finish.transition_kind = transition_kind;
-    g_finish.deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(20);
+    g_finish.deadline.start(g_session.synchronization_progress());
     g_finish.stage = FinishStage::AwaitingAnnouncement;
     g_frame_debt_phase.store(FrameDebtPhase::FinishBarrier,
                              std::memory_order_release);
@@ -1874,7 +1952,7 @@ bool service_race_finish(std::uint8_t* rdram) {
         fail("The synchronized race finish lost the game state.");
         return true;
     }
-    if (std::chrono::steady_clock::now() >= g_finish.deadline) {
+    if (g_finish.deadline.expired(g_session.synchronization_progress())) {
         fail("The synchronized finish barrier timed out. The game was released "
              "from its parked online state safely.");
         return true;
@@ -1949,7 +2027,7 @@ bool service_recovery(std::uint8_t* rdram) {
         fail("The synchronized recovery lost the game state.");
         return true;
     }
-    if (std::chrono::steady_clock::now() >= g_recovery.deadline) {
+    if (g_recovery.deadline.expired(g_session.synchronization_progress())) {
         fail("The synchronized recovery timed out at simulation frame " +
              std::to_string(g_recovery.frame) +
              ". The game was released from its parked online state safely.");
@@ -2024,6 +2102,9 @@ bool service_recovery(std::uint8_t* rdram) {
     return true;
 }
 
+void begin_completed_recovery(std::uint8_t* rdram,
+                              std::uint32_t completed_frame);
+
 void commit_authoritative_gameplay_frame(std::uint8_t* rdram) {
     const std::uint32_t next = g_authored_frame.load(std::memory_order_acquire);
     const FrameDebtPhase debt_phase = g_frame_debt_phase.load(
@@ -2047,6 +2128,8 @@ void commit_authoritative_gameplay_frame(std::uint8_t* rdram) {
     }
     if (next == 0U) return;
     const std::uint32_t completed_frame = next - 1U;
+    if (external_side_effects_allowed())
+        g_session.report_simulation_progress(completed_frame);
     const RuntimeSessionView live_view = g_session.runtime_view();
     if (external_side_effects_allowed()) {
         // Plane cameraYaw and steerVisualRotation are presentation
@@ -2085,6 +2168,11 @@ void commit_authoritative_gameplay_frame(std::uint8_t* rdram) {
         return;
     }
     if (!recovery_checkpoint) return;
+    begin_completed_recovery(rdram, completed_frame);
+}
+
+void begin_completed_recovery(std::uint8_t* rdram,
+                              std::uint32_t completed_frame) {
     if (g_recovery.active()) return;
     const SessionView view = g_session.view();
     std::string error;
@@ -2092,8 +2180,7 @@ void commit_authoritative_gameplay_frame(std::uint8_t* rdram) {
     g_recovery.frame = completed_frame;
     g_frame_debt_phase.store(FrameDebtPhase::RecoveryBarrier,
                              std::memory_order_release);
-    g_recovery.deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(15);
+    g_recovery.deadline.start(g_session.synchronization_progress());
     if (!capture_authoritative_state(rdram, 0x00800000U,
                                      completed_frame,
                                      g_recovery.local_state, error)) {
@@ -2147,6 +2234,7 @@ OnlineWaitReason online_wait_reason() {
 std::uint64_t online_wait_generation() {
     return g_online_wait_state.generation();
 }
+std::uint64_t online_wait_episode() { return g_online_wait_state.episode(); }
 
 bool online_wait_active() { return g_online_wait_state.active(); }
 
@@ -2278,6 +2366,14 @@ int drive_authored_tick(std::uint8_t* rdram, recomp_context* context) {
         reset_client_catch_up_pacing();
         return 1;
     }
+    // Begin may arrive after the post-native hook. The worker's admission
+    // guard parks the following tick; capture the exact completed boundary
+    // here instead of waiting for a post hook which has already executed.
+    const auto recovery_boundary = g_session.recovery_frame();
+    if (!g_recovery.active() && recovery_boundary &&
+        g_session.native_completed_frame() == recovery_boundary) {
+        begin_completed_recovery(rdram, *recovery_boundary);
+    }
     if (service_recovery(rdram)) {
         g_online_wait_state.enter(OnlineWaitReason::Recovery);
         reset_client_catch_up_pacing();
@@ -2365,6 +2461,11 @@ int drive_authored_tick(std::uint8_t* rdram, recomp_context* context) {
                 frame, local, prepared_inputs, std::chrono::milliseconds(0));
         if (prepared == InputSynchronizationResult::Committed ||
             prepared == InputSynchronizationResult::AlreadyCommitted) {
+            if (rdram != nullptr) {
+                MEM_W(0, rdram_address(revision_addresses::LogicUpdateRate)) =
+                    authored_logic_step(true, MEM_W(0, rdram_address(
+                        revision_addresses::LogicUpdateRate)));
+            }
             g_online_wait_state.leave();
             g_prepared_authored_frame.store(frame,
                                             std::memory_order_release);
@@ -2975,8 +3076,13 @@ extern "C" void dkr_netplay_character_select_ai_seed(
     dkr::runtime::netplay::seed_character_select_ai(rdram, context);
 }
 
+extern "C" void dkr_custom_tracks_prepare_level(std::uint8_t*, recomp_context*);
+
 extern "C" void dkr_netplay_gameplay_level_begin(std::uint8_t* rdram,
                                                     recomp_context* context) {
+    // The only hook at load_level_game's entry, before alloc_displaylist_heap.
+    // Custom tracks are offline-only, and retail levels keep the retail table.
+    dkr_custom_tracks_prepare_level(rdram, context);
     dkr::runtime::netplay::begin_gameplay_level(rdram, context);
 }
 

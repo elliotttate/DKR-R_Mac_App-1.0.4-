@@ -64,11 +64,18 @@ struct SplitViewportHorizontalRange {
 // and 10.2 fixed-point scissor coordinates.
 constexpr SplitViewportHorizontalRange expand_split_viewport_horizontal_range(
     float left, float right, float horizontal_cover, int camera_id) {
-    if (right <= left || horizontal_cover <= 1.0F ||
+    if (right == left || horizontal_cover <= 1.0F ||
         camera_id < 0 || camera_id > 3) {
         return {left, right};
     }
 
+    // Mirrored courses express handedness with a negative viewport X scale.
+    // Expand its geometric bounds, then restore their original ordering.
+    if (right < left) {
+        const auto expanded = expand_split_viewport_horizontal_range(
+            right, left, horizontal_cover, camera_id);
+        return {expanded.right, expanded.left};
+    }
     const float expanded_width =
         (right - left) * horizontal_cover;
     return (camera_id & 1) == 0
@@ -116,19 +123,6 @@ constexpr bool preserve_track_select_lens_flare_tint(
     bool fullscreen_preview) {
     return modern_presentation && fit_to_window && tracks_menu_active &&
            !fullscreen_preview;
-}
-
-// postrace_viewport() draws the wooden frame under this exact retail state.
-// Derive it every rendered frame rather than carrying a host-side latch across
-// frames, retries and alternate post-race exits.
-constexpr bool postrace_wooden_frame_visible(
-    bool modern_presentation, bool fit_to_window, bool in_game,
-    int postrace_viewport, int active_players, int trophy_race_world,
-    int finish_state, int menu_stage, int menu_delay) {
-    return modern_presentation && fit_to_window && in_game &&
-           postrace_viewport != 0 && active_players == 1 &&
-           trophy_race_world == 0 && finish_state == 0 &&
-           menu_stage > 0 && menu_delay < 20;
 }
 
 // Preserve the player-approved uniform skydome cover through 21:9. Beyond

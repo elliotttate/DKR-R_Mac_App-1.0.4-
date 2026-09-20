@@ -1,6 +1,7 @@
 #include "direct_session.hpp"
 #include "netplay_protocol.hpp"
 #include "session_transport.hpp"
+#include "transport_send_policy.hpp"
 
 #if DKR_NETPLAY_WEBRTC
 #include <rtc/rtc.hpp>
@@ -77,6 +78,11 @@ bool wait_until(Predicate predicate, std::chrono::seconds timeout) {
 
 int main() {
     using namespace dkr::runtime::netplay;
+    static_assert(quick_join_send_accepted(true, false, false, false));
+    static_assert(quick_join_send_accepted(false, true, true, true));
+    static_assert(!quick_join_send_accepted(false, false, true, true));
+    static_assert(!quick_join_send_accepted(false, true, false, true));
+    static_assert(!quick_join_send_accepted(false, true, true, false));
     assert(valid_quick_join_code("ABCDE"));
     assert(valid_quick_join_code("ab-c de"));
     assert(!valid_quick_join_code("ABCDO"));
@@ -136,6 +142,10 @@ int main() {
         if (!host.revoke_invitation(error)) {
             std::cerr << "rekey cycle " << cycle << ": " << error << '\n';
             return 3;
+        }
+        if (!wait_until([&] { return host.view().invite != original_code; }, std::chrono::seconds(20))) {
+            std::cerr << "Rekey registration did not commit: " << host.view().status << '\n';
+            return 4;
         }
         const std::string code = host.view().invite;
         if (!valid_quick_join_code(code) || code == original_code) return 4;

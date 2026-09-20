@@ -25,6 +25,15 @@ enum class FrameDebtPhase : std::uint8_t {
     PostRace,
 };
 
+// The input ledger counts simulation ticks, not elapsed renderer VIs. Retail
+// fb_update can return different values on different machines; letting a menu
+// or post-race timer consume those values makes identical commits lead to
+// different level-load boundaries. Apply only to an admitted online tick.
+inline constexpr std::int32_t authored_logic_step(
+    bool online_tick_admitted, std::int32_t local_step) {
+    return online_tick_admitted ? 2 : local_step;
+}
+
 struct FrameDebtSample {
     FrameDebtPhase phase = FrameDebtPhase::Inactive;
     bool valid = false;
@@ -286,10 +295,10 @@ inline constexpr std::uint32_t client_catch_up_rate_hz(
     std::uint32_t frame_debt, std::uint32_t target_debt) {
     const std::uint32_t excess = frame_debt > target_debt
         ? frame_debt - target_debt : 0U;
-    if (excess <= 2U) return 30U;
-    if (excess <= 5U) return 32U;
-    if (excess <= 8U) return 34U;
-    if (excess <= 12U) return 36U;
+    if (excess <= 1U) return 30U;
+    if (excess <= 2U) return 32U;
+    if (excess <= 5U) return 34U;
+    if (excess <= 8U) return 36U;
     if (excess <= 16U) return 38U;
     return 40U;
 }
@@ -298,6 +307,14 @@ inline constexpr std::uint32_t client_catch_up_scale_milli(
     std::uint32_t simulation_hz) {
     return (std::clamp)(
         (simulation_hz * 1000U + 15U) / 30U, 1000U, 1333U);
+}
+
+// Required checkpoint repair needs the request/response round trip, not just
+// one-way latency. Keep a LAN floor and bounded retry on distant routes; this
+// does not change the independent tiny release/commit retry cadence.
+inline constexpr std::uint32_t checkpoint_retry_milliseconds(
+    std::uint16_t round_trip_ms, std::uint16_t jitter_ms) {
+    return (std::clamp)(100U + 2U * round_trip_ms + 2U * jitter_ms, 100U, 1000U);
 }
 
 class ClientCatchUpController {
@@ -310,14 +327,24 @@ public:
         constexpr std::uint32_t fall_step_milli = 25U; // about -0.75 Hz/sample
 
         const ClientCatchUpState previous_state = state_;
-        if (!sample.eligible || sample.contiguous_commits == 0U) {
+        if (!sample.eligible) {
             reset();
             return decision(previous_state != state_);
         }
+        if (sample.contiguous_commits == 0U) {
+            // Never speed through a missing commit. A short delivery gap does
+            // not erase established catch-up hysteresis, but six consecutive
+            // unavailable samples reset it. Phase changes reset immediately.
+            current_scale_milli_ = 1000U;
+            if (++missing_count_ >= 6U) reset();
+            return decision(previous_state != state_);
+        }
+        missing_count_ = 0U;
 
-        const std::uint32_t settled_limit = sample.target_debt + 2U;
-        const std::uint32_t entry_debt = sample.target_debt > UINT32_MAX - 3U
-            ? UINT32_MAX : sample.target_debt + 3U;
+        const std::uint32_t settled_limit = sample.target_debt == UINT32_MAX
+            ? UINT32_MAX : sample.target_debt + 1U;
+        const std::uint32_t entry_debt = sample.target_debt > UINT32_MAX - 2U
+            ? UINT32_MAX : sample.target_debt + 2U;
         if (state_ == ClientCatchUpState::Normal) {
             if (sample.frame_debt >= entry_debt &&
                 sample.frame_debt > settled_limit) {
@@ -379,6 +406,7 @@ public:
         entry_count_ = 0U;
         settled_count_ = 0U;
         cooldown_count_ = 0U;
+        missing_count_ = 0U;
         current_scale_milli_ = 1000U;
     }
 
@@ -398,6 +426,7 @@ private:
     std::uint8_t entry_count_ = 0U;
     std::uint8_t settled_count_ = 0U;
     std::uint8_t cooldown_count_ = 0U;
+    std::uint8_t missing_count_ = 0U;
     std::uint32_t current_scale_milli_ = 1000U;
 };
 

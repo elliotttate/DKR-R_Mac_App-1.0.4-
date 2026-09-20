@@ -25,7 +25,13 @@ def main() -> int:
     parser.add_argument("--entrypoint", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--use-mdebug", action="store_true")
+    parser.add_argument("--functions-per-output-file", type=int,
+                        help="Optional source granularity for isolated Patch Pipeline qualification")
     arguments = parser.parse_args()
+    if arguments.functions_per_output_file is not None and arguments.functions_per_output_file < 1:
+        parser.error("--functions-per-output-file must be positive")
+    source_granularity = (f"functions_per_output_file = {arguments.functions_per_output_file}\n"
+                          if arguments.functions_per_output_file is not None else "")
 
     policy = json.loads(arguments.policy.read_text(encoding="utf-8"))
     if policy.get("schemaVersion") != 1:
@@ -70,7 +76,7 @@ use_mdebug = {str(arguments.use_mdebug).lower()}
 elf_path = {toml_string(arguments.elf.resolve().as_posix())}
 rom_file_path = {toml_string(arguments.rom.resolve().as_posix())}
 output_func_path = {toml_string(arguments.output_functions.resolve().as_posix())}
-manual_funcs = [{manual}]
+{source_granularity}manual_funcs = [{manual}]
 function_sizes = [{sizes}]
 
 [patches]

@@ -156,10 +156,19 @@ int main() {
         dkr::runtime::saves::OnlineSaveSeedMode::Fresh,
         seeded_online, error));
     assert(seeded_online == dkr::runtime::saves::codec::blank_bytes());
+    assert(!dkr::runtime::saves::previous_online_adventure_info().exists);
+    std::vector<std::uint8_t> activated_host;
+    std::filesystem::path activated_host_path;
+    assert(dkr::runtime::saves::read_online_adventure(true, 1U, activated_host, activated_host_path, error));
+    assert(activated_host == seeded_online);
     const auto host_online_info =
         dkr::runtime::saves::previous_online_adventure_info();
     assert(host_online_info.exists && host_online_info.valid);
     write_bytes(host_online_info.path, host_save);
+    assert(dkr::runtime::saves::prepare_host_online_adventure(
+        dkr::runtime::saves::OnlineSaveSeedMode::Fresh, seeded_online, error));
+    // Simulate failed/cancelled lobby creation: the old file must be untouched.
+    assert(read_bytes(host_online_info.path) == host_save);
     assert(dkr::runtime::saves::prepare_host_online_adventure(
         dkr::runtime::saves::OnlineSaveSeedMode::ContinuePreviousSession,
         seeded_online, error));

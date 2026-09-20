@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,64 @@ dkr::runtime::netplay::CompatibilityManifest Manifest() {
 
 int main() {
     using namespace dkr::runtime::netplay;
+
+    // Post-race rendering hitches must not advance the host's transition
+    // timer faster than the guest's identical committed simulation ticks.
+    int host_timer = 0, client_timer = 0;
+    for (int tick = 0; tick < 120; ++tick) {
+        host_timer += authored_logic_step(true, tick % 7 == 0 ? 6 : 2);
+        client_timer += authored_logic_step(true, tick % 11 == 0 ? 4 : 2);
+        assert(host_timer == client_timer);
+    }
+    assert(host_timer == 240);
+    assert(authored_logic_step(false, 6) == 6); // Single-player stays retail.
+    for (const int requested : {kHubWorldRaceType, kBossRaceType,
+                                kCutsceneRaceType1, kCutsceneRaceType2}) {
+        for (const int resolved : {kCutsceneRaceType1, kCutsceneRaceType2}) {
+            assert(two_player_adventure_empty_cutscene_ready(
+                true, true, true, requested, resolved, 1U, 0U, 2U));
+        }
+    }
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kDefaultRaceType, kCutsceneRaceType1, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kHubWorldRaceType, kHubWorldRaceType, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kBossRaceType, kBossRaceType, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kHubWorldRaceType, kCutsceneRaceType1, 1U, 1U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        false, true, true, kHubWorldRaceType, kCutsceneRaceType1, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, false, true, kHubWorldRaceType, kCutsceneRaceType1, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, false, kHubWorldRaceType, kCutsceneRaceType1, 1U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kHubWorldRaceType, kCutsceneRaceType1, 2U, 0U, 2U));
+    assert(!two_player_adventure_empty_cutscene_ready(
+        true, true, true, kHubWorldRaceType, kCutsceneRaceType1, 1U, 0U, 3U));
+
+    // Model the actual outer-loop cadence with a fixed 30 Hz host. Every
+    // client dispatch consumes one already committed frame, never a hidden
+    // native tick. Six excess frames must drain to the one-frame deadband.
+    {
+        ClientCatchUpController controller;
+        constexpr std::uint32_t target = 2U;
+        double elapsed = 0.0;
+        std::uint32_t consumed = 0U;
+        std::uint32_t debt = target + 6U;
+        while (elapsed < 2.0 && debt > target + 1U) {
+            const auto decision = controller.update({true, debt, target, debt});
+            assert(decision.pacing_scale_milli <= 1333U);
+            elapsed += 1000.0 / (30.0 * decision.pacing_scale_milli);
+            ++consumed;
+            debt = target + 6U + static_cast<std::uint32_t>(elapsed * 30.0) - consumed;
+            assert(debt >= target);
+        }
+        std::fprintf(stderr, "Six-frame backlog: %.3f seconds, %u excess frames remain\n",
+                     elapsed, debt - target);
+        assert(debt <= target + 1U && elapsed <= 2.0);
+    }
 
     // Admission failures keep their machine-readable detail for recovery UI,
     // while the player-facing message stays concise. Magic Codes are checked
@@ -136,14 +195,19 @@ int main() {
     // persistent debt signal, caps at 40 Hz, settles conservatively, and
     // returns immediately to retail pacing if complete authority data is no
     // longer available.
-    assert(client_catch_up_rate_hz(4U, 2U) == 30U);
-    assert(client_catch_up_rate_hz(7U, 2U) == 32U);
-    assert(client_catch_up_rate_hz(10U, 2U) == 34U);
-    assert(client_catch_up_rate_hz(14U, 2U) == 36U);
+    assert(client_catch_up_rate_hz(3U, 2U) == 30U);
+    assert(client_catch_up_rate_hz(4U, 2U) == 32U);
+    assert(client_catch_up_rate_hz(7U, 2U) == 34U);
+    assert(client_catch_up_rate_hz(10U, 2U) == 36U);
+    assert(client_catch_up_rate_hz(14U, 2U) == 38U);
     assert(client_catch_up_rate_hz(18U, 2U) == 38U);
     assert(client_catch_up_rate_hz(40U, 2U) == 40U);
     assert(client_catch_up_scale_milli(30U) == 1000U);
     assert(client_catch_up_scale_milli(40U) == 1333U);
+    assert(checkpoint_retry_milliseconds(0U, 0U) == 100U);
+    assert(checkpoint_retry_milliseconds(100U, 20U) == 340U);
+    assert(checkpoint_retry_milliseconds(300U, 30U) == 760U);
+    assert(checkpoint_retry_milliseconds(65535U, 65535U) == 1000U);
 
     ClientCatchUpController catch_up;
     const ClientCatchUpSample delayed{true, 20U, 2U, 3U};
@@ -160,7 +224,7 @@ int main() {
     assert(catch_up_decision.pacing_scale_milli == 1333U);
     assert(catch_up_decision.target_simulation_hz == 40U);
 
-    const ClientCatchUpSample settled{true, 4U, 2U, 3U};
+    const ClientCatchUpSample settled{true, 3U, 2U, 3U};
     for (int sample = 0; sample < 5; ++sample) {
         catch_up_decision = catch_up.update(settled);
         assert(catch_up_decision.state == ClientCatchUpState::CatchUp);
@@ -179,6 +243,11 @@ int main() {
     assert(catch_up_decision.state == ClientCatchUpState::CatchUp);
     catch_up_decision = catch_up.update(
         ClientCatchUpSample{true, 20U, 2U, 0U});
+    assert(catch_up_decision.state == ClientCatchUpState::CatchUp);
+    assert(catch_up_decision.pacing_scale_milli == 1000U);
+    for (int missing = 1; missing < 6; ++missing) {
+        catch_up_decision = catch_up.update({true, 20U, 2U, 0U});
+    }
     assert(catch_up_decision.state == ClientCatchUpState::Normal);
     assert(catch_up_decision.pacing_scale_milli == 1000U);
     // Host lead covers the complete progress-acknowledgement journey. The LAN
@@ -338,6 +407,22 @@ int main() {
     assert(!two_player_adventure_dual_gameplay_topology_ready(
         true, true, true, kDefaultRaceType, kDefaultRaceType,
         1U, kTwoPlayerAdventureRaceRacerCount, 3U));
+    const std::array<std::uint8_t, 20U> retail_boss_intros{
+        38, 57, 46, 57, 40, 61, 53, 61, 1, 59, 52, 59,
+        41, 58, 54, 58, 37, 60, 55, 62};
+    for (std::size_t i = 0; i < retail_boss_intros.size(); i += 2U) {
+        assert(boss_introduction_redirect_matches(retail_boss_intros,
+            retail_boss_intros[i], retail_boss_intros[i + 1U]));
+    }
+    assert(!boss_introduction_redirect_matches(retail_boss_intros, 40, 57));
+    assert(!boss_introduction_redirect_matches(retail_boss_intros, 40, 40));
+    assert(!boss_introduction_redirect_matches({}, 40, 61));
+    assert(two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kHubWorldRaceType, 1U, 1U, 2U, true));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kHubWorldRaceType, 1U, 1U, 2U, false));
+    assert(!two_player_adventure_boss_topology_ready(
+        true, true, true, kBossRaceType, kHubWorldRaceType, 1U, 2U, 2U, true));
     assert(two_player_adventure_boss_topology_ready(
         true, true, true, kBossRaceType, kBossRaceType, 1U, 2U, 2U));
     assert(two_player_adventure_boss_topology_ready(
@@ -538,6 +623,7 @@ int main() {
     batch.player_slot = 2U;
     batch.first_frame = 100U;
     batch.inputs = {{0x8000U, 50, -20}, {0x4000U, -10, 70}};
+    batch.revisions = {2U, 37U};
     batch.simulation_progress_present = true;
     batch.simulation_scene_epoch = 9U;
     batch.simulation_completed_frame = 97U;
@@ -555,6 +641,12 @@ int main() {
     assert(decoded_batch.player_slot == batch.player_slot);
     assert(decoded_batch.first_frame == batch.first_frame);
     assert(decoded_batch.inputs == batch.inputs);
+    assert(decoded_batch.revisions == batch.revisions);
+    auto bad_revision_batch = batch;
+    bad_revision_batch.revisions[0] = 0U;
+    assert(protocol::encode_input_batch(bad_revision_batch).empty());
+    bad_revision_batch.revisions = {1U};
+    assert(protocol::encode_input_batch(bad_revision_batch).empty());
     assert(decoded_batch.simulation_progress_present);
     assert(decoded_batch.simulation_scene_epoch == 9U);
     assert(decoded_batch.simulation_completed_frame == 97U);
@@ -927,6 +1019,18 @@ int main() {
     assert(protocol::encode_online_save_ready({4U, 9U, 1U}).empty());
     assert(protocol::encode_online_save_ready({1U, 0U, 1U}).empty());
     assert(protocol::encode_online_save_ready({1U, 9U, 0U}).empty());
+    const protocol::OnlineSaveStatusPayload online_status{7U, 9U, 0x1020304050607080ULL, 15U};
+    const auto status_bytes = protocol::encode_online_save_status(online_status);
+    protocol::OnlineSaveStatusPayload decoded_status{};
+    assert(protocol::decode_online_save_status(status_bytes, decoded_status, error));
+    assert(decoded_status.room_generation == 7U && decoded_status.save_generation == 9U &&
+           decoded_status.save_hash == online_status.save_hash && decoded_status.verified_mask == 15U);
+    for (const auto invalid : {protocol::OnlineSaveStatusPayload{0U, 9U, 1U, 1U},
+             {7U, 0U, 1U, 1U}, {7U, 9U, 0U, 1U}, {7U, 9U, 1U, 16U}, {7U, 9U, 1U, 2U}})
+        assert(protocol::encode_online_save_status(invalid).empty());
+    assert(!protocol::decode_online_save_status(std::span(status_bytes).first(20), decoded_status, error));
+    auto trailing_status = status_bytes; trailing_status.push_back(0U);
+    assert(!protocol::decode_online_save_status(trailing_status, decoded_status, error));
 
     protocol::LobbyStatePayload state_payload{};
     state_payload.generation = 14U;
@@ -1020,12 +1124,21 @@ int main() {
     lockstep_rules.rollback_window = 0U;
     assert(valid_rules(lockstep_rules));
     Rules unsupported_rules{};
-    unsupported_rules.maximum_players = 3U;
+    unsupported_rules.maximum_players = 5U;
     assert(!valid_rules(unsupported_rules));
     LaunchDescriptor unsupported_launch = launch;
-    unsupported_launch.player_count = 3U;
-    unsupported_launch.occupied_mask = 0x07U;
+    unsupported_launch.player_count = 5U;
+    unsupported_launch.occupied_mask = 0x1FU;
     assert(!valid_launch_descriptor(unsupported_launch));
+    for (std::uint8_t players = 2U; players <= 4U; ++players) {
+        auto supported = launch;
+        supported.player_count = players;
+        supported.occupied_mask = (1U << players) - 1U;
+        assert(valid_launch_descriptor(supported));
+        auto rules = lockstep_rules;
+        rules.maximum_players = players;
+        assert(valid_rules(rules));
+    }
 
     protocol::RollbackPayload rollback_payload{};
     rollback_payload.scene_epoch = 7U;
@@ -1084,8 +1197,16 @@ int main() {
     assert(decoded_gameplay_barrier.stage == gameplay_barrier.stage);
     auto invalid_gameplay_barrier = gameplay_barrier;
     invalid_gameplay_barrier.racer_count = 0U;
-    assert(protocol::encode_gameplay_barrier(
-               invalid_gameplay_barrier).empty());
+    // A retail key-unlock cinematic has no racers, but still needs the same
+    // authenticated level-load/epoch handshake as the hub it redirected.
+    const auto cinematic_barrier = protocol::encode_gameplay_barrier(
+        invalid_gameplay_barrier);
+    assert(!cinematic_barrier.empty());
+    assert(protocol::decode_gameplay_barrier(cinematic_barrier,
+                                              decoded_gameplay_barrier));
+    assert(decoded_gameplay_barrier.racer_count == 0U);
+    invalid_gameplay_barrier.racer_count = 11U;
+    assert(protocol::encode_gameplay_barrier(invalid_gameplay_barrier).empty());
     std::vector<std::uint8_t> corrupt_start = encoded_start;
     corrupt_start.back() ^= 1U;
     assert(!protocol::decode_start(corrupt_start, decoded_start, error));

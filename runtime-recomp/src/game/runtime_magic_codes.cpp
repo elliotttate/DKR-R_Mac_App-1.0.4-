@@ -1,7 +1,9 @@
 #include "runtime_magic_codes.hpp"
 
 #include "magic_code_policy.hpp"
+#include "magic_code_runtime_policy.hpp"
 #include "revision_addresses.hpp"
+#include "runtime_netplay.hpp"
 
 #include "recomp.h"
 
@@ -13,6 +15,8 @@
 #endif
 
 #include <atomic>
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -27,9 +31,17 @@ const std::uint32_t& kUnlockedMagicCodesAddress =
 
 std::atomic<std::uint32_t> g_persistent_mask{0U};
 std::atomic<std::uint32_t> g_queued_one_shot_mask{0U};
-std::atomic<bool> g_applied{false};
 std::filesystem::path g_one_shot_path;
 std::mutex g_queue_file_guard;
+std::array<std::uint64_t, 32> g_queue_generations{};
+std::array<std::uint64_t, 32> g_launch_generations{};
+std::atomic<std::uint32_t> g_launch_mask{0U};
+std::string g_queue_error;
+// Only the emulated game thread accesses session state. It is reset on the
+// main thread before that thread is created (and after the previous one joins).
+dkr::runtime::magic_codes::MagicCodeSessionState g_session_state{};
+std::uint64_t g_session_sequence = 0U;
+std::chrono::steady_clock::time_point g_retry_after{};
 
 gpr RdramAddress(std::uint32_t address) {
     return static_cast<gpr>(static_cast<std::int32_t>(address));
@@ -46,8 +58,7 @@ bool ReplaceQueueFile(const std::filesystem::path& temporary,
 #endif
 }
 
-bool PersistOneShotQueue(std::uint32_t mask, std::string& error) {
-    std::lock_guard lock(g_queue_file_guard);
+bool PersistOneShotQueueLocked(std::uint32_t mask, std::string& error) {
     if (g_one_shot_path.empty()) {
         error = "Magic Code launch queue is not configured yet.";
         return false;
@@ -89,18 +100,39 @@ bool PersistOneShotQueue(std::uint32_t mask, std::string& error) {
     return true;
 }
 
-void RemoveConsumedQueueFile() {
+bool SetQueueLocked(std::uint32_t mask, std::string& error) {
+    mask &= dkr::runtime::magic_codes::kOneShotMagicCodeMask;
+    if (!PersistOneShotQueueLocked(mask, error)) {
+        g_queue_error = error;
+        return false;
+    }
+    const auto changed = g_queued_one_shot_mask.load(std::memory_order_relaxed) ^ mask;
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        if (changed & (1U << bit)) ++g_queue_generations[bit];
+    }
+    g_queued_one_shot_mask.store(mask, std::memory_order_release);
+    g_queue_error.clear();
+    error.clear();
+    return true;
+}
+
+bool AcknowledgeQueuedActions(std::uint32_t consumed, std::string& error) {
     std::lock_guard lock(g_queue_file_guard);
-    if (g_one_shot_path.empty()) {
-        return;
+    const std::uint32_t current =
+        g_queued_one_shot_mask.load(std::memory_order_acquire);
+    // An overlay edit may have cancelled and requeued the same action for a
+    // later launch. Completion of the old request must not erase the new one.
+    std::uint32_t eligible = 0U;
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        if (g_launch_generations[bit] == g_queue_generations[bit]) {
+            eligible |= consumed & (1U << bit);
+        }
     }
-    std::error_code error;
-    std::filesystem::remove(g_one_shot_path, error);
-    if (error) {
-        std::fprintf(stderr,
-                     "[boot][magic-codes] could not clear one-shot queue: %s\n",
-                     error.message().c_str());
+    const std::uint32_t next = current & ~eligible;
+    if (next == current) {
+        return true;
     }
+    return SetQueueLocked(next, error);
 }
 
 } // namespace
@@ -122,11 +154,44 @@ void dkr::runtime::magic_codes::configure(
         }
     }
     g_queued_one_shot_mask.store(mask, std::memory_order_release);
-    g_applied.store(false, std::memory_order_release);
+    g_queue_generations = {};
+    g_launch_generations = {};
+    g_queue_error.clear();
+    g_launch_mask.store(0U, std::memory_order_release);
+    g_session_state = {};
+}
+
+void dkr::runtime::magic_codes::begin_game_session(
+    std::optional<std::uint32_t> online_mask) {
+    std::lock_guard lock(g_queue_file_guard);
+    const std::uint32_t selected = online_mask.value_or(selected_mask());
+    g_session_state = begin_magic_code_session(
+        selected & kPersistentMagicCodeMask, selected & kOneShotMagicCodeMask,
+        online_mask.has_value());
+    g_launch_generations = g_queue_generations;
+    g_launch_mask.store(g_session_state.persistent_mask |
+                        g_session_state.deferred_action_mask,
+                        std::memory_order_release);
+    g_retry_after = {};
+    ++g_session_sequence;
+    std::fprintf(stderr,
+                 "[boot][magic-codes] session=%llu persistent=0x%08X deferred=0x%08X\n",
+                 static_cast<unsigned long long>(g_session_sequence),
+                 static_cast<unsigned>(g_session_state.persistent_mask),
+                 static_cast<unsigned>(g_session_state.deferred_action_mask));
 }
 
 std::uint32_t dkr::runtime::magic_codes::persistent_mask() {
     return g_persistent_mask.load(std::memory_order_acquire);
+}
+
+std::uint32_t dkr::runtime::magic_codes::launch_mask() {
+    return g_launch_mask.load(std::memory_order_acquire);
+}
+
+std::string dkr::runtime::magic_codes::queue_error() {
+    std::lock_guard lock(g_queue_file_guard);
+    return g_queue_error;
 }
 
 void dkr::runtime::magic_codes::set_persistent_mask(std::uint32_t mask) {
@@ -141,12 +206,8 @@ std::uint32_t dkr::runtime::magic_codes::queued_one_shot_mask() {
 
 bool dkr::runtime::magic_codes::set_queued_one_shot_mask(
     std::uint32_t mask, std::string& error) {
-    mask &= kOneShotMagicCodeMask;
-    if (!PersistOneShotQueue(mask, error)) {
-        return false;
-    }
-    g_queued_one_shot_mask.store(mask, std::memory_order_release);
-    return true;
+    std::lock_guard lock(g_queue_file_guard);
+    return SetQueueLocked(mask, error);
 }
 
 std::uint32_t dkr::runtime::magic_codes::selected_mask() {
@@ -161,10 +222,11 @@ bool dkr::runtime::magic_codes::set_enabled(
         return false;
     }
     if ((bit & kOneShotMagicCodeMask) != 0U) {
+        std::lock_guard lock(g_queue_file_guard);
         std::uint32_t next = queued_one_shot_mask();
         next = enabled ? enable_magic_code(next, internal_index)
                        : disable_magic_code(next, internal_index);
-        return set_queued_one_shot_mask(next, error);
+        return SetQueueLocked(next, error);
     }
 
     std::uint32_t next = persistent_mask();
@@ -183,34 +245,54 @@ bool dkr::runtime::magic_codes::clear_all(std::string& error) {
 }
 
 extern "C" void dkr_apply_launch_magic_codes(std::uint8_t* rdram,
-                                               recomp_context*) {
-    bool expected = false;
-    if (!g_applied.compare_exchange_strong(expected, true,
-                                            std::memory_order_acq_rel)) {
-        return;
-    }
-
-    const std::uint32_t persistent =
-        dkr::runtime::magic_codes::persistent_mask();
-    const std::uint32_t one_shot =
-        g_queued_one_shot_mask.exchange(0U, std::memory_order_acq_rel);
-    const std::uint32_t selected =
-        dkr::runtime::magic_codes::normalise_magic_code_mask(
-            persistent | one_shot);
-    if (selected != 0U) {
-        const gpr active = RdramAddress(kActiveMagicCodesAddress);
-        const gpr unlocked = RdramAddress(kUnlockedMagicCodesAddress);
-        MEM_W(0, active) = static_cast<std::uint32_t>(MEM_W(0, active)) | selected;
-        MEM_W(0, unlocked) =
-            static_cast<std::uint32_t>(MEM_W(0, unlocked)) | selected;
-        std::fprintf(stderr,
-                     "[boot][magic-codes] applied launch mask=0x%08X\n",
-                     static_cast<unsigned>(selected));
-    } else {
-        std::fprintf(stderr, "[boot][magic-codes] no launch codes selected\n");
-    }
-    if (one_shot != 0U) {
-        RemoveConsumedQueueFile();
-    }
+                                              recomp_context*) {
+    if (g_session_state.applied) return;
+    const gpr active_address = RdramAddress(kActiveMagicCodesAddress);
+    const gpr unlocked_address = RdramAddress(kUnlockedMagicCodesAddress);
+    const auto update = dkr::runtime::magic_codes::apply_magic_code_session(
+        g_session_state,
+        static_cast<std::uint32_t>(MEM_W(0, active_address)),
+        static_cast<std::uint32_t>(MEM_W(0, unlocked_address)));
+    g_session_state = update.state;
+    MEM_W(0, active_address) = update.active;
+    MEM_W(0, unlocked_address) = update.unlocked;
+    std::fprintf(stderr,
+                 "[boot][magic-codes] applied session=%llu mask=0x%08X\n",
+                 static_cast<unsigned long long>(g_session_sequence),
+                 static_cast<unsigned>(update.applied_mask));
 }
 
+// These hooks do not modify RDRAM or registers. They observe only the native
+// credits-init return and the exclusive file-select balloon-award branch.
+extern "C" void dkr_magic_code_credits_started(std::uint8_t*, recomp_context*) {
+    g_session_state = dkr::runtime::magic_codes::complete_magic_code_action(
+        g_session_state, 1U << 10,
+        dkr::runtime::netplay::external_side_effects_allowed());
+}
+
+extern "C" void dkr_magic_code_balloon_awarded(std::uint8_t*, recomp_context*) {
+    g_session_state = dkr::runtime::magic_codes::complete_magic_code_action(
+        g_session_state, 1U << 26,
+        dkr::runtime::netplay::external_side_effects_allowed());
+}
+
+extern "C" void dkr_magic_codes_frame_complete(std::uint8_t*, recomp_context*) {
+    const auto completed = g_session_state.completed_action_mask;
+    if (completed == 0U ||
+        !dkr::runtime::netplay::external_side_effects_allowed()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < g_retry_after) return;
+    std::string error;
+    if (!AcknowledgeQueuedActions(completed, error)) {
+        g_retry_after = now + std::chrono::seconds(5);
+        std::fprintf(stderr,
+                     "[boot][magic-codes] queue acknowledgement failed: %s\n",
+                     error.c_str());
+        return;
+    }
+    g_session_state = dkr::runtime::magic_codes::acknowledge_magic_code_actions(
+        g_session_state, completed);
+    std::fprintf(stderr,
+                 "[boot][magic-codes] native action completed mask=0x%08X\n",
+                 static_cast<unsigned>(completed));
+}
