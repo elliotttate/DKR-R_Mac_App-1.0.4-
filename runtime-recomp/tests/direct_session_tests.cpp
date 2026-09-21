@@ -615,8 +615,11 @@ struct DirectSessionTestAccess {
         return session.launch_control_timeout_locked(minimum, maximum);
     }
 
+    // The worker publishes queue statistics even with a closed transport.
+    // Test-only queue access must take the same mutex as production callers.
     static bool enqueue_checkpoint(DirectSession& session,
                                    std::uint8_t marker) {
+        std::scoped_lock lock(session.mutex_);
         PeerAddress destination{};
         destination.size = 1U;
         destination.storage[0] = 1U;
@@ -625,15 +628,18 @@ struct DirectSessionTestAccess {
             std::vector<std::uint8_t>{marker});
     }
     static std::size_t checkpoint_queue_size(const DirectSession& session) {
+        std::scoped_lock lock(session.mutex_);
         return session.authority_outbound_.size();
     }
     static std::uint8_t oldest_checkpoint_marker(
         const DirectSession& session) {
+        std::scoped_lock lock(session.mutex_);
         return session.authority_outbound_.front().bytes.front();
     }
     static bool enqueue_admission(DirectSession& session,
                                   protocol::MessageType type,
                                   std::uint8_t marker) {
+        std::scoped_lock lock(session.mutex_);
         PeerAddress destination{};
         destination.size = 1U;
         destination.storage[0] = 1U;
@@ -641,9 +647,11 @@ struct DirectSessionTestAccess {
             destination, type, std::vector<std::uint8_t>{marker});
     }
     static std::size_t admission_queue_size(const DirectSession& session) {
+        std::scoped_lock lock(session.mutex_);
         return session.critical_outbound_.size();
     }
     static std::size_t ordinary_queue_size(const DirectSession& session) {
+        std::scoped_lock lock(session.mutex_);
         return session.normal_priority_outbound_.size();
     }
     static std::uint64_t packets_sent(const DirectSession& session) {
@@ -2100,7 +2108,14 @@ int main() {
     assert(client.begin_gameplay_handoff(frontend_frames, 42U, error));
     std::uint32_t host_transition_frame = frontend_frames;
     InputSynchronizationResult parked_result = parked_host.get();
-    while (parked_result == InputSynchronizationResult::Committed) {
+    const auto handoff_deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (parked_result == InputSynchronizationResult::Committed &&
+           std::chrono::steady_clock::now() < handoff_deadline) {
+        // Service both endpoints as the runtime does. A tight host-only loop
+        // can predict thousands of frames before the client's queued handoff
+        // reaches it, testing queue exhaustion instead of transition skew.
+        pump_pair(host, client, 1);
         ++host_transition_frame;
         parked_result = host.synchronize_inputs_result(
             host_transition_frame, {0x8000U, 25, -5}, parked_host_inputs,
