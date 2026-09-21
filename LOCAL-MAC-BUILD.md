@@ -53,7 +53,7 @@ export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
 export CMAKE_PREFIX_PATH=/path/to/sdl2-2.32.10/install
 export DKR_MAC_SDL2_DYLIB=/path/to/sdl2-2.32.10/install/lib/libSDL2-2.0.0.dylib
 export DKR_MAC_PAYLOAD_DIR="$PWD/build/payloads"
-export DKR_RELEASE_VERSION=1.0.5-beta.10-macos.2
+export DKR_RELEASE_VERSION=1.0.5-beta.10-macos.3
 export DKR_MACOS_DEPLOYMENT_TARGET=12.0
 export DKR_MAC_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 bash Build-macOS.sh
@@ -79,3 +79,8 @@ ad-hoc signing for local development, whose permission identity may change on
 rebuilds. macOS 27 is the currently available native QA host; the build audit
 does not substitute for execution on an older macOS machine. Modern mode enables the optional models (F8) and terrain (F7).
 ROMs, saves and external HD texture packs remain outside the bundle.
+
+The package also contains a renderer-independent Cocoa Diagnostics app, both
+beside the game and inside its Helpers directory. It is built and signed with
+the same deployment target and identity. Its report exporter and fatal-signal
+recording have dedicated regression tests. See [MACOS-DIAGNOSTICS.md](MACOS-DIAGNOSTICS.md).

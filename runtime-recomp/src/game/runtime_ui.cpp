@@ -4017,7 +4017,7 @@ void DrawSupportSummary(float width) {
         "Privacy-safe settings and system details for troubleshooting.");
     ImGui::Dummy({0.0F, 8.0F});
     ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.045F, 0.18F, 0.25F, 0.96F});
-    const float support_card_height = width >= 420.0F ? 430.0F : 520.0F;
+    const float support_card_height = width >= 420.0F ? 485.0F : 575.0F;
     BeginPaddedChild("support-summary-card", {width, support_card_height}, true,
                      ImGuiWindowFlags_NoScrollbar, {20.0F, 18.0F});
     ImGui::PushTextWrapPos(std::max(width - 24.0F, 1.0F));
@@ -4055,11 +4055,15 @@ void DrawSupportSummary(float width) {
             : "Diagnostic logging will be disabled at the next launch.";
     }
     bool dumps = dkr::runtime::support::crash_dumps_enabled();
+#if defined(__APPLE__)
+    if (ImGui::Checkbox("Save fatal-signal records (next launch)", &dumps)) {
+#else
     if (ImGui::Checkbox("Create crash dumps", &dumps)) {
+#endif
         dkr::runtime::support::set_crash_dumps_enabled(dumps);
         g_support_action_status = dumps
-            ? "Crash dumps are enabled."
-            : "Crash dumps are disabled.";
+            ? "Crash recording will be enabled at the next launch."
+            : "Crash recording will be disabled at the next launch.";
     }
     const float available_button_width = ImGui::GetContentRegionAvail().x;
     const float button_gap = ImGui::GetStyle().ItemSpacing.x;
@@ -4067,6 +4071,12 @@ void DrawSupportSummary(float width) {
     const float utility_button_width = use_two_columns
         ? (available_button_width - button_gap) * 0.5F
         : available_button_width;
+#if defined(__APPLE__)
+    if (ImGui::Button("SAVE CRASH LOGS / MAC DIAGNOSTICS",
+                      {available_button_width, 42.0F})) {
+        dkr::runtime::support::open_mac_diagnostics(g_support_action_status);
+    }
+#endif
     if (ImGui::Button("EXPORT SUPPORT SUMMARY",
                       {available_button_width, 42.0F})) {
         std::filesystem::path output;

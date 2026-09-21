@@ -27,6 +27,9 @@ const std::filesystem::path& support_report_directory();
 
 bool open_directory(const std::filesystem::path& directory,
                     std::string& error);
+#if defined(__APPLE__)
+bool open_mac_diagnostics(std::string& error);
+#endif
 bool export_report(const std::string& report, std::filesystem::path& output,
                    std::string& error);
 

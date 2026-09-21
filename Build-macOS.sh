@@ -110,6 +110,17 @@ ditto "${built_app}" "${stage}/DKR-R.app"
 app="${stage}/DKR-R.app"
 app_executable="${app}/Contents/MacOS/DKR-R"
 
+# Renderer-independent support app: embedded for the launcher button and also
+# shipped beside the game so it can run when the game cannot open.
+diagnostics_built="${build_dir}/diagnostics/DKR-R Diagnostics.app"
+[[ -x "${diagnostics_built}/Contents/MacOS/DKR-R Diagnostics" ]] || {
+  echo 'The Mac Diagnostics app was not built.' >&2
+  exit 1
+}
+mkdir -p "${app}/Contents/Helpers"
+ditto "${diagnostics_built}" "${app}/Contents/Helpers/DKR-R Diagnostics.app"
+
+
 # Bundle SDL2 instead of retaining the build machine's absolute package-manager
 # path. DKR_MAC_SDL2_DYLIB can point at a deployment-target-compatible build.
 sdl2_dependency="$(otool -L "${app_executable}" | awk '
@@ -247,8 +258,12 @@ signing_options=(--force --deep --sign "${signing_identity}")
 if [[ "${signing_identity}" != "-" ]]; then
   signing_options+=(--timestamp --options runtime)
 fi
+codesign "${signing_options[@]}" "${app}/Contents/Helpers/DKR-R Diagnostics.app"
 codesign "${signing_options[@]}" "${app}"
 codesign --verify --deep --strict "${app}"
+ditto "${app}/Contents/Helpers/DKR-R Diagnostics.app" "${stage}/DKR-R Diagnostics.app"
+codesign --verify --deep --strict "${stage}/DKR-R Diagnostics.app"
+
 
 while IFS= read -r -d '' file; do
   extension="${file##*.}"

@@ -6,6 +6,9 @@
 #include "runtime_platform.hpp"
 #include "runtime_netplay.hpp"
 #include "runtime_support.hpp"
+#if defined(__APPLE__)
+#include "../macos/crash_log.hpp"
+#endif
 #include "save_manager.hpp"
 #include "startup_performance.hpp"
 #include "virtual_pak.hpp"
@@ -67,7 +70,8 @@ void ShowMacLaunchFailure(const std::string& reason, unsigned timeout_seconds) {
     // must explain a rejected ROM or renderer failure before the window exits.
     if (timeout_seconds == 0) {
         const std::string message = reason + "\n\nDiagnostic log: " +
-            (dkr::runtime::support::log_directory() / "runtime.log").string();
+            (dkr::runtime::support::log_directory() / "runtime.log").string() +
+            "\n\nOpen DKR-R Diagnostics.app to save a report or try fresh settings.";
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DKR-R could not start the game",
                                  message.c_str(), nullptr);
     }
@@ -95,6 +99,9 @@ bool ConfigurePersistentRuntimeLog(
         return false;
     }
     const std::filesystem::path current = log_directory / "runtime.log";
+#if defined(__APPLE__)
+    dkr::macos::archive_runtime_log(log_directory);
+#endif
     const std::filesystem::path previous =
         log_directory / "runtime-previous.log";
     std::filesystem::remove(previous, error);
@@ -324,6 +331,11 @@ void RuntimeSignalHandler(int signal_number) {
 }
 
 void InstallRuntimeSignalHandlers() {
+#if defined(__APPLE__)
+    dkr::macos::install_crash_logging(
+        dkr::runtime::support::crash_dump_directory(),
+        dkr::runtime::support::crash_dumps_enabled());
+#else
     struct sigaction action {};
     action.sa_handler = RuntimeSignalHandler;
     sigemptyset(&action.sa_mask);
@@ -331,6 +343,7 @@ void InstallRuntimeSignalHandlers() {
     for (const int signal_number : {SIGSEGV, SIGABRT, SIGFPE, SIGILL}) {
         sigaction(signal_number, &action, nullptr);
     }
+#endif
 }
 
 #endif

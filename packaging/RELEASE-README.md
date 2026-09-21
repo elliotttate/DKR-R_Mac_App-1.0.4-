@@ -1,4 +1,4 @@
-# DKR-R 1.0.5-beta.10-macos.2 — Apple Silicon
+# DKR-R 1.0.5-beta.10-macos.3 — Apple Silicon
 
 This is the experimental macOS build from
 https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-, based on jt87's macOS port
@@ -12,7 +12,7 @@ Requires Apple Silicon (M1 or newer) and macOS 12 Monterey or newer. Intel Macs
 are not supported. No Homebrew, Xcode or command-line build tools are required.
 
 1. Verify the ZIP against the supplied SHA256 checksum, then unzip it.
-2. Drag `DKR-R.app` to Applications and open it.
+2. Drag `DKR-R.app` and `DKR-R Diagnostics.app` to Applications, then open DKR-R.
 3. Supply your own supported US ROM when prompted and select Modern to use
    the new 3D replacements. Existing external HD packs can be imported separately.
 
@@ -45,6 +45,37 @@ Full Disk Access. Permission is requested when the corresponding feature needs i
 For a launch failure, collect `runtime.log` from `~/.config/dkr-port/logs/`
 immediately afterward. Reopening the app moves the prior log to
 `runtime-previous.log`.
+
+## If the game crashes or will not open
+
+Open **DKR-R Diagnostics.app**, which runs separately from the game renderer.
+If the game opens, the same tool is available under **About DKR-R**, in the
+support card: **Save Crash Logs / Mac Diagnostics**.
+
+1. Choose **Save Diagnostic Report** before repeatedly relaunching. Select where
+   to save the text file, then review it before sharing it with support.
+2. Choose **Launch with Logging**, reproduce the problem, quit the game if it is
+   still open, then save another report. The tool records errors that occur
+   before the game creates its normal runtime log, plus the exit code or signal.
+3. Try **Launch with Fresh Settings** to rule out a bad setting or imported pack.
+   Select your ROM again. This creates a separate profile; your normal settings
+   and saves are preserved. Fresh-session saves remain in the diagnostic profile.
+4. If the game was moved, use **Choose DKR-R.app** to locate it.
+
+Reports contain macOS/GPU details, release and binary UUID, signature status,
+current and recent runtime logs, fatal-signal records and selected fields from
+recent Apple crash reports. Common personal paths and connection data are
+redacted. ROMs, saves, full settings files and full Apple reports are excluded.
+Review the text before sharing; nothing is uploaded automatically. A report can
+still be saved when the game is missing or cannot launch.
+
+The game retains eight archived runtime logs and up to eight fatal-signal records.
+Native Apple reports can also be found in `~/Library/Logs/DiagnosticReports/`.
+Diagnostic launch output and fresh profiles are stored in
+`~/Library/Application Support/DKR-R/Diagnostics/`. Both apps target macOS 12+;
+this tool does not bypass Gatekeeper or grant Full Disk Access. If macOS blocks
+both apps, use Console > Crash Reports or collect the existing runtime log for
+support. No Xcode, Homebrew or Python installation is required.
 
 ## Upstream beta changes
 

@@ -4,12 +4,16 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
 #include <system_error>
+#include <vector>
+#include <cerrno>
+#include <string_view>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -22,6 +26,10 @@
 #else
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -229,6 +237,8 @@ void configure(const std::filesystem::path& config_directory) {
 }
 
 bool diagnostic_logging_enabled() {
+    if (const char* forced = std::getenv("DKR_DIAGNOSTIC_LOGGING");
+        forced != nullptr && std::string_view(forced) == "1") return true;
     return g_diagnostic_logging.load(std::memory_order_acquire);
 }
 bool crash_dumps_enabled() {
@@ -251,6 +261,41 @@ const std::filesystem::path& support_report_directory() {
     return g_support_report_directory;
 }
 
+#if defined(__APPLE__)
+namespace {
+bool OpenMac(const std::vector<std::string>& arguments, std::string& error) {
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>("/usr/bin/open"));
+    for (const auto& argument : arguments) argv.push_back(const_cast<char*>(argument.c_str()));
+    argv.push_back(nullptr);
+    pid_t child;
+    int status = 0;
+    if (posix_spawn(&child, argv[0], nullptr, nullptr, argv.data(), environ) != 0) {
+        error = "macOS could not open the support item.";
+        return false;
+    }
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        error = "macOS could not open the support item.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+}
+bool open_mac_diagnostics(std::string& error) {
+    char executable[4096]; uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0) {
+        error = "Could not locate DKR-R Diagnostics. Open the copy included in the download.";
+        return false;
+    }
+    const auto contents = std::filesystem::path(executable).parent_path().parent_path();
+    return OpenMac({"-n", (contents / "Helpers/DKR-R Diagnostics.app").string(),
+        "--args", "--game", contents.parent_path().string(), "--config", g_config_directory.string()}, error);
+}
+#endif
+
 bool open_directory(const std::filesystem::path& directory,
                     std::string& error) {
     std::error_code filesystem_error;
@@ -266,6 +311,8 @@ bool open_directory(const std::filesystem::path& directory,
         error = "Windows could not open that DKR-R support folder.";
         return false;
     }
+#elif defined(__APPLE__)
+    return OpenMac({directory.string()}, error);
 #else
     const pid_t child = fork();
     if (child == 0) {

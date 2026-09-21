@@ -683,6 +683,26 @@ if(DKR_RUNTIME_BUILD_GENERATED)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(APPLE)
+        target_sources(DKRPortGame PRIVATE src/macos/crash_log.cpp)
+        add_executable(DKRMacDiagnostics MACOSX_BUNDLE src/macos/diagnostics.mm)
+        target_compile_options(DKRMacDiagnostics PRIVATE -fobjc-arc)
+        target_link_libraries(DKRMacDiagnostics PRIVATE "-framework Cocoa" "-framework Metal" "-framework UniformTypeIdentifiers")
+        set_target_properties(DKRMacDiagnostics PROPERTIES
+            OUTPUT_NAME "DKR-R Diagnostics"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/diagnostics"
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/MacInfo.plist.in"
+            MACOSX_BUNDLE_BUNDLE_NAME "DKR-R Diagnostics"
+            MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.thatguymcd.dkr-r.diagnostics"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${DKR_RELEASE_VERSION_NUMERIC}"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${DKR_RELEASE_BUILD_NUMBER}"
+            MACOSX_BUNDLE_LONG_VERSION_STRING "${DKR_RELEASE_VERSION}")
+        if(BUILD_TESTING)
+            add_test(NAME DKRMacDiagnostics COMMAND DKRMacDiagnostics --self-test)
+            add_executable(DKRMacCrashLogTests tests/macos_crash_log_tests.cpp src/macos/crash_log.cpp)
+            add_test(NAME DKRMacCrashLog COMMAND DKRMacCrashLogTests)
+        endif()
+    endif()
+    if(APPLE)
         # CMake supplies the platform Info.plist and places the executable in
         # Contents/MacOS. RT64 selects its native Metal backend on Apple
         # platforms; the release packager adds artwork and notices before
