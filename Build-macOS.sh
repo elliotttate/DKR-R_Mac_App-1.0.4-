@@ -109,6 +109,7 @@ mkdir -p "${stage}"
 ditto "${built_app}" "${stage}/DKR-R.app"
 app="${stage}/DKR-R.app"
 app_executable="${app}/Contents/MacOS/DKR-R"
+python3 "${project_root}/scripts/test_bundled_texture_pack.py" "${app_executable}"
 
 # Renderer-independent support app: embedded for the launcher button and also
 # shipped beside the game so it can run when the game cannot open.
@@ -213,7 +214,7 @@ install -m 0644 "${project_root}/packaging/licenses/SDL3-LICENSE.txt" \
   "${notices}/SDL3-LICENSE.txt"
 install -m 0644 "${project_root}/packaging/licenses/SDL-GAMECONTROLLERDB-LICENSE.txt" \
   "${notices}/SDL-GAMECONTROLLERDB-LICENSE.txt"
-for notice in GOLDEN-BALLOON-NOTICE.txt LEGACY-MODS-NOTICE.txt; do
+for notice in GOLDEN-BALLOON-NOTICE.txt LEGACY-MODS-NOTICE.txt SRGU-TEXTURE-PACK-NOTICE.txt; do
   install -m 0644 "${project_root}/packaging/licenses/${notice}" "${notices}/${notice}"
 done
 install -m 0644 "${project_root}/extern/libdatachannel/LICENSE" "${notices}/LIBDATACHANNEL-LICENSE.txt"

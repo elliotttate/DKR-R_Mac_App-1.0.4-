@@ -49,3 +49,7 @@ Report fork-specific problems to this repository. The Play page can export a
 support report; diagnostic logging and crash dumps are opt-in. See `LICENSE.md`,
 `THIRD_PARTY.md`, and the bundled license files for terms and credits. The
 release page links the corresponding Windows source commit.
+
+Source builds after the Mac HD release also stage the bundled SR.GU pack under
+`assets/texture-packs/srgu-remastered`; see its README and notice. The published
+1.0.4 Windows ZIP predates that addition and is not refreshed by the Mac release.

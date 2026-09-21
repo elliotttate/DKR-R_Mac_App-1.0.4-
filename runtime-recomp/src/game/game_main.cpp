@@ -593,10 +593,43 @@ int DkrMain(int argc, char** argv) {
 #endif
 
 #if DKR_RUNTIME_HAS_RT64
+    if (argc == 3 && std::string_view(argv[1]) == "--self-test-bundled-pack") {
+        namespace packs = dkr::runtime::texture_packs;
+        const auto config = std::filesystem::u8path(argv[2]);
+        if (std::filesystem::exists(config)) {
+            std::fprintf(stderr, "[test][bundled] Requires a new temporary profile.\n");
+            return 1;
+        }
+        packs::configure(config);
+        auto entries = packs::snapshot();
+        if (entries.size() != 1 || entries[0].origin != packs::Origin::Bundled ||
+            !entries[0].compatible || !entries[0].enabled || entries[0].image_count == 0)
+            return 1;
+        const auto id = entries[0].id;
+        const auto path = entries[0].path;
+        std::string status;
+        if (packs::delete_managed(id, status) || !std::filesystem::exists(path / "rt64.json"))
+            return 1;
+        packs::set_enabled(id, false);
+        packs::configure(config);
+        packs::refresh();
+        if (packs::snapshot().at(0).enabled) return 1;
+        if (!packs::set_hidden(id, true, status)) return 1;
+        packs::configure(config);
+        if (!packs::snapshot().empty() || !packs::snapshot(true).at(0).hidden) return 1;
+        if (!packs::set_hidden(id, false, status) || packs::snapshot().at(0).enabled) return 1;
+        packs::set_enabled(id, true);
+        packs::configure(config);
+        if (!packs::snapshot().at(0).enabled) return 1;
+        std::fprintf(stderr, "[test][bundled] PASS: %zu textures; default enabled, persistent "
+                     "deactivation, hide/restore, reactivation and delete protection\n",
+                     entries[0].image_count);
+        return 0;
+    }
     if (argc == 4 && std::string_view(argv[1]) == "--self-test-rice-pack") {
         const std::filesystem::path source = std::filesystem::u8path(argv[2]);
         const std::filesystem::path test_directory = std::filesystem::u8path(argv[3]);
-        dkr::runtime::texture_packs::configure(test_directory);
+        dkr::runtime::texture_packs::configure(test_directory, false);
         std::string status;
         if (!dkr::runtime::texture_packs::import_archive(source, status)) {
             std::fprintf(stderr, "[test][rice] FAILED: %s\n", status.c_str());

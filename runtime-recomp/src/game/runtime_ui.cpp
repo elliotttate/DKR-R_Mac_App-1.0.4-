@@ -6952,6 +6952,8 @@ bool DrawTexturePackManagementModal(
             ImGui::TextWrapped("%s", value.c_str());
         };
         detail_row("TYPE", dkr::runtime::texture_packs::format_name(pack.format));
+        if (pack.origin == dkr::runtime::texture_packs::Origin::Bundled)
+            detail_row("SOURCE", "Included with DKR-R (read-only)");
         detail_row("MANAGED SIZE",
                    FormatManagedTexturePackSize(pack.managed_size_bytes));
         detail_row("TEXTURES", std::to_string(pack.image_count));
@@ -7010,12 +7012,14 @@ bool DrawTexturePackManagementModal(
 
     bool request_removal = false;
     ImGui::PushStyleColor(ImGuiCol_Button, {0.45F, 0.09F, 0.10F, 1.0F});
+    ImGui::BeginDisabled(pack.origin == dkr::runtime::texture_packs::Origin::Bundled);
     if (ImGui::Button("REMOVE PACK...", {action_width, 42.0F})) {
         g_texture_pack_remove_id = pack.id;
         g_texture_pack_remove_name = pack.name;
         request_removal = true;
         ImGui::CloseCurrentPopup();
     }
+    ImGui::EndDisabled();
     ImGui::PopStyleColor();
     if (!compact) ImGui::SameLine();
     if (ImGui::Button("CLOSE", {action_width, 42.0F})) {

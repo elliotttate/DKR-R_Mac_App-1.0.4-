@@ -136,6 +136,10 @@ foreach ($family in $modelFamilies) {
     Copy-Item -LiteralPath (Join-Path $bin "assets\models\$family") `
         -Destination $modelDirectory -Recurse
 }
+$textureDirectory = Join-Path $stage 'assets\texture-packs'
+New-Item -ItemType Directory -Path $textureDirectory -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $bin 'assets\texture-packs\srgu-remastered') `
+    -Destination $textureDirectory -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\WINDOWS-README.md') -Destination (Join-Path $stage 'README.md')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\WINDOWS-3D-MODELS.md') `
     -Destination (Join-Path $stage '3D-MODELS.md')
@@ -165,6 +169,7 @@ $noticeFiles = [ordered]@{
     'MONOCYPHER-LICENSE.txt' = 'packaging\licenses\MONOCYPHER-LICENSE.txt'
     'GOLDEN-BALLOON-NOTICE.txt' = 'packaging\licenses\GOLDEN-BALLOON-NOTICE.txt'
     'LEGACY-MODS-NOTICE.txt' = 'packaging\licenses\LEGACY-MODS-NOTICE.txt'
+    'SRGU-TEXTURE-PACK-NOTICE.txt' = 'packaging\licenses\SRGU-TEXTURE-PACK-NOTICE.txt'
     'LIBDATACHANNEL-LICENSE.txt' = 'extern\libdatachannel\LICENSE'
     'MBEDTLS-LICENSE.txt' = 'extern\mbedtls\LICENSE'
     'LIBJUICE-LICENSE.txt' = 'extern\libdatachannel\deps\libjuice\LICENSE'

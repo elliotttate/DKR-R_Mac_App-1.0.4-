@@ -14,7 +14,10 @@ are not supported. No Homebrew, Xcode or command-line build tools are required.
 1. Verify the ZIP against the supplied SHA256 checksum, then unzip it.
 2. Drag `DKR-R.app` and `DKR-R Diagnostics.app` to Applications, then open DKR-R.
 3. Supply your own supported US ROM when prompted and select Modern to use
-   the new 3D replacements. Existing external HD packs can be imported separately.
+   the bundled SR.GU remastered textures, 3D replacements and terrain detail.
+   No texture-pack download or import is needed. In **Textures**, choose
+   **DKR REMASTERED (SR.GU's)** to deactivate or hide it; your choice is saved.
+   Accurate mode retains original textures. Additional packs can be imported separately.
 
 This release is **Developer ID signed, but not notarized**. macOS may
 block the first launch. Only if you trust this release and have verified its
@@ -22,8 +25,9 @@ checksum, use System Settings > Privacy & Security > Open Anyway for this app.
 Do not disable Gatekeeper globally.
 
 F8 toggles the optional 3D plants/items; F7 toggles terrain detail. Original
-gameplay timing and collision are retained. Saves, ROMs and texture packs stay
-outside the app. No ROM, saves or external HD texture pack is included.
+gameplay timing and collision are retained. Saves, ROMs and user-imported packs
+stay outside the app. The built-in SR.GU pack is read directly from the signed
+app and needs no additional storage permission. No ROM or saves are included.
 
 ## macOS compatibility and permissions
 

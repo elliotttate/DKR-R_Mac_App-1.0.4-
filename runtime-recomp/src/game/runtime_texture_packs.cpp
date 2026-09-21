@@ -41,6 +41,9 @@ std::mutex g_mutex;
 std::filesystem::path g_pack_directory;
 std::filesystem::path g_settings_path;
 std::filesystem::path g_index_path;
+std::filesystem::path g_bundled_pack_path;
+constexpr const char* kBundledPackId = "@bundled/srgu-remastered";
+std::set<std::string> g_seen_bundled_ids;
 std::vector<dkr::runtime::texture_packs::PackInfo> g_packs;
 std::set<std::string> g_enabled_ids;
 std::string g_last_selected_id;
@@ -201,6 +204,7 @@ bool LooksLikeRiceName(const std::string& entry) {
 
 void LoadSettingsLocked() {
     g_enabled_ids.clear();
+    g_seen_bundled_ids.clear();
     g_hidden_ids.clear();
     g_imported_at.clear();
     g_managed_sizes.clear();
@@ -243,7 +247,9 @@ void LoadSettingsLocked() {
             }
             continue;
         }
-        if (line.rfind(enabled_prefix, 0) == 0 && line.size() > 8) {
+        if (line.rfind("bundled_seen=", 0) == 0 && line.size() > 13) {
+            g_seen_bundled_ids.insert(Lower(line.substr(13)));
+        } else if (line.rfind(enabled_prefix, 0) == 0 && line.size() > 8) {
             g_enabled_ids.insert(Lower(line.substr(8)));
         } else if (line.rfind(hidden_prefix, 0) == 0 && line.size() > 7) {
             g_hidden_ids.insert(Lower(line.substr(7)));
@@ -296,6 +302,7 @@ void SaveSettingsLocked() {
     if (!g_last_selected_id.empty()) {
         output << "last_selected=" << g_last_selected_id << '\n';
     }
+    for (const auto& id : g_seen_bundled_ids) output << "bundled_seen=" << id << '\n';
     for (const auto& id : g_enabled_ids) output << "enabled=" << id << '\n';
     for (const auto& id : g_hidden_ids) output << "hidden=" << id << '\n';
     for (const auto& [id, timestamp] : g_imported_at) {
@@ -763,6 +770,7 @@ void ScanLibrary(bool cache_only, bool force_deep,
     const auto refresh_started_at =
         dkr::runtime::startup_performance::Clock::now();
     std::filesystem::path directory;
+    std::filesystem::path bundled_path;
     std::set<std::string> enabled;
     std::set<std::string> hidden;
     std::map<std::string, std::int64_t> imported_at;
@@ -772,6 +780,7 @@ void ScanLibrary(bool cache_only, bool force_deep,
     {
         std::scoped_lock lock(g_mutex);
         directory = g_pack_directory;
+        bundled_path = g_bundled_pack_path;
         enabled = g_enabled_ids;
         hidden = g_hidden_ids;
         imported_at = g_imported_at;
@@ -877,8 +886,22 @@ void ScanLibrary(bool cache_only, bool force_deep,
             scanned.emplace_back(std::move(info));
         }
     }
+    if (!bundled_path.empty()) {
+        PackInfo info = InspectDirectory(bundled_path);
+        info.id = kBundledPackId;
+        info.name = "DKR REMASTERED (SR.GU's)";
+        info.origin = Origin::Bundled;
+        info.detail = "By SR.GU (sr.gu). Included with DKR-R; applies in Modern mode. "
+                      "Deactivate or hide it here to use original textures.";
+        info.managed_size_bytes = ManagedSize(bundled_path);
+        scanned.emplace_back(std::move(info));
+    }
     std::sort(scanned.begin(), scanned.end(),
               [](const PackInfo& left, const PackInfo& right) {
+                  // Load bundled artwork first so explicitly imported packs
+                  // can override it in RT64's replacement search order.
+                  if ((left.origin == Origin::Bundled) != (right.origin == Origin::Bundled))
+                      return left.origin == Origin::Bundled;
                   return Lower(left.name) < Lower(right.name);
               });
     const std::size_t scanned_count = scanned.size();
@@ -886,7 +909,9 @@ void ScanLibrary(bool cache_only, bool force_deep,
         std::scoped_lock lock(g_mutex);
         for (auto& info : scanned) {
             const auto owner = g_track_pack_owners.find(info.id);
-            if (owner == g_track_pack_owners.end()) {
+            if (info.origin == Origin::Bundled) {
+                // Bundled packs are read-only and have no custom-track owner.
+            } else if (owner == g_track_pack_owners.end()) {
                 info.origin = Origin::User;
                 info.owner_track_id.clear();
                 info.texture_digest.clear();
@@ -926,7 +951,7 @@ void ScanLibrary(bool cache_only, bool force_deep,
 
 } // namespace
 
-void configure(const std::filesystem::path& config_directory) {
+void configure(const std::filesystem::path& config_directory, bool include_bundled) {
     g_background_refresh.request_stop();
     if (g_background_refresh.joinable()) g_background_refresh.join();
     g_background_refresh_started.store(false, std::memory_order_release);
@@ -943,6 +968,22 @@ void configure(const std::filesystem::path& config_directory) {
         std::error_code error;
         std::filesystem::create_directories(g_pack_directory, error);
         LoadSettingsLocked();
+        g_bundled_pack_path.clear();
+        if (include_bundled) {
+            const auto database = dkr::runtime::platform::asset_path(
+                "assets/texture-packs/srgu-remastered/rt64.json");
+            if (std::filesystem::is_regular_file(database, error)) {
+                g_bundled_pack_path = database.parent_path();
+                // Record the first encounter independently of the enabled set:
+                // an explicit deactivate/hide must survive updates and restarts.
+                if (g_seen_bundled_ids.insert(kBundledPackId).second) {
+                    if (!g_hidden_ids.contains(kBundledPackId))
+                        g_enabled_ids.insert(kBundledPackId);
+                    if (g_last_selected_id.empty()) g_last_selected_id = kBundledPackId;
+                    SaveSettingsLocked();
+                }
+            }
+        }
         LoadPackIndexLocked();
     }
     // The launcher's critical path inspects enabled packs and reuses cached
@@ -1315,6 +1356,10 @@ bool delete_managed(const std::string& id, std::string& status_text) {
             [&](const PackInfo& pack) { return pack.id == normalized; });
         if (match == g_packs.end()) {
             status_text = "The selected texture pack is no longer available.";
+            return false;
+        }
+        if (match->origin == Origin::Bundled) {
+            status_text = "This pack is included with DKR-R. Deactivate or hide it instead.";
             return false;
         }
         if (!IsDirectManagedChild(match->path)) {

@@ -14,6 +14,10 @@
 - Decomp source under its own applicable licence when integrated correctly.
 - Extraction schemas, offsets and declarative metadata.
 - Original port interface assets.
+- The supplied SR.GU replacement artwork in `assets/texture-packs/srgu-remastered`,
+  included at the project owner's request with attribution, source/output hashes
+  and conversion records. See `packaging/licenses/SRGU-TEXTURE-PACK-NOTICE.txt`;
+  the source-code license does not relicense the artwork.
 - Independently supplied interface fonts only when their redistribution terms
   are documented in `THIRD_PARTY.md` and permit the intended release.
 - Synthetic test geometry and data.

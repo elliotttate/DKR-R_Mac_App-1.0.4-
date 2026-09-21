@@ -663,6 +663,19 @@ if(DKR_RUNTIME_BUILD_GENERATED)
             COMMENT "Staging the DKR-R launcher, graphics and controller assets"
             VERBATIM
         )
+        # Always synchronize the committed pack, including asset-only rebuilds.
+        add_custom_target(DKRBundledTextureAssets ALL
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/../scripts/prepare_srgu_texture_pack.py"
+                --output "${CMAKE_CURRENT_LIST_DIR}/../assets/texture-packs/srgu-remastered"
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                "$<TARGET_FILE_DIR:DKRPortGame>/assets/texture-packs/srgu-remastered"
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${CMAKE_CURRENT_LIST_DIR}/../assets/texture-packs/srgu-remastered"
+                "$<TARGET_FILE_DIR:DKRPortGame>/assets/texture-packs/srgu-remastered"
+            DEPENDS DKRPortGame
+            COMMENT "Validating and staging the SR.GU remastered texture pack"
+            VERBATIM)
         foreach(plant IN ITEMS palm blueberry rubber-tree beach-tree banana balloons)
             if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../assets/models/${plant}/near.dkrmesh")
                 add_custom_command(TARGET DKRPortGame POST_BUILD
@@ -1065,6 +1078,10 @@ if(BUILD_TESTING)
     add_test(NAME DKRWidescreenPolicy COMMAND DKRWidescreenPolicyTests)
 
     if(DKR_RUNTIME_BUILD_RT64 AND TARGET DKRPortGame)
+        add_test(NAME DKRBundledTexturePack
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_LIST_DIR}/../scripts/test_bundled_texture_pack.py"
+                "$<TARGET_FILE:DKRPortGame>")
         add_executable(DKRSplitScreenRT64Tests tests/split_screen_rt64_tests.cpp)
         target_include_directories(DKRSplitScreenRT64Tests PRIVATE
             "${CMAKE_CURRENT_LIST_DIR}/src/game"

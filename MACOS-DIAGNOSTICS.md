@@ -1,6 +1,6 @@
 # Mac crash logs and failed-launch diagnostics
 
-Available in **1.0.5-beta.10-macos.3**, based on upstream main `8a8e927` with
+Introduced in **1.0.5-beta.10-macos.3** and included in later Mac releases, based on upstream main `8a8e927` with
 our existing models and terrain. The unfinished PBR experiment remains separate.
 
 ## For a player

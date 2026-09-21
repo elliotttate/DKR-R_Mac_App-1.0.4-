@@ -80,7 +80,7 @@ Only the decoding library is used; no external decompression commands or
 user-supplied executable code are run. The private worker has resource and
 cancellation limits, not a complete OS security sandbox. Compression/ZIP and
 hashing reuse the existing miniz and Mbed TLS implementations. Notices are in
-`LEGACY-MODS-NOTICE.txt` in both packages. No game or mod assets are bundled.
+`LEGACY-MODS-NOTICE.txt` in both packages. No legacy mod binaries or extracted retail assets are bundled.
 
 ## Golden Balloon HUD reference
 
@@ -97,3 +97,13 @@ No Golden Balloon game assets are redistributed here.
 
 Nintendo, Rare, Diddy Kong Racing and related names and assets belong to their
 respective owners. DKR-R includes no game ROM or extracted game assets.
+
+## Bundled SR.GU remastered texture pack
+
+This fork includes **DKR REMASTERED (SR.GU's)** by **SR.GU (sr.gu)**: 1,741
+replacement texture identities, prepared from the folder supplied for this
+release. The code license does not relicense the artwork. The supplied folder
+contained no separate license or additional notice. Attribution and conversion
+provenance are retained in `assets/texture-packs/srgu-remastered/README.md`, its
+hash manifest, and `SRGU-TEXTURE-PACK-NOTICE.txt` in the Mac app's notices.
+The pack is enabled in Modern mode and can be deactivated in Textures.

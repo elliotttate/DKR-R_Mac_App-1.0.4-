@@ -1,0 +1,12 @@
+DKR REMASTERED (SR.GU's)
+HD replacement artwork by SR.GU (sr.gu).
+
+This fork bundles the texture folder supplied for this release, converted to
+RT64 replacement metadata and PNGs. Credit remains with the artist and the
+respective rights holders. No separate license or additional notice was present
+in the supplied folder; the project's code license does not relicense the art.
+
+The pack README and manifest document conversion, source hashes, output hashes,
+and excluded non-runtime files. Nintendo, Rare, Diddy Kong Racing and related
+names and characters belong to their respective owners. No game ROM, save file,
+or extracted retail resource archive is included.

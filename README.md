@@ -1,4 +1,4 @@
-# DKR-R for Windows and macOS — 3D items, plants and terrain
+# DKR-R for Windows and macOS — 3D models, terrain and HD textures
 
 This experimental Windows x64 and Apple Silicon fork builds on
 [jt87's macOS port](https://github.com/jt87/DKR-R_Mac_App-1.0.4-) of
@@ -15,6 +15,8 @@ original game simulation and collision.
 - **3D items (F8):** [spinning bananas](BANANA-3D-PREVIEW.md) driven by the
   original animation phase, and [seven glossy balloon finishes](BALLOONS-3D-PREVIEW.md)
   with repaired wraparound textures. The shared F8 toggle covers plants and items.
+- **Bundled HD textures:** [DKR REMASTERED by SR.GU](assets/texture-packs/srgu-remastered/README.md),
+  with 1,741 replacement textures enabled in Modern mode. Toggle the pack in Textures.
 - **Native packaging:** bundled SDL runtimes, complete model assets, and
   Finder-safe asset discovery on macOS. See the [Windows build instructions](docs/BUILDING.md)
   and [Mac build instructions](LOCAL-MAC-BUILD.md).
@@ -24,22 +26,23 @@ The current source integrates upstream `main` at
 (September 19, 2026), version **1.0.5-beta.10**, with our 3D models and terrain.
 The unfinished PBR experiment remains separate. See [build instructions](LOCAL-MAC-BUILD.md).
 
-### [Download this fork's Mac release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/latest)
+### [Download the Mac HD release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/tag/v1.0.5-beta.10-macos.4)
 
-The previously published version `1.0.4-macos.1` requires an Apple Silicon Mac and macOS 12 or newer.
-The new local `1.0.5-beta.10-macos.3` build includes a standalone Diagnostics
-app for crash-log export and fresh-settings troubleshooting, alongside the
-Metal compatibility and native ROM-picker fixes. It is Developer ID signed,
-**not notarized**; older published builds were ad-hoc signed. See the included
-[Mac installation instructions](packaging/RELEASE-README.md). ROMs, saves,
-external HD packs, and ROM-derived audit fixtures are not included. The original
-release and its installation instructions below describe jt87's build, not this
-fork's experimental builds. See [release notes and verification limits](RELEASE-NOTES-macos.1.md).
-Current compatibility fixes and testing limits are recorded in
-[MACOS-COMPATIBILITY.md](MACOS-COMPATIBILITY.md). For crash reports and failed
-launches, see [MACOS-DIAGNOSTICS.md](MACOS-DIAGNOSTICS.md).
+**1.0.5-beta.10-macos.4** bundles SR.GU's remastered textures, all six 3D model
+families, terrain detail, and the standalone **DKR-R Diagnostics.app** for crash
+reports and fresh-settings troubleshooting. Select **Modern** to enable HD
+textures and 3D additions; manage the built-in pack under **Textures**.
 
-Windows x64 is also available in the earlier release. See [Windows release notes](RELEASE-NOTES-windows.1.md) and [build instructions](docs/BUILDING.md).
+Requires Apple Silicon and targets macOS 12+. Native code and Metal shaders are
+audited for that target; older OS runtime testing remains outstanding. Both
+apps are Developer ID signed, **not notarized**. See the [installation guide](packaging/RELEASE-README.md),
+[release notes](RELEASE-NOTES-macos.4.md), [compatibility details](MACOS-COMPATIBILITY.md),
+and [diagnostics guide](MACOS-DIAGNOSTICS.md). Supply your own supported ROM;
+ROMs, saves, and retail resource archives are not included.
+
+The earlier [1.0.4 release](https://github.com/elliotttate/DKR-R_Mac_App-1.0.4-/releases/tag/v1.0.4-macos.1)
+retains the Windows x64 download. Windows binaries have not been refreshed for
+this Mac release; its build/packaging fixes remain in source. See [Windows notes](RELEASE-NOTES-windows.1.md).
 
 
 ## Original macOS release (jt87)

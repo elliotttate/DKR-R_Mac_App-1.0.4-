@@ -293,7 +293,10 @@ std::filesystem::path RuntimeAssetPath(const std::filesystem::path& relative) {
             return candidate;
         }
 #if defined(__APPLE__)
-        const auto bundled = directory / ".." / "MacOS" / relative;
+        // SDL defaults to Contents/Resources, which can be absent in a freshly
+        // built bundle. Normalize before checking so a nonexistent intermediate
+        // Resources directory cannot hide the adjacent MacOS assets.
+        const auto bundled = (directory / ".." / "MacOS" / relative).lexically_normal();
         if (std::filesystem::is_regular_file(bundled, error)) {
             return bundled.lexically_normal();
         }

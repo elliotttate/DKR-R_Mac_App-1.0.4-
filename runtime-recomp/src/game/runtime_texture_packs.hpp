@@ -28,6 +28,7 @@ enum class Format {
 enum class Origin {
     User,
     TrackPack,
+    Bundled, // Read-only assets shipped beside the executable.
 };
 
 struct PackInfo {
@@ -60,7 +61,8 @@ struct ImportProgress {
 // installed.
 using ImportProgressCallback = std::function<bool(const ImportProgress&)>;
 
-void configure(const std::filesystem::path& config_directory);
+void configure(const std::filesystem::path& config_directory,
+               bool include_bundled = true);
 // Starts one non-blocking validation pass when the texture library is first
 // opened. Enabled packs are already validated synchronously by configure().
 void request_background_refresh();
