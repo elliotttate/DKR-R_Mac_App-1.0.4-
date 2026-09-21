@@ -5,6 +5,7 @@ param(
     [switch]$Clean,
     [switch]$SkipTests,
     [switch]$Package,
+    [string]$WindowsSdkVersion = '10.0.26100.0',
     [string]$GeneratedSource = '',
     [string]$Revision80GeneratedSource = ''
 )
@@ -75,6 +76,7 @@ if ($Clean -and (Test-Path -LiteralPath $buildDirectory)) {
 Write-Host "Configuring DKR-R $version ($Configuration)..." -ForegroundColor Cyan
 & $cmake -S (Join-Path $projectRoot 'runtime-recomp') -B $buildDirectory `
     -G 'Visual Studio 17 2022' -A x64 `
+    "-DCMAKE_SYSTEM_VERSION=$WindowsSdkVersion" `
     "-DDKRPORT_ROOT=$projectRoot" `
     "-DDKR_RELEASE_VERSION=$version" `
     -DDKR_RUNTIME_BUILD_GENERATED=ON `
